@@ -1,3 +1,20 @@
+Write-Host "Running preliminary hardware diagnostics..."
+
+$cpu = Get-CimInstance Win32_Processor
+$clockSpeedMHz = $cpu.MaxClockSpeed
+$clockSpeedGHz = [math]::Round($clockSpeedMHz / 1000, 2)
+Write-Host "CPU: $($cpu.Name) - $clockSpeedGHz GHz"
+$minimumClockSpeedGHz = 3.5
+
+if ($clockSpeedGHz -lt $minimumClockSpeedGHz) {
+    Write-Host "Warning: CPU clock speed is below the minimum required."
+    Write-Host "Immediately terminating instance to prevent performance issues."
+    Stop-Computer -Force
+    exit
+} else {
+    Write-Host "CPU clock speed meets the minimum requirement. Proceeding with software installation..."
+}
+
 $WingetArgs = "--accept-package-agreements --accept-source-agreements --silent"
 
 winget install -e --id Google.Chrome $WingetArgs
@@ -47,3 +64,5 @@ $sunshineStateData = @"
 }
 "@
 
+Set-Content -Path "C:\Program Files\Sunshine\config\sunshine_state.json" -Value $sunshineStateData
+Start-Service -Name SunshineService
