@@ -1,0 +1,48 @@
+{
+  "budget": {
+    "max_price_per_hour": 1.00
+  },
+
+  "hardware_requirements": {
+    "target_gpus": ["RTX 4090", "RTX 5090", "RTX 3090 Ti", "RTX 3090", "RTX 4080", "RTX 5080", "RTX 5070 Ti", "RTX A6000", "RTX A5000", "RTX A4000", "RTX 4070 Ti", "RTX 4060 Ti"],
+    "min_vcpus": 8,
+    "min_memory_gb": 16
+  },
+
+  "geography": {
+    "preferred_regions": ["us-central-1", "us-east-1", "us-central-2", "us-east-2", "detroit", "ohio", "virginia", "oregon", "california", "texas", "florida", "southfield", "us-central", "us-central1", "us-east", "us-east1", "us-west", "us-west1", "us-west2", "us-west3", "us-west4"]
+  },
+
+  "provider_preferences": {
+    "tensordock": {
+      "enabled": true,
+      "api_token": "ka1mdlUkZpZxMdxFPBeEYhR8dltelGTS"
+    },
+    "runpod": {
+      "enabled": false,
+      "api_token": "your_runpod_api_token_here"
+    },
+    "lambda": {
+      "enabled": false,
+      "api_token": "your_lambda_api_token_here"
+    },
+    "GCP": {
+      "enabled": false,
+      "credentials_file": "/path/to/your/gcp_credentials.json"
+  },
+    "AWS": {
+      "enabled": false,
+      "access_key_id": "your_aws_access_key"
+  },
+    "Azure": {
+      "enabled": false,
+      "client_id": "your_azure_client_id",
+      "tenant_id": "your_azure_tenant_id",
+      "client_secret": "your_azure_client_secret"
+    }
+  },
+
+  "payload": {
+    "github_raw_url": "https://raw.githubusercontent.com/NoviceAtPython/CloudDeploy-mover/refs/heads/main/CloudDeploy.ps1?token=GHSAT0AAAAAADYYPT7OYD7NY7D43E4TB2AQ2OU2OUQ"
+  }
+}
