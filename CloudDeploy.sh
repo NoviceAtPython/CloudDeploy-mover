@@ -10,7 +10,7 @@ TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
 CPU_GATE_EXIT="${CPU_GATE_EXIT:-42}"
 CPU_BENCH_SECONDS="${CPU_BENCH_SECONDS:-1.5}"
-CPU_BENCH_MIN="${CPU_BENCH_MIN:-22000000}"
+CPU_BENCH_MIN="${CPU_BENCH_MIN:-350000}"
 
 NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
@@ -41,7 +41,6 @@ run_as_user() {
         shift
         runuser -u "${user}" -- "$@"
 }
-
 echo "Running preliminary hardware diagnostics..."
 command -v python3 >/dev/null 2>&1 || die "Python 3 is required for CPU gate benchmarking."
 
@@ -67,12 +66,12 @@ PY
 log "CPU single-threaded score: ${cpu_score}"
 
 if [[ "${cpu_score}" -lt "${CPU_BENCH_MIN}" ]]; then
-        log "Warning: CPU score ${cpu_score} is below the minimum threshold of ${PU_BENCH_MIN}."
+        log "Warning: CPU score ${cpu_score} is below the minimum threshold of ${CPU_BENCH_MIN}."
         log "Sunshine may not perform well. Consider using a more powerful CPU or adjusting the CPU_BENCH_MIN threshold."
         log "Exiting with code ${CPU_GATE_EXIT}."
         exit "${CPU_GATE_EXIT}"
 fi
-log "CPU gate passed with a score of ${cpu_score} (threshold: ${PU_BENCH_MIN}). Proceeding with installation."
+log "CPU gate passed with a score of ${cpu_score} (threshold: ${CPU_BENCH_MIN}). Proceeding with installation."
 
 INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-0}"
 
@@ -167,7 +166,7 @@ Section "Device"
         Option "UseDisplayDevice"               "${NVIDIA_DISPLAY_DEVICE}"
         Option "ConnectedMonitor"               "${NVIDIA_DISPLAY_DEVICE}"
         Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
-        Option "ModeValidation"                 "NoDFPNativeResolutionCheck,NoVirtualSizeCheck,NoMaxPClkCheck,NoHorizSyncCheck,NoVertRefreshCheck,NoWidthAlignmentCheck"
+        Option "ModeValidation"                 "NoDFPNativeResolutionCheck,NoVirtualSizeCheck,NoMaxPClkCheck,NoHorizSyncCheck,NoVertRefreshCheck,NoWidthAl>
 EndSection
 
 Section "Screen"
@@ -262,7 +261,7 @@ Environment=HOME=${HOME_DIR}
 Environment=DISPLAY=:0
 Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
 Environment=XAUTHORITY=/tmp/serverauth.sunshine
-ExecStartPre=/bin/bash -lc 'for i in {1..60}; do /usr/bin/xrandr --display :0 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "X session never became ready" >&2; exit 1'
+ExecStartPre=/bin/bash -lc 'for i in {1..60}; do /usr/bin/xrandr --display :0 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "X session never became ready">
 ExecStart=/usr/bin/sunshine
 Restart=always
 RestartSec=5
