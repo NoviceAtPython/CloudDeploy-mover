@@ -8,13 +8,30 @@ SUNSHINE_USER="${SUNSHINE_USER:-aedyn}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-CPU_GATE_EXIT="${CPU_GATE_EXIT:-42}"
-CPU_BENCH_SECONDS="${CPU_BENCH_SECONDS:-1.5}"
-CPU_BENCH_MIN="${CPU_BENCH_MIN:-350000}"
 
 NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
-HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
+HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x108
+0}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
+
+echo "Running preliminary hardware diagnostics..."
+# Fetches CPU speed in MHz using lscpu: grabs the number and removes decimals
+CPU_SPEED_MHZ=$(lscpu | grep "CPU MHz" | awk '{print $3}' | cut -d. -f1)
+# Convert to GHz for easy reading
+CPU_SPEED_GHZ=$(echo "scale=2; $CPU_SPEED_MHZ / 1000" | bc)
+echo "CPU Clock Speed: $CPU_SPEED_GHZ Ghz"
+
+# Define the 3.5 GHz requirement
+MIN_SPEED=3500
+
+if [ "$CPU_SPEED_MHZ" -lt "$MIN_SPEED" ]; then
+        echo "CPU clock speed is below minimum threshold required" && echo "Terminating instance immediately..."
+        # shutdown -h now
+else
+        echo "CPU clock speed meets minimum threshold requirement" && echo "Proceeding with software installation..."
+fi
+
+Install_optional_apps="${Install_optional_apps:-1}"
 
 # =========================
 # Helpers
@@ -24,7 +41,7 @@ log() {
 }
 
 die() {
-        log "ERROR: $*"
+        echo "ERROR: $*" >&2
         exit 1
 }
 
@@ -35,45 +52,6 @@ require_root() {
 user_home() {
         getent passwd "$1" | cut -d: -f6
 }
-
-run_as_user() {
-        local user="$1"
-        shift
-        runuser -u "${user}" -- "$@"
-}
-echo "Running preliminary hardware diagnostics..."
-command -v python3 >/dev/null 2>&1 || die "Python 3 is required for CPU gate benchmarking."
-
-cpu_score="$(python3 - "$CPU_BENCH_SECONDS" << 'PY'
-import sys, time, statistics
-
-duration = float(sys.argv[1])
-scores = []
-
-for _ in range(3):
-        end = time.perf_counter() + duration
-        x = 1
-        n = 0
-        while time.perf_counter() < end:
-                x = (x * 1664525 + 1013904223) & 0xFFFFFFFF
-                n += 1
-        scores.append(n)
-
-print(int(statistics.median(scores)))
-PY
-)"
-
-log "CPU single-threaded score: ${cpu_score}"
-
-if [[ "${cpu_score}" -lt "${CPU_BENCH_MIN}" ]]; then
-        log "Warning: CPU score ${cpu_score} is below the minimum threshold of ${CPU_BENCH_MIN}."
-        log "Sunshine may not perform well. Consider using a more powerful CPU or adjusting the CPU_BENCH_MIN threshold."
-        log "Exiting with code ${CPU_GATE_EXIT}."
-        exit "${CPU_GATE_EXIT}"
-fi
-log "CPU gate passed with a score of ${cpu_score} (threshold: ${CPU_BENCH_MIN}). Proceeding with installation."
-
-INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-0}"
 
 detect_nvidia_busid() {
         local busid=""
@@ -92,6 +70,12 @@ detect_nvidia_busid() {
         fi
 
         printf '%s\n' "${busid}"
+}
+
+run_as_user() {
+        local user="$1"
+        shift
+        runuser -u "${user}" -- "$@"
 }
 
 # =========================
@@ -136,6 +120,7 @@ if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
         if ! command -v tailscale >/dev/null 2>&1; then
                 curl -fsSL https://tailscale.com/install.sh | sh
         fi
+
         systemctl enable --now tailscaled
         tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh
 fi
@@ -166,7 +151,7 @@ Section "Device"
         Option "UseDisplayDevice"               "${NVIDIA_DISPLAY_DEVICE}"
         Option "ConnectedMonitor"               "${NVIDIA_DISPLAY_DEVICE}"
         Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
-        Option "ModeValidation"                 "NoDFPNativeResolutionCheck,NoVirtualSizeCheck,NoMaxPClkCheck,NoHorizSyncCheck,NoVertRefreshCheck,NoWidthAl>
+        Option "ModeValidation"                 "NoDFPNativeResolutionCheck,NoVirtualSizeCheck,NoMaxPClkCheck,NoHorizSyncCheck,NoVertRefreshCheck,NoWidthAlignmentCheck"
 EndSection
 
 Section "Screen"
@@ -184,37 +169,77 @@ EndSection
 EOF
 
 log "Writing Plasma X11 session startup"
-cat > "${HOME_DIR}/.xinitrc" <<EOF
-export XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
-exec dbus-run-session startplasma-x11
+install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \"${HOME_DIR}/.local/bin" \ "${HOME_DIR}/.config/sunshine"
+
+cat > "${HOME_DIR}/.local/bin/start-sunshine.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export DISPLAY="\${DISPLAY:-:0}"
+export XAUTHORITY="\${XAUTHORITY:-/tmp/serverauth.sunshine}"
+export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+
+mkdir -p "\$XDG_RUNTIME_DIR"
+chmod 700 "\$XDG_RUNTIME_DIR"
+
+pkill -x sunshine >/dev/null 2>&1 || true
+
+for _ in \$(seq 1 60); do
+  if xrandr --query >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+exec /usr/bin/sunshine
 EOF
+
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-sunshine.sh"
+chmod 0755 "${HOME_DIR}/.local/bin/start-sunshine.sh"
+
+cat > "${HOME_DIR}/.xinitrc" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+mkdir -p "\$XDG_RUNTIME_DIR"
+chmod 700 "\$XDG_RUNTIME_DIR"
+
+exec dbus-run-session bash -lc '"${HOME_DIR}/.local/bin/start-sunshine.sh" & exec startplasma-x11'
+EOF
+
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.xinitrc"
-chmod 0644 "${HOME_DIR}/.xinitrc"
+chmod 0755 "${HOME_DIR}/.xinitrc"
 
 log "Writing Sunshine config"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
 
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
+min_log_level = info
 encoder = nvenc
 capture = x11
 adapter_name = ${SUNSHINE_RENDER_NODE}
+hevc_mode = 1
+av1_mode = 0
+stream_audio = disabled
+address_family = ipv4
 EOF
 
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config"
 
 log "Removing stale Sunshine state to avoid broken pre-pairing"
 if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
-        mv "${HOME_DIR}/.config/sunshine/sunshine_state.json" \
-                "${HOME_DIR}/.config/sunshine/sunshine_state.json.bak.$(date +%s)"
+  mv "${HOME_DIR}/.config/sunshine/sunshine_state.json" "${HOME_DIR}/.config/sunshine/sunshine_state.json.bak.$(date +%s)"
 fi
 
 log "Removing Sunshine KMS capability so X11 capture is used"
 if command -v setcap >/dev/null 2>&1 && command -v sunshine >/dev/null 2>&1; then
-        setcap -r "$(readlink -f "$(command -v sunshine)")" || true
+  setcap -r "$(readlink -f "$(command -v sunshine)")" || true
 fi
 
 log "Setting Sunshine web UI credentials"
-run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}"
+run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}" || true
 
 log "Writing headless Plasma systemd service"
 cat > /etc/systemd/system/headless-plasma.service <<EOF
@@ -222,7 +247,6 @@ cat > /etc/systemd/system/headless-plasma.service <<EOF
 Description=Headless X11 Plasma session on NVIDIA
 After=network-online.target
 Wants=network-online.target
-Before=sunshine-headless.service
 
 [Service]
 User=${HEADLESS_USER}
@@ -237,32 +261,7 @@ ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/rm -f /tmp/serverauth.sunshine ${HOME_DIR}/.Xauthority
-ExecStart=/usr/bin/startx -- :0 -auth /tmp/serverauth.sunshine
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-log "Writing Sunshine systemd service"
-cat > /etc/systemd/system/sunshine-headless.service <<EOF
-[Unit]
-Description=Sunshine on headless NVIDIA X11
-After=headless-plasma.service network-online.target tailscaled.service
-Wants=headless-plasma.service network-online.target
-Requires=headless-plasma.service
-
-[Service]
-User=${HEADLESS_USER}
-Group=${HEADLESS_USER}
-WorkingDirectory=${HOME_DIR}
-Environment=HOME=${HOME_DIR}
-Environment=DISPLAY=:0
-Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
-Environment=XAUTHORITY=/tmp/serverauth.sunshine
-ExecStartPre=/bin/bash -lc 'for i in {1..60}; do /usr/bin/xrandr --display :0 >/dev/null 2>&1 && exit 0; sleep 1; done; echo "X session never became ready">
-ExecStart=/usr/bin/sunshine
+ExecStart=/usr/bin/startx ${HOME_DIR}/.xinitrc -- :0 -auth /tmp/serverauth.sunshine
 Restart=always
 RestartSec=5
 
@@ -279,9 +278,12 @@ pkill Xorg 2>/dev/null || true
 
 log "Optional desktop apps"
 if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
-        dpkg --add-architecture i386
-        apt-get-repository -y multiverse || true
-        apt-get update
+        if ! dpkg --print-foreign-architectures | grep -q i386; then
+                dpkg --add-architecture i386
+                apt-get update
+        fi
+        
+        apt-get upgrade -y
         apt-get install -y flatpak steam-installer
         flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
         flatpak install -y flathub com.heroicgameslauncher.hgl || true
@@ -289,20 +291,23 @@ if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
 
         tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
         wget -O "${tmpchrome}" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-        dpkg -i "${tmpchrome}" || apt-get -f install -y
+        dpkg -i "${tmpchrome}" || sudo apt-get -f install -y
         rm -f "${tmpchrome}"
 fi
 
 log "Enabling services"
 systemctl daemon-reload
 systemctl enable --now headless-plasma.service
-systemctl enable --now sunshine-headless.service
+systemctl restart --now headless-plasma.service
+systemctl enable --now tailscaled
+systemctl restart --now tailscaled
 
 log "Finished"
 echo
 echo "Use Moonlight against the Tailscale IP, not the public IP."
 if command -v tailscale >/dev/null 2>&1; then
         TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+
         if [[ -n "${TS_IP}" ]]; then
                 echo "Sunshine web UI: https://${TS_IP}:47990"
                 echo "Moonlight host:   ${TS_IP}"
