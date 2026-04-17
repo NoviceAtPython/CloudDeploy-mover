@@ -94,6 +94,45 @@ run_as_user() {
         runuser -u "${user}" -- "$@"
 }
 
+wait_for_apt() {
+        local waited=0
+        while \
+                fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+                fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+                fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+                fuser /var/cache/apt/archives/lock >/dev/null 2>&1 || \
+                pgrep -x apt >/dev/null 2>&1 || \
+                pgrep -x apt-get >/dev/null 2>&1 || \
+                pgrep -x dpkg >/dev/null 2>&1 || \
+                pgrep -x unattended-upgr >/dev/null 2>&1 || \
+        
+        do
+                echo "Waiting for apt/dpkg lock..."
+                sleep 5
+                waited=$((waited + 5))
+
+                if [ "${waited}" -ge 600 ]; then
+                        ps -ef | grep -E 'apt|dpkg|unattended' | grep -v grep || true
+                        die "Timed out while waiting for apt/dpkg lock"
+                fi
+        done
+}
+
+apt_update_retry() {
+        wait_for_apt
+        apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20
+}
+
+apt_install_wait() {
+        wait_for_apt
+        apt-get install -y "$@"
+}
+
+apt_purge_wait() {
+        wait_for_apt
+        apt-get purge -y "$@"
+}
+
 # =========================
 # Start
 # =========================
@@ -111,15 +150,15 @@ usermod -aG sudo,video,input,render "${HEADLESS_USER}" || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
 
 log "Installing base packages"
-apt-get update
-apt-get install -y \
+apt_update_retry
+apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         dbus-x11 xinit x11-xserver-utils pciutils jq libcap2-bin \
         kde-plasma-desktop
 
 log "Removing pieces that fought the working setup"
 systemctl disable --now sddm 2>/dev/null || true
-apt-get purge -y xserver-xorg-video-dummy 2>/dev/null || true
+apt_purge_wait xserver-xorg-video-dummy 2>/dev/null || true
 rm -f /etc/sddm.conf.d/autologin.conf
 rm -f /etc/sddm.conf.d/zz-autologin.conf
 
@@ -127,6 +166,7 @@ log "Installing Sunshine"
 if ! command -v sunshine >/dev/null 2>&1; then
         tmpdeb="$(mktemp /tmp/sunshine.XXXXXX.deb)"
         wget -O "${tmpdeb}" "${SUNSHINE_DEB_URL}"
+        wait_for_apt
         dpkg -i "${tmpdeb}" || apt-get -f install -y
         rm -f "${tmpdeb}"
 fi
@@ -134,6 +174,7 @@ fi
 log "Installing Tailscale if requested"
 if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
         if ! command -v tailscale >/dev/null 2>&1; then
+                wait_for_apt
                 curl -fsSL https://tailscale.com/install.sh | sh
         fi
 
@@ -322,12 +363,14 @@ pkill Xorg 2>/dev/null || true
 log "Optional desktop apps"
 if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
         if ! dpkg --print-foreign-architectures | grep -q i386; then
+                wait_for_apt
                 dpkg --add-architecture i386
-                apt-get update
+                apt_update_retry
         fi
 
+        wait_for_apt
         apt-get upgrade -y
-        apt-get install -y flatpak steam-installer
+        apt_install_wait flatpak steam-installer
         flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
         flatpak install -y flathub com.heroicgameslauncher.hgl || true
         flatpak install -y flathub org.prismlauncher.PrismLauncher || true
@@ -357,7 +400,6 @@ if command -v tailscale >/dev/null 2>&1; then
                 echo "Moonlight host:   ${TS_IP}"
         fi
 fi
-
 echo "Sunshine web UI username: ${SUNSHINE_USER}"
 echo "Sunshine web UI password: ${SUNSHINE_PASS}"
 echo
