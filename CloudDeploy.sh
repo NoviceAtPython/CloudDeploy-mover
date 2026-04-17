@@ -104,7 +104,7 @@ wait_for_apt() {
                 pgrep -x apt >/dev/null 2>&1 || \
                 pgrep -x apt-get >/dev/null 2>&1 || \
                 pgrep -x dpkg >/dev/null 2>&1 || \
-                pgrep -x unattended-upgr >/dev/null 2>&1 || \
+                pgrep -x unattended-upgr >/dev/null 2>&1
         
         do
                 echo "Waiting for apt/dpkg lock..."
