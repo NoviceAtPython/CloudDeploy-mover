@@ -317,10 +317,14 @@ PermissionsStartOnly=true
 ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/rm -f /tmp/serverauth.sunshine ${HOME_DIR}/.Xauthority
-ExecStart=/usr/bin/startx ${HOME_DIR}/.xinitrc -- :0 -auth /tmp/serverauth.sunshine
+ExecStartPre=/usr/bin/touch /tmp/serverauth.sunshine
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/serverauth.sunshine
+ExecStartPre=/usr/bin/chmod 600 /tmp/serverauth.sunshine
+ExecStart=/usr/bin/xinit ${HOME_DIR}/.xinitrc -- /usr/lib/xorg/Xorg :0 -auth /tmp/serverauth.sunshine -nolisten tcp
 Restart=always
 RestartSec=5
+StandardOutput=journal
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
