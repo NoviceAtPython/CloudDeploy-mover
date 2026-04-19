@@ -139,17 +139,19 @@ run_as_user() {
         runuser -u "${user}" -- "$@"
 }
 
+wait_for_cloud_init() {
+        if command -v cloud-init >/dev/null 2>&1; then
+                echo "Waiting for cloud-init..."
+                cloud-init status --wait || true
+        fi
+}
+
 wait_for_apt() {
         local waited=0
-        while \
-                fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
-                fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
-                fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
-                fuser /var/cache/apt/archives/lock >/dev/null 2>&1 || \
-                pgrep -x apt >/dev/null 2>&1 || \
-                pgrep -x apt-get >/dev/null 2>&1 || \
-                pgrep -x dpkg >/dev/null 2>&1 || \
-                pgrep -x unattended-upgr >/dev/null 2>&1
+        while fuser /var/lib/dpkg/lock-frontend \
+                    /var/lib/dpkg/lock \
+                    /var/lib/apt/lists/lock \
+                    /var/cache/apt/archives/lock >/dev/null 2>&1
         
         do
                 echo "Waiting for apt/dpkg lock..."
@@ -157,19 +159,27 @@ wait_for_apt() {
                 waited=$((waited + 5))
 
                 if [ "${waited}" -ge 600 ]; then
-                        ps -ef | grep -E 'apt|dpkg|unattended' | grep -v grep || true
-                        die "Timed out while waiting for apt/dpkg lock"
+                        echo "Lock holders after 10 minutes:"
+                        fuser -v /var/lib/dpkg/lock-frontend \
+                                /var/lib/dpkg/lock \
+                                /var/lib/apt/lists/lock \
+                                /var/cache/apt/archives/lock 2>/dev/null || true
+                        ps -ef | grep -E 'apt|dpkg|packagekit|cloud-init' | grep -v grep || true
+                        die "Timed out while waiting for apt/dpkg locks"
                 fi
         done
 }
 
 apt_update_retry() {
+        wait_for_cloud_init
         wait_for_apt
+        DEBIAN_FRONTEND=noninteractive
         apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20
 }
 
 apt_install_wait() {
         wait_for_apt
+        DEBIAN_FRONTEND=noninteractive
         apt-get install -y "$@"
 }
 
