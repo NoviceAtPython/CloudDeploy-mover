@@ -9,10 +9,20 @@ SUNSHINE_USER="${SUNSHINE_USER:-aedyn}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-
 NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
-HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1080}"
+HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
+SENTINEL="/opt/clouddeploy.installed"
+
+if [[ -f "$SENTINEL" ]]; then
+    echo "CloudDeploy.sh has already run on this machine. Restarting existing services and exiting..."
+        systemctl daemon-reload || true
+        systemctl restart headless-plasma.service || true
+        systemctl restart sunshine-headless.service || true
+        systemctl restart tailscaled || true
+        exit 0
+
+fi
 
 echo "Running preliminary hardware diagnostics..."
 
@@ -404,6 +414,9 @@ if command -v tailscale >/dev/null 2>&1; then
                 echo "Moonlight host:   ${TS_IP}"
         fi
 fi
+
+touch "$SENTINEL"
+
 echo "Sunshine web UI username: ${SUNSHINE_USER}"
 echo "Sunshine web UI password: ${SUNSHINE_PASS}"
 echo
