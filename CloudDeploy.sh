@@ -10,7 +10,7 @@ SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-None}"
+NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
 SENTINEL="/opt/clouddeploy.installed"
@@ -284,6 +284,8 @@ EndSection
 
 Section "Monitor"
         Identifier                              "Monitor0"
+        HorizSync                               28.0-160.0
+        VertRefresh                             48.0-144.0
 EndSection
 
 Section "Device"
@@ -292,7 +294,10 @@ Section "Device"
         BusID                                   "${NVIDIA_BUSID}"
         Option "PrimaryGPU"                     "yes"
         Option "AllowEmptyInitialConfiguration" "True"
+        Option "ConnectedMonitor"               "${NVIDIA_DISPLAY_DEVICE}"
+        Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
         Option "UseDisplayDevice"               "${NVIDIA_DISPLAY_DEVICE}"
+        Option "ModeValidation"                 "NoEdidModes, NoMaxPClkCheck, AllowNonEdidModes, NoHorizSyncCheck, NoVertRefreshCheck"
 EndSection
 
 Section "Screen"
