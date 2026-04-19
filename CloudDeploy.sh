@@ -4,8 +4,9 @@ set -Eeuo pipefail
 trap 'echo "Failed at line $LINENO"; exit 1' ERR
 export DEBIAN_FRONTEND=noninteractive
 
-HEADLESS_USER="${HEADLESS_USER:-ubuntu}"
-SUNSHINE_USER="${SUNSHINE_USER:-aedyn}"
+DEFAULT_USER="${SUDO_USER:-user}"
+HEADLESS_USER="${HEADLESS_USER:-$DEFAULT_USER}"
+SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
@@ -18,11 +19,22 @@ SCRIPT_VERSION="3"
 [[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
 
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
-    echo "CloudDeploy.sh has already run on this machine for version $SCRIPT_VERSION. Restarting existing services and exiting..."
+        echo "CloudDeploy.sh has already run on this machine for version $SCRIPT_VERSION. Restarting existing services and exiting..."
         systemctl daemon-reload || true
-        systemctl restart headless-plasma.service || true
-        systemctl restart sunshine-headless.service || true
+        systemctl reset-failed headless-plasma.service sunshine-headless.service tailscaled || true
+        systemctl enable headless-plasma.service sunshine-headless.service tailscaled|| true
         systemctl restart tailscaled || true
+        sleep 2
+
+        if command -v tailscale >/dev/null 2>&1; then
+                if ! tailscale status >/dev/null 2>&1; then
+                        if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
+                                echo "Tailscale is installed but not connected. Attempting to connect..."
+                                tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || true
+                        else
+                                echo "Tailscale is installed but not connected, and no auth key is set. Please set TAILSCALE_AUTHKEY and run 'tailscale up' manually."
+                fi
+        fi
 
         echo
         echo "Service states:"
