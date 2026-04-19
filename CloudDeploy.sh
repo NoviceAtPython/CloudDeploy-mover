@@ -475,7 +475,7 @@ if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
 fi
 
 log "Verifying NVIDIA Xorg module exists"
-ls /usr/lib/xorg/modules/drivers/nvidia_drv.so* || die "NVIDIA Xorg driver module not found. NVIDIA drivers may not be installed correctly."
+find /usr /usr/lib64 -type f -name 'nvidia_drv.so*' 2>/dev/null | grep -q . || die "NVIDIA Xorg driver module not found. NVIDIA drivers may not be installed correctly."
 
 log "Enabling services"
 systemctl daemon-reload
