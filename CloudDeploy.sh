@@ -13,15 +13,37 @@ NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
 SENTINEL="/opt/clouddeploy.installed"
+SCRIPT_VERSION="3"
 
-if [[ -f "$SENTINEL" ]]; then
-    echo "CloudDeploy.sh has already run on this machine. Restarting existing services and exiting..."
+[[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
+
+if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
+    echo "CloudDeploy.sh has already run on this machine for version $SCRIPT_VERSION. Restarting existing services and exiting..."
         systemctl daemon-reload || true
         systemctl restart headless-plasma.service || true
         systemctl restart sunshine-headless.service || true
         systemctl restart tailscaled || true
-        exit 0
 
+        echo
+        echo "Service states:"
+        systemctl --no-pager --full status headless-plasma.service | sed -n '1,8p' || true
+        systemctl --no-pager --full status sunshine-headless.service | sed -n '1,8p' || true
+        systemctl --no-pager --full status tailscaled | sed -n '1,8p' || true
+
+        if command -v tailscale >/dev/null 2>&1; then
+                TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+
+                if [[ -n "${TS_IP}" ]]; then
+                        echo
+                        echo "Sunshine web UI: https://${TS_IP}:47990"
+                        echo "Moonlight host: ${TS_IP}"
+                else 
+                        echo
+                        echo "Tailscale is installed but could not determine IP address. Check tailscale status for details."
+                fi
+        fi
+
+        exit 0
 fi
 
 echo "Running preliminary hardware diagnostics..."
@@ -284,12 +306,13 @@ log "Writing Sunshine config"
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = info
 encoder = nvenc
-capture = x11
+capture = nvfbc
 adapter_name = ${SUNSHINE_RENDER_NODE}
 hevc_mode = 1
-av1_mode = 0
-stream_audio = disabled
+av1_mode = 1
+stream_audio = enabled
 address_family = ipv4
+ping_timeout = 60000
 EOF
 
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config"
@@ -415,8 +438,7 @@ if command -v tailscale >/dev/null 2>&1; then
         fi
 fi
 
-touch "$SENTINEL"
-
+echo "$SCRIPT_VERSION" > "$SENTINEL"
 echo "Sunshine web UI username: ${SUNSHINE_USER}"
 echo "Sunshine web UI password: ${SUNSHINE_PASS}"
 echo
