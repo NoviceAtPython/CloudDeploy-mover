@@ -10,7 +10,7 @@ SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
+NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-None}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
 SENTINEL="/opt/clouddeploy.installed"
@@ -133,6 +133,10 @@ detect_nvidia_busid() {
         printf '%s\n' "${busid}"
 }
 
+nvidia_driver_ready() {
+        command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+}
+
 run_as_user() {
         local user="$1"
         shift
@@ -209,7 +213,36 @@ apt_update_retry
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         dbus-x11 xinit x11-xserver-utils pciutils jq libcap2-bin \
-        kde-plasma-desktop
+        kde-plasma-desktop xserver-xorg xserver-xorg-legacy \
+        ubuntu-drivers-common
+
+log "Configuring Xorg wrapper permissions"
+cat > /etc/X11/Xwrapper.config <<EOF
+allowed_users=anybody
+needs_root_rights=yes
+EOF
+
+log "Checking NVIDIA driver status"
+if nvidia_driver_ready; then
+        log "NVIDIA drivers are already installed and working"
+else
+        log "Installing NVIDIA drivers"
+        ubuntu-drivers install || die "Failed to install NVIDIA drivers"
+        modprobe nvidia || true
+        modprobe nvidia_modeset || true
+        modprobe nvidia_drm || true
+
+        for _ in $(seq 1 15); do
+                if nvidia_driver_ready; then
+                        log "NVIDIA drivers are now working"
+                        break
+                fi
+                echo "Waiting for NVIDIA drivers to be ready..."
+                sleep 3
+        done
+
+        nvidia_driver_ready || die "NVIDIA drivers still not ready after installation. This VM may need a reboot or may not be compatible."
+fi
 
 log "Removing pieces that fought the working setup"
 systemctl disable --now sddm 2>/dev/null || true
@@ -251,7 +284,6 @@ EndSection
 
 Section "Monitor"
         Identifier                              "Monitor0"
-        Option "Enable"                         "true"
 EndSection
 
 Section "Device"
@@ -261,9 +293,6 @@ Section "Device"
         Option "PrimaryGPU"                     "yes"
         Option "AllowEmptyInitialConfiguration" "True"
         Option "UseDisplayDevice"               "${NVIDIA_DISPLAY_DEVICE}"
-        Option "ConnectedMonitor"               "${NVIDIA_DISPLAY_DEVICE}"
-        Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
-        Option "ModeValidation"                 "NoDFPNativeResolutionCheck,NoVirtualSizeCheck,NoMaxPClkCheck,NoHorizSyncCheck,NoVertRefreshCheck"
 EndSection
 
 Section "Screen"
@@ -275,7 +304,7 @@ Section "Screen"
 
         SubSection "Display"
                 Depth   24
-                Modes   "${HEADLESS_RESOLUTION}"
+                Virtual ${HEADLESS_RESOLUTION}
         EndSubSection
 EndSection
 EOF
@@ -289,11 +318,14 @@ cat > "${HOME_DIR}/.xinitrc" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
 export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-exec dbus-run-session startplasma-x11
+exec /usr/bin/runuser -u "${HEADLESS_USER}" -- dbus-run-session startplasma-x11
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.xinitrc"
@@ -362,8 +394,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=${HEADLESS_USER}
-Group=${HEADLESS_USER}
+User=root
+Group=root
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=DISPLAY=:0
@@ -376,6 +408,7 @@ ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/touch /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/chmod 600 /tmp/serverauth.sunshine
+ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 15); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
 ExecStart=/usr/bin/xinit ${HOME_DIR}/.xinitrc -- /usr/lib/xorg/Xorg :0 -auth /tmp/serverauth.sunshine -nolisten tcp
 Restart=always
 RestartSec=5
@@ -440,6 +473,9 @@ if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
         dpkg -i "${tmpchrome}" || apt-get -f install -y
         rm -f "${tmpchrome}"
 fi
+
+log "Verifying NVIDIA Xorg module exists"
+ls /usr/lib/xorg/modules/drivers/nvidia_drv.so* || die "NVIDIA Xorg driver module not found. NVIDIA drivers may not be installed correctly."
 
 log "Enabling services"
 systemctl daemon-reload
