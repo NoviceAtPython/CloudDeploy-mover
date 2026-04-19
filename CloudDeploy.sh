@@ -33,6 +33,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
                                 tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || true
                         else
                                 echo "Tailscale is installed but not connected, and no auth key is set. Please set TAILSCALE_AUTHKEY and run 'tailscale up' manually."
+                        fi
                 fi
         fi
 
