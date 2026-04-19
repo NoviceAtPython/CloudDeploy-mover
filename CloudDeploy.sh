@@ -309,7 +309,7 @@ Section "Screen"
 
         SubSection "Display"
                 Depth   24
-                Virtual ${HEADLESS_RESOLUTION}
+                Virtual "${HEADLESS_RESOLUTION}"
         EndSubSection
 EndSection
 EOF
