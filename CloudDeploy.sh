@@ -277,6 +277,11 @@ NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 echo "Configuring monitor with X11 driver..."
 cat > /etc/X11/xorg.conf <<EOF
 
+Section "Files"
+        ModulePath                              "/usr/lib64/xorg/modules"
+        ModulePath                              "/usr/lib/xorg/modules"
+EndSection
+
 Section "ServerLayout"
         Identifier                              "Layout0"
         Screen 0                                "Screen0"
@@ -309,7 +314,7 @@ Section "Screen"
 
         SubSection "Display"
                 Depth   24
-                Virtual "${HEADLESS_RESOLUTION}"
+                Modes   "${HEADLESS_RESOLUTION}"
         EndSubSection
 EndSection
 EOF
