@@ -478,9 +478,10 @@ if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
 
         wait_for_apt
         apt-get upgrade -y
-        apt_install_wait flatpak steam-installer
+        apt_install_wait flatpak steam-installer wine64 winetricks
         flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
         flatpak install -y flathub com.heroicgameslauncher.hgl || true
+        flatpak install -y flathub net.lutris.Lutris || true
         flatpak install -y flathub org.prismlauncher.PrismLauncher || true
 
         tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
