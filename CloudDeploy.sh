@@ -337,17 +337,10 @@ export DISPLAY=:0
 export XAUTHORITY=/tmp/serverauth.sunshine
 export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 
-mkdir -p "\$XDG_RUNTIME_DIR"
+mkdir -p "\$XDG_RUNTIME_DIR" "${HOME_DIR}/.local/share" "${HOME_DIR}/.config"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-exec /usr/bin/runuser -u "${HEADLESS_USER}" -- env \
-        HOME="${HOME_DIR}" \
-        USER="${HEADLESS_USER}" \
-        LOGNAME="${HEADLESS_USER}" \
-        DISPLAY=:0 \
-        XAUTHORITY=/tmp/serverauth.sunshine \
-        XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}" \
-        dbus-run-session startplasma-x11
+exec dbus-run-session -- startplasma-x11
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.xinitrc"
@@ -365,8 +358,11 @@ export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-for _ in \$(seq 1 60); do
-    if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1; then
+for _ in $(seq 1 90); do
+    if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1 \
+       && pgrep -u "${HEADLESS_USER}" plasmashell >/dev/null 2>&1 \
+       && pgrep -u "${HEADLESS_USER}" kwin_x11 >/dev/null 2>&1; then
+        DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --output HDMI-0 --mode "${HEADLESS_RESOLUTION}" || true
         exec /usr/bin/sunshine
     fi
     sleep 1
