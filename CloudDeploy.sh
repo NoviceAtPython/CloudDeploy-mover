@@ -12,9 +12,9 @@ TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
 NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
-SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
+SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-}"
 SENTINEL="/opt/clouddeploy.installed"
-SCRIPT_VERSION="3"
+SCRIPT_VERSION="4"
 
 [[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
 
@@ -131,6 +131,25 @@ detect_nvidia_busid() {
         fi
 
         printf '%s\n' "${busid}"
+}
+
+detect_nvidia_render_node() {
+        local gpu_bus_short bypath
+
+        gpu_bus_short="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
+                | head -n1 \
+                | awk -F: '{print $(NF-1) ":" $NF}' \
+                | tr -d ' ')"
+
+        [[ -n "${gpu_bus_short}" ]] || return 1
+
+        bypath="$(ls -1 /dev/dri/by-path/*"${gpu_bus_short}"*-render 2>/dev/null | head -n1 || true)"
+        if [[ -n "${bypath}" ]]; then
+                readlink -f "${bypath}"
+                return 0
+        fi
+
+        ls -1 /dev/dri/renderD* 2>/dev/null | tail -n1
 }
 
 nvidia_driver_ready() {
@@ -273,6 +292,11 @@ fi
 log "Detecting NVIDIA BusID"
 NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
+
+log "Detecting NVIDIA render node"
+SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-$(detect_nvidia_render_node || true)}"
+[[ -n "${SUNSHINE_RENDER_NODE}" ]] || die "Could not detect NVIDIA render node."
+log "Using Sunshine render node: ${SUNSHINE_RENDER_NODE}"
 
 echo "Configuring monitor with X11 driver..."
 cat > /etc/X11/xorg.conf <<EOF
