@@ -134,22 +134,12 @@ detect_nvidia_busid() {
 }
 
 detect_nvidia_render_node() {
-        local gpu_bus_short bypath
-
-        gpu_bus_short="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader 2>/dev/null \
-                | head -n1 \
-                | awk -F: '{print $(NF-1) ":" $NF}' \
-                | tr -d ' ')"
-
-        [[ -n "${gpu_bus_short}" ]] || return 1
-
-        bypath="$(ls -1 /dev/dri/by-path/*"${gpu_bus_short}"*-render 2>/dev/null | head -n1 || true)"
-        if [[ -n "${bypath}" ]]; then
-                readlink -f "${bypath}"
-                return 0
-        fi
-
-        ls -1 /dev/dri/renderD* 2>/dev/null | tail -n1
+        local raw link
+        raw="$(nvidia-smi --query-gpu=pci.bus_id --format=csv,noheader | head -n1 | tr '[:upper:]' '[:lower:]')"
+        [[ -n "${raw}" ]] || return 1
+        link="/dev/dri/by-path/pci-${raw}-render"
+        [[ -e "${link}" ]] || return 1
+        readlink -f "${link}"
 }
 
 nvidia_driver_ready() {
@@ -294,8 +284,10 @@ NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
 
 log "Detecting NVIDIA render node"
-SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-$(detect_nvidia_render_node || true)}"
-[[ -n "${SUNSHINE_RENDER_NODE}" ]] || die "Could not detect NVIDIA render node."
+if [[ -z "${SUNSHINE_RENDER_NODE}" ]]; then
+        SUNSHINE_RENDER_NODE="$(detect_nvidia_render_node || true)"
+fi
+[[ -n "${SUNSHINE_RENDER_NODE}" ]] || SUNSHINE_RENDER_NODE="/dev/dri/renderD128"
 log "Using Sunshine render node: ${SUNSHINE_RENDER_NODE}"
 
 echo "Configuring monitor with X11 driver..."
@@ -382,11 +374,11 @@ export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-for _ in $(seq 1 90); do
+for ((i=0; i<90; i++)); do
     if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1 \
        && pgrep -u "${HEADLESS_USER}" plasmashell >/dev/null 2>&1 \
        && pgrep -u "${HEADLESS_USER}" kwin_x11 >/dev/null 2>&1; then
-        DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --output HDMI-0 --mode "${HEADLESS_RESOLUTION}" || true
+                DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --output HDMI-0 --mode "${HEADLESS_RESOLUTION}" >/dev/null 2>&1 || true
         exec /usr/bin/sunshine
     fi
     sleep 1
