@@ -10,7 +10,7 @@ SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP}"
+NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
 SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-/dev/dri/renderD128}"
 SENTINEL="/opt/clouddeploy.installed"
@@ -22,8 +22,8 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         echo "CloudDeploy.sh has already run on this machine for version $SCRIPT_VERSION. Restarting existing services and exiting..."
         systemctl daemon-reload || true
         systemctl reset-failed headless-plasma.service sunshine-headless.service tailscaled || true
-        systemctl enable headless-plasma.service sunshine-headless.service tailscaled|| true
-        systemctl restart tailscaled || true
+        systemctl enable --now headless-plasma.service sunshine-headless.service tailscaled || true
+        systemctl restart headless-plasma.service sunshine-headless.service tailscaled || true
         sleep 2
 
         if command -v tailscale >/dev/null 2>&1; then
@@ -278,6 +278,7 @@ echo "Configuring monitor with X11 driver..."
 cat > /etc/X11/xorg.conf <<EOF
 
 Section "Files"
+        ModulePath                              "/usr/lib/x86_64-linux-gnu/nvidia/xorg"
         ModulePath                              "/usr/lib64/xorg/modules"
         ModulePath                              "/usr/lib/xorg/modules"
 EndSection
@@ -311,6 +312,7 @@ Section "Screen"
         Device                                  "NvidiaCard"
         DefaultDepth                            24
         Option "TwinView"                       "True"
+        Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
 
         SubSection "Display"
                 Depth   24
@@ -331,11 +333,21 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
+export DISPLAY=:0
+export XAUTHORITY=/tmp/serverauth.sunshine
 export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-exec /usr/bin/runuser -u "${HEADLESS_USER}" -- dbus-run-session startplasma-x11
+exec /usr/bin/runuser -u "${HEADLESS_USER}" -- env \
+        HOME="${HOME_DIR}" \
+        USER="${HEADLESS_USER}" \
+        LOGNAME="${HEADLESS_USER}" \
+        DISPLAY=:0 \
+        XAUTHORITY=/tmp/serverauth.sunshine \
+        XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}" \
+        dbus-run-session startplasma-x11
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.xinitrc"
@@ -388,9 +400,9 @@ if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
        "${HOME_DIR}/.config/sunshine/sunshine_state.json.bak.$(date +%s)"
 fi
 
-log "Removing Sunshine KMS capability so X11 capture is used"
+log "Ensuring Sunshine has cap_sys_admin for NvFBC"
 if command -v setcap >/dev/null 2>&1 && command -v sunshine >/dev/null 2>&1; then
-    setcap -r "$(readlink -f "$(command -v sunshine)")" || true
+        setcap cap_sys_admin+p "$(readlink -f "$(command -v sunshine)")" || true
 fi
 
 log "Setting Sunshine web UI credentials"
@@ -404,8 +416,8 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-User=root
-Group=root
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=DISPLAY=:0
@@ -415,11 +427,8 @@ PermissionsStartOnly=true
 ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/touch /tmp/serverauth.sunshine
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/serverauth.sunshine
-ExecStartPre=/usr/bin/chmod 600 /tmp/serverauth.sunshine
-ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 15); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-ExecStart=/usr/bin/xinit ${HOME_DIR}/.xinitrc -- /usr/lib/xorg/Xorg :0 -auth /tmp/serverauth.sunshine -nolisten tcp
+ExecStartPre=/usr/bin/rm -f /tmp/serverauth.sunshine ${HOME_DIR}/.Xauthority
+ExecStart=/usr/bin/startx ${HOME_DIR}/.xinitrc -- :0 -auth /tmp/serverauth.sunshine
 Restart=always
 RestartSec=5
 StandardOutput=journal
