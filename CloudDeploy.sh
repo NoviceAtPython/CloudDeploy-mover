@@ -340,6 +340,9 @@ EOF
 log "Writing Plasma X11 session startup"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \
     "${HOME_DIR}/.local/bin" \
+        "${HOME_DIR}/.local/share" \
+        "${HOME_DIR}/.local/share/xorg" \
+        "${HOME_DIR}/.config" \
     "${HOME_DIR}/.config/sunshine"
 
 cat > "${HOME_DIR}/.xinitrc" <<EOF
@@ -374,10 +377,10 @@ export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-for ((i=0; i<90; i++)); do
-    if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1 \
-       && pgrep -u "${HEADLESS_USER}" plasmashell >/dev/null 2>&1 \
-       && pgrep -u "${HEADLESS_USER}" kwin_x11 >/dev/null 2>&1; then
+for _ in \$(seq 1 90); do
+        if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1 \
+                && pgrep -u "${HEADLESS_USER}" plasmashell >/dev/null 2>&1 \
+                && pgrep -u "${HEADLESS_USER}" kwin_x11 >/dev/null 2>&1; then
                 DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --output HDMI-0 --mode "${HEADLESS_RESOLUTION}" >/dev/null 2>&1 || true
         exec /usr/bin/sunshine
     fi
@@ -439,11 +442,13 @@ PermissionsStartOnly=true
 ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
+ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share/xorg
+ExecStartPre=/usr/bin/chown -R ${HEADLESS_USER}:${HEADLESS_USER} ${HOME_DIR}/.local ${HOME_DIR}/.config
 ExecStartPre=/usr/bin/touch /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/chmod 600 /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 15); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-ExecStart=/usr/bin/xinit ${HOME_DIR}/.xinitrc -- /usr/lib/xorg/Xorg :0 -auth /tmp/serverauth.sunshine -nolisten tcp
+ExecStart=/usr/bin/startx ${HOME_DIR}/.xinitrc -- :0 -auth /tmp/serverauth.sunshine -nolisten tcp
 Restart=always
 RestartSec=5
 StandardOutput=journal
