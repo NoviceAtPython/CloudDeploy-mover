@@ -10,11 +10,19 @@ SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-Aedyn11107@13}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-tskey-auth-kNatGervUa11CNTRL-jKpWxbykvf7hF6btz5dXg7EuZeMdTToD}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
-NVIDIA_DISPLAY_DEVICE="${NVIDIA_DISPLAY_DEVICE:-DFP-0}"
-HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-1920x1200}"
-SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-}"
-SENTINEL="/opt/clouddeploy.installed"
-SCRIPT_VERSION="4"
+KMS_OUTPUT="${KMS_OUTPUT:-}"
+SUNSHINE_CAPTURE_METHOD="${SUNSHINE_CAPTURE_METHOD:-kms}"
+SUNSHINE_ENCODER="${SUNSHINE_ENCODER:-nvenc}"
+TARGET_WIDTH="${TARGET_WIDTH:-3840}"
+TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
+HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-${TARGET_WIDTH}x${TARGET_HEIGHT}}"
+TARGET_FPS="${TARGET_FPS:-120}"
+ENABLE_HDR="${ENABLE_HDR:-1}"
+ENABLE_AV1="${ENABLE_AV1:-1}"
+ENABLE_HEVC="${ENABLE_HEVC:-1}"
+SUNSHINE_RENDER_NODE="${SUNSHINE_RENDER_NODE:-auto}"
+SENTINEL="/opt/clouddeploy-wayland.installed"
+SCRIPT_VERSION="5"
 
 [[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
 
@@ -221,15 +229,10 @@ log "Installing base packages"
 apt_update_retry
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
-        dbus-x11 xinit x11-xserver-utils pciutils jq libcap2-bin \
-        kde-plasma-desktop xserver-xorg xserver-xorg-legacy \
+        pciutils jq libcap2-bin \
+        kde-plasma-desktop plasma-workspace-wayland kwin-wayland xwayland \
+        pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         ubuntu-drivers-common
-
-log "Configuring Xorg wrapper permissions"
-cat > /etc/X11/Xwrapper.config <<EOF
-allowed_users=anybody
-needs_root_rights=yes
-EOF
 
 log "Checking NVIDIA driver status"
 if nvidia_driver_ready; then
@@ -284,110 +287,64 @@ NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
 
 log "Detecting NVIDIA render node"
-if [[ -z "${SUNSHINE_RENDER_NODE}" ]]; then
+if [[ -z "${SUNSHINE_RENDER_NODE}" || "${SUNSHINE_RENDER_NODE}" == "auto" ]]; then
         SUNSHINE_RENDER_NODE="$(detect_nvidia_render_node || true)"
 fi
 [[ -n "${SUNSHINE_RENDER_NODE}" ]] || SUNSHINE_RENDER_NODE="/dev/dri/renderD128"
 log "Using Sunshine render node: ${SUNSHINE_RENDER_NODE}"
 
-echo "Configuring monitor with X11 driver..."
-cat > /etc/X11/xorg.conf <<EOF
-
-Section "Files"
-        ModulePath                              "/usr/lib/x86_64-linux-gnu/nvidia/xorg"
-        ModulePath                              "/usr/lib64/xorg/modules"
-        ModulePath                              "/usr/lib/xorg/modules"
-EndSection
-
-Section "ServerLayout"
-        Identifier                              "Layout0"
-        Screen 0                                "Screen0"
-EndSection
-
-Section "Monitor"
-        Identifier                              "Monitor0"
-        HorizSync                               28.0-160.0
-        VertRefresh                             48.0-144.0
-EndSection
-
-Section "Device"
-        Identifier                              "NvidiaCard"
-        Driver                                  "nvidia"
-        BusID                                   "${NVIDIA_BUSID}"
-        Option "PrimaryGPU"                     "yes"
-        Option "AllowEmptyInitialConfiguration" "True"
-        Option "ConnectedMonitor"               "${NVIDIA_DISPLAY_DEVICE}"
-        Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
-        Option "UseDisplayDevice"               "${NVIDIA_DISPLAY_DEVICE}"
-        Option "ModeValidation"                 "NoEdidModes, NoMaxPClkCheck, AllowNonEdidModes, NoHorizSyncCheck, NoVertRefreshCheck"
-EndSection
-
-Section "Screen"
-        Identifier                              "Screen0"
-        Monitor                                 "Monitor0"
-        Device                                  "NvidiaCard"
-        DefaultDepth                            24
-        Option "TwinView"                       "True"
-        Option "MetaModes"                      "${HEADLESS_RESOLUTION}"
-
-        SubSection "Display"
-                Depth   24
-                Modes   "${HEADLESS_RESOLUTION}"
-        EndSubSection
-EndSection
-EOF
-
-log "Writing Plasma X11 session startup"
+log "Writing Plasma Wayland session startup"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \
-    "${HOME_DIR}/.local/bin" \
+        "${HOME_DIR}/.local/bin" \
         "${HOME_DIR}/.local/share" \
-        "${HOME_DIR}/.local/share/xorg" \
         "${HOME_DIR}/.config" \
-    "${HOME_DIR}/.config/sunshine"
+        "${HOME_DIR}/.config/sunshine"
 
-cat > "${HOME_DIR}/.xinitrc" <<EOF
+cat > "${HOME_DIR}/.local/bin/start-plasma-wayland.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export DISPLAY=:0
-export XAUTHORITY=/tmp/serverauth.sunshine
 export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+export XDG_SESSION_TYPE=wayland
+export XDG_CURRENT_DESKTOP=KDE
+export DESKTOP_SESSION=plasma
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland
+export SDL_VIDEODRIVER=wayland
+export MOZ_ENABLE_WAYLAND=1
 
 mkdir -p "\$XDG_RUNTIME_DIR" "${HOME_DIR}/.local/share" "${HOME_DIR}/.config"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-exec dbus-run-session -- startplasma-x11
+exec dbus-run-session -- startplasma-wayland
 EOF
 
-chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.xinitrc"
-chmod 0755 "${HOME_DIR}/.xinitrc"
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-plasma-wayland.sh"
+chmod 0755 "${HOME_DIR}/.local/bin/start-plasma-wayland.sh"
 
 cat > "${HOME_DIR}/.local/bin/start-sunshine-headless.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
 export HOME="${HOME_DIR}"
-export DISPLAY=:0
-export XAUTHORITY=/tmp/serverauth.sunshine
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
 export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
 for _ in \$(seq 1 90); do
-        if DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --query >/dev/null 2>&1 \
-                && pgrep -u "${HEADLESS_USER}" plasmashell >/dev/null 2>&1 \
-                && pgrep -u "${HEADLESS_USER}" kwin_x11 >/dev/null 2>&1; then
-                DISPLAY=:0 XAUTHORITY=/tmp/serverauth.sunshine xrandr --output HDMI-0 --mode "${HEADLESS_RESOLUTION}" >/dev/null 2>&1 || true
-        exec /usr/bin/sunshine
-    fi
-    sleep 1
+        if pgrep -u "${HEADLESS_USER}" -f "startplasma-wayland|kwin_wayland|plasmashell" >/dev/null 2>&1; then
+                exec /usr/bin/sunshine
+        fi
+        sleep 1
 done
 
-echo "X11 session never became ready for Sunshine" >&2
+echo "Wayland session never became ready for Sunshine" >&2
 exit 1
 EOF
 
@@ -395,13 +352,28 @@ chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-sunshine
 chmod 0755 "${HOME_DIR}/.local/bin/start-sunshine-headless.sh"
 
 log "Writing Sunshine config"
+if [[ "${ENABLE_HEVC}" == "1" ]]; then
+        HEVC_MODE="0"
+else
+        HEVC_MODE="1"
+fi
+
+if [[ "${ENABLE_AV1}" == "1" ]]; then
+        AV1_MODE="0"
+else
+        AV1_MODE="1"
+fi
+
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = info
-encoder = nvenc
-capture = nvfbc
+encoder = ${SUNSHINE_ENCODER}
+capture = ${SUNSHINE_CAPTURE_METHOD}
+${KMS_OUTPUT:+output_name = ${KMS_OUTPUT}}
 adapter_name = ${SUNSHINE_RENDER_NODE}
-hevc_mode = 1
-av1_mode = 1
+hevc_mode = ${HEVC_MODE}
+av1_mode = ${AV1_MODE}
+fps = [60, ${TARGET_FPS}]
+resolutions = [1920x1080, 1920x1200, 2560x1440, ${HEADLESS_RESOLUTION}]
 stream_audio = enabled
 address_family = ipv4
 ping_timeout = 60000
@@ -415,7 +387,7 @@ if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
        "${HOME_DIR}/.config/sunshine/sunshine_state.json.bak.$(date +%s)"
 fi
 
-log "Ensuring Sunshine has cap_sys_admin for NvFBC"
+log "Ensuring Sunshine has cap_sys_admin for KMS capture"
 if command -v setcap >/dev/null 2>&1 && command -v sunshine >/dev/null 2>&1; then
         setcap cap_sys_admin+p "$(readlink -f "$(command -v sunshine)")" || true
 fi
@@ -426,7 +398,7 @@ run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHI
 log "Writing headless Plasma systemd service"
 cat > /etc/systemd/system/headless-plasma.service <<EOF
 [Unit]
-Description=Headless X11 Plasma session on NVIDIA
+Description=Headless Plasma Wayland session on NVIDIA
 After=network-online.target
 Wants=network-online.target
 
@@ -435,20 +407,17 @@ User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
-Environment=DISPLAY=:0
+Environment=USER=${HEADLESS_USER}
+Environment=LOGNAME=${HEADLESS_USER}
 Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
-Environment=XAUTHORITY=/tmp/serverauth.sunshine
 PermissionsStartOnly=true
 ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share/xorg
+ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share ${HOME_DIR}/.config ${HOME_DIR}/.local/bin
 ExecStartPre=/usr/bin/chown -R ${HEADLESS_USER}:${HEADLESS_USER} ${HOME_DIR}/.local ${HOME_DIR}/.config
-ExecStartPre=/usr/bin/touch /tmp/serverauth.sunshine
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/serverauth.sunshine
-ExecStartPre=/usr/bin/chmod 600 /tmp/serverauth.sunshine
 ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 15); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-ExecStart=/usr/bin/startx ${HOME_DIR}/.xinitrc -- :0 -auth /tmp/serverauth.sunshine -nolisten tcp
+ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-plasma-wayland.sh
 Restart=always
 RestartSec=5
 StandardOutput=journal
@@ -461,7 +430,7 @@ EOF
 log "Writing Sunshine systemd service"
 cat > /etc/systemd/system/sunshine-headless.service <<EOF
 [Unit]
-Description=Sunshine on headless NVIDIA X11
+Description=Sunshine on headless NVIDIA Wayland
 After=headless-plasma.service network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
 Requires=headless-plasma.service
@@ -472,9 +441,8 @@ User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
-Environment=DISPLAY=:0
+Environment=USER=${HEADLESS_USER}
 Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
-Environment=XAUTHORITY=/tmp/serverauth.sunshine
 ExecStart=${HOME_DIR}/.local/bin/start-sunshine-headless.sh
 Restart=always
 RestartSec=5
@@ -486,11 +454,8 @@ WantedBy=multi-user.target
 EOF
 
 log "Stopping any old broken session bits"
-pkill -u "${HEADLESS_USER}" startplasma-x11 2>/dev/null || true
-pkill -u "${HEADLESS_USER}" plasmashell 2>/dev/null || true
-pkill -u "${HEADLESS_USER}" kwin_x11 2>/dev/null || true
-pkill sunshine 2>/dev/null || true
-pkill Xorg 2>/dev/null || true
+pkill -u "${HEADLESS_USER}" -f 'startplasma-wayland|kwin_wayland|plasmashell|sunshine' 2>/dev/null || true
+systemctl stop sddm 2>/dev/null || true
 
 log "Optional desktop apps"
 if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
@@ -514,16 +479,19 @@ if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
         rm -f "${tmpchrome}"
 fi
 
-log "Verifying NVIDIA Xorg module exists"
-find /usr /usr/lib64 -type f -name 'nvidia_drv.so*' 2>/dev/null | grep -q . || die "NVIDIA Xorg driver module not found. NVIDIA drivers may not be installed correctly."
-
 log "Enabling services"
 systemctl daemon-reload
-systemctl enable --now headless-plasma.service
+systemctl enable headless-plasma.service sunshine-headless.service tailscaled
+
+systemctl restart tailscaled || true
 systemctl restart headless-plasma.service
-systemctl enable --now sunshine-headless.service
-systemctl enable --now tailscaled
-systemctl restart tailscaled
+sleep 5
+systemctl restart sunshine-headless.service
+sleep 3
+
+systemctl is-active --quiet headless-plasma.service || die "headless-plasma.service failed to start"
+systemctl is-active --quiet sunshine-headless.service || die "sunshine-headless.service failed to start"
+systemctl is-active --quiet tailscaled || die "tailscaled failed to start"
 
 log "Finished"
 echo
