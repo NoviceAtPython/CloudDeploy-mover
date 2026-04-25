@@ -22,15 +22,16 @@ SUNSHINE_CAPTURE_METHOD="${SUNSHINE_CAPTURE_METHOD:-kms}"
 SUNSHINE_ENCODER="${SUNSHINE_ENCODER:-nvenc}"
 SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SESSION_BACKEND="${SESSION_BACKEND:-weston}"
+STREAM_MODE="${STREAM_MODE:-weston}"
 KMS_OUTPUT="${KMS_OUTPUT:-${FORCED_CONNECTOR}}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-${TARGET_WIDTH}x${TARGET_HEIGHT}}"
-ENABLE_AV1="${ENABLE_AV1:-0}"
-ENABLE_HEVC="${ENABLE_HEVC:-0}"
-SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-0}"
-SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
+ENABLE_AV1="${ENABLE_AV1:-1}"
+ENABLE_HEVC="${ENABLE_HEVC:-1}"
+SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
+SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-2}"
 RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="9"
+SCRIPT_VERSION="10"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -163,6 +164,7 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_ENCODER=%q\n' "${SUNSHINE_ENCODER}"
                 printf 'SUNSHINE_DRM_DEVICE=%q\n' "${SUNSHINE_DRM_DEVICE}"
                 printf 'SESSION_BACKEND=%q\n' "${SESSION_BACKEND}"
+                printf 'STREAM_MODE=%q\n' "${STREAM_MODE}"
                 printf 'KMS_OUTPUT=%q\n' "${KMS_OUTPUT}"
                 printf 'HEADLESS_RESOLUTION=%q\n' "${HEADLESS_RESOLUTION}"
                 printf 'SUNSHINE_AV1_MODE=%q\n' "${SUNSHINE_AV1_MODE}"
@@ -446,6 +448,257 @@ EOF
         chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 }
 
+install_clouddeploy_helpers() {
+        cat > /usr/local/sbin/clouddeploy-run <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+REPO_DIR="${CLOUDDEPLOY_REPO_DIR:-/home/user/CloudDeploy-mover}"
+
+cd "${REPO_DIR}"
+exec bash ./CloudDeploy-wayland.sh
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-run
+
+        cat > /usr/local/sbin/clouddeploy-write-env <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+
+[[ ${EUID} -eq 0 ]] || { echo "Run with sudo." >&2; exit 1; }
+
+prompt_default() {
+        local name="$1"
+        local default="$2"
+        local value
+
+        read -r -p "${name} [${default}]: " value
+        printf '%s\n' "${value:-${default}}"
+}
+
+HEADLESS_USER="$(prompt_default HEADLESS_USER "${HEADLESS_USER:-user}")"
+SUNSHINE_USER="$(prompt_default SUNSHINE_USER "${SUNSHINE_USER:-${HEADLESS_USER}}")"
+read -s -r -p "SUNSHINE_PASS: " SUNSHINE_PASS
+echo
+read -s -r -p "TAILSCALE_AUTHKEY (blank to skip): " TAILSCALE_AUTHKEY
+echo
+
+if [[ -z "${SUNSHINE_PASS}" ]]; then
+        echo "SUNSHINE_PASS is required." >&2
+        exit 1
+fi
+
+install -m 0600 /dev/null "${ENV_FILE}"
+{
+        printf 'HEADLESS_USER=%q\n' "${HEADLESS_USER}"
+        printf 'SUNSHINE_USER=%q\n' "${SUNSHINE_USER}"
+        printf 'SUNSHINE_PASS=%q\n' "${SUNSHINE_PASS}"
+        printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
+        printf 'FORCED_CONNECTOR=%q\n' "DP-1"
+        printf 'TARGET_WIDTH=%q\n' "3840"
+        printf 'TARGET_HEIGHT=%q\n' "2160"
+        printf 'TARGET_FPS=%q\n' "120"
+        printf 'ENABLE_HDR=%q\n' "0"
+        printf 'EDID_PROFILE=%q\n' "4k120-sdr"
+        printf 'WAYLAND_DISPLAY_NAME=%q\n' "wayland-cd"
+        printf 'SUNSHINE_DRM_DEVICE=%q\n' "auto"
+        printf 'SESSION_BACKEND=%q\n' "weston"
+        printf 'STREAM_MODE=%q\n' "weston"
+        printf 'RUNTIME_DIR=%q\n' "/tmp/runtime-user"
+        printf 'INSTALL_OPTIONAL_APPS=%q\n' "0"
+        printf 'SUNSHINE_AV1_MODE=%q\n' "2"
+        printf 'SUNSHINE_HEVC_MODE=%q\n' "2"
+} > "${ENV_FILE}"
+chmod 0600 "${ENV_FILE}"
+echo "Wrote ${ENV_FILE} with mode 0600."
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-write-env
+
+        cat > /usr/local/sbin/clouddeploy-reset-streaming <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+HEADLESS_USER="${HEADLESS_USER:-user}"
+STREAM_MODE="${STREAM_MODE:-weston}"
+FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
+TARGET_WIDTH="${TARGET_WIDTH:-3840}"
+TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
+TARGET_FPS="${TARGET_FPS:-120}"
+RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
+WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME:-wayland-cd}"
+SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
+SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-2}"
+SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
+HOME_DIR="$(getent passwd "${HEADLESS_USER}" | cut -d: -f6 || true)"
+HOME_DIR="${HOME_DIR:-/home/${HEADLESS_USER}}"
+
+detect_nvidia_drm_card() {
+        local card vendor
+
+        for card in /sys/class/drm/card[0-9]; do
+                [[ -e "${card}/device/vendor" ]] || continue
+                vendor="$(cat "${card}/device/vendor" 2>/dev/null || true)"
+                if [[ "${vendor}" == "0x10de" ]]; then
+                        printf '/dev/dri/%s\n' "$(basename "${card}")"
+                        return 0
+                fi
+        done
+
+        return 1
+}
+
+if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
+        SUNSHINE_DRM_DEVICE="$(detect_nvidia_drm_card || true)"
+fi
+
+if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
+        echo "Could not detect NVIDIA DRM card for Sunshine KMS capture." >&2
+        exit 1
+fi
+
+case "${STREAM_MODE}" in
+        weston)
+                ;;
+        plasma)
+                echo "STREAM_MODE=plasma is reserved for the KDE Plasma SDR desktop path and is not enabled yet." >&2
+                exit 1
+                ;;
+        gamescope)
+                echo "STREAM_MODE=gamescope is reserved for the future HDR game path and is not enabled yet." >&2
+                exit 1
+                ;;
+        *)
+                echo "Unsupported STREAM_MODE='${STREAM_MODE}'." >&2
+                exit 1
+                ;;
+esac
+
+echo "Performing exact known-good clean reset before final validation"
+
+systemctl stop sunshine-headless.service weston-kms-session.service 2>/dev/null || true
+pkill sunshine 2>/dev/null || true
+pkill -f '^weston ' 2>/dev/null || true
+
+rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock"
+
+install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
+cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<CONF
+min_log_level = debug
+encoder = nvenc
+capture = kms
+adapter_name = ${SUNSHINE_DRM_DEVICE}
+hevc_mode = ${SUNSHINE_HEVC_MODE}
+av1_mode = ${SUNSHINE_AV1_MODE}
+stream_audio = enabled
+address_family = ipv4
+ping_timeout = 60000
+CONF
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
+
+systemctl reset-failed weston-kms-session.service sunshine-headless.service || true
+
+systemctl start weston-kms-session.service
+sleep 8
+
+journalctl -u weston-kms-session.service -n 120 --no-pager \
+  | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|fatal|error" || true
+
+systemctl start sunshine-headless.service
+sleep 5
+
+journalctl -u sunshine-headless.service -n 160 --no-pager \
+  | grep -Ei 'Desktop resolution|Monitor 0|Found monitor|Screencasting|/dev/dri|Creating encoder|Nvenc initialized|Found H.264|Found AV1|Error|Fatal' || true
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-reset-streaming
+
+        cat > /etc/systemd/system/clouddeploy-reset-streaming.service <<'EOF'
+[Unit]
+Description=Reset CloudDeploy Weston/Sunshine streaming stack
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/clouddeploy-wayland.env
+ExecStart=/usr/local/sbin/clouddeploy-reset-streaming
+EOF
+
+        cat > /usr/local/sbin/clouddeploy-watch-streaming <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+LOCK_FILE="/run/clouddeploy-reset-streaming.lock"
+LAST_FILE="/run/clouddeploy-reset-streaming.last"
+
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+exec 9>"${LOCK_FILE}"
+flock -n 9 || exit 0
+
+now="$(date +%s)"
+if [[ -f "${LAST_FILE}" ]]; then
+        last="$(cat "${LAST_FILE}" 2>/dev/null || echo 0)"
+        if [[ "${last}" =~ ^[0-9]+$ ]] && (( now - last < 180 )); then
+                exit 0
+        fi
+fi
+
+recent_log="$(journalctl -u sunshine-headless.service --since '45 seconds ago' --no-pager 2>/dev/null || true)"
+if printf '%s\n' "${recent_log}" | grep -Eiq "Couldn't find monitor \\[0\\]|Unable to find display or encoder during startup|Couldn't find any working encoder matching|Fatal: Please ensure your manually chosen GPU and monitor are connected and powered on"; then
+        printf '%s\n' "${now}" > "${LAST_FILE}"
+        systemctl start clouddeploy-reset-streaming.service
+fi
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-watch-streaming
+
+        cat > /etc/systemd/system/clouddeploy-watch-streaming.service <<'EOF'
+[Unit]
+Description=Watch CloudDeploy Sunshine logs for recoverable encoder errors
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/etc/clouddeploy-wayland.env
+ExecStart=/usr/local/sbin/clouddeploy-watch-streaming
+EOF
+
+        cat > /etc/systemd/system/clouddeploy-watch-streaming.timer <<'EOF'
+[Unit]
+Description=Run CloudDeploy Sunshine recovery watchdog
+
+[Timer]
+OnBootSec=60
+OnUnitActiveSec=30
+Unit=clouddeploy-watch-streaming.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+        systemctl daemon-reload
+}
+
 KNOWN_WESTON_MODE_LINE=""
 KNOWN_SUNSHINE_RESOLUTION_LINE=""
 KNOWN_SUNSHINE_MONITOR_LINE=""
@@ -599,94 +852,22 @@ wait_for_sunshine_post_start_markers() {
         return 1
 }
 
-start_streaming_stack_ordered() {
-        local rc=0
-
-        log "Performing known-good clean reset before starting Weston and Sunshine"
-        systemctl stop sunshine-headless.service 2>/dev/null || true
-        systemctl stop weston-kms-session.service 2>/dev/null || true
-        pkill -u "${HEADLESS_USER}" sunshine 2>/dev/null || true
-        pkill -u "${HEADLESS_USER}" -f '^weston ' 2>/dev/null || true
-        rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock" || true
-        write_sunshine_config
-        systemctl reset-failed weston-kms-session.service sunshine-headless.service 2>/dev/null || true
-
-        if ! systemctl start weston-kms-session.service; then
-                print_streaming_diagnostics
-                return 1
-        fi
-
-        if ! wait_for_weston_ready; then
-                print_streaming_diagnostics
-                return 1
-        fi
-
-        sleep 2
-        log "Weston is ready; starting Sunshine"
-        LAST_SUNSHINE_START_SINCE="$(date '+%F %T')"
-        if ! systemctl start sunshine-headless.service; then
-                print_streaming_diagnostics
-                return 1
-        fi
-
-        if wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}"; then
-                return 0
-        else
-                rc=$?
-                return "${rc}"
-        fi
-}
-
-ordered_restart_streaming_stack() {
-        local rc=0
-
-        if start_streaming_stack_ordered; then
-                return 0
-        else
-                rc=$?
-        fi
-
-        if [[ "${rc}" -eq 2 ]]; then
-                echo "Detected Sunshine Desktop resolution: 0x0; diagnostics before one more full clean ordered reset:"
-                print_streaming_diagnostics
-
-                if start_streaming_stack_ordered; then
-                        return 0
-                else
-                        rc=$?
-                fi
-        fi
-
-        print_streaming_diagnostics
-        return "${rc}"
-}
-
 known_good_clean_reset_streaming_stack() {
-        log "Performing exact known-good clean reset before final validation"
-
-        systemctl stop sunshine-headless.service weston-kms-session.service 2>/dev/null || true
-        pkill sunshine 2>/dev/null || true
-        pkill -f '^weston ' 2>/dev/null || true
-
-        rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock"
-
-        write_sunshine_config
-
-        chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
-
-        systemctl reset-failed weston-kms-session.service sunshine-headless.service || true
-
-        systemctl start weston-kms-session.service
-        sleep 8
-
-        journalctl -u weston-kms-session.service -n 120 --no-pager \
-          | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|fatal|error" || true
-
-        systemctl start sunshine-headless.service
-        sleep 5
-
-        journalctl -u sunshine-headless.service -n 160 --no-pager \
-          | grep -Ei 'Desktop resolution|Monitor 0|Found monitor|Screencasting|/dev/dri|Creating encoder|Nvenc initialized|Found H.264|Found AV1|Error|Fatal' || true
+        log "Running clouddeploy-reset-streaming before final validation"
+        write_clouddeploy_env_file
+        env \
+                HEADLESS_USER="${HEADLESS_USER}" \
+                STREAM_MODE="${STREAM_MODE}" \
+                FORCED_CONNECTOR="${FORCED_CONNECTOR}" \
+                TARGET_WIDTH="${TARGET_WIDTH}" \
+                TARGET_HEIGHT="${TARGET_HEIGHT}" \
+                TARGET_FPS="${TARGET_FPS}" \
+                RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME}" \
+                SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE}" \
+                SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE}" \
+                SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE}" \
+                /usr/local/sbin/clouddeploy-reset-streaming
 }
 
 validate_streaming_stack_ready() {
@@ -721,15 +902,6 @@ validate_streaming_stack_ready() {
 
 print_known_good_checklist() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
-        local codec_profile="baseline / H.264-first"
-        local moonlight_codec="H.264"
-        local moonlight_label="For baseline"
-
-        if [[ "${SUNSHINE_AV1_MODE}" == "2" ]]; then
-                codec_profile="AV1 test profile; set Moonlight codec to AV1"
-                moonlight_codec="AV1"
-                moonlight_label="For AV1 test"
-        fi
 
         echo
         echo "CloudDeploy 4K120 SDR status:"
@@ -743,8 +915,8 @@ print_known_good_checklist() {
         echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
         echo "[OK] Sunshine KMS capture found monitor (${KNOWN_SUNSHINE_KMS_LINE})"
         echo "[OK] NVENC initialized (${KNOWN_SUNSHINE_NVENC_LINE})"
-        echo "Codec profile: ${codec_profile}"
-        echo "${moonlight_label}: Moonlight: ${target_mode}, ${TARGET_FPS} FPS, HDR off, ${moonlight_codec}"
+        echo "Codec profile: AV1/HEVC enabled SDR profile"
+        echo "Moonlight: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
 
 install_optional_apps_nonfatal() {
@@ -790,8 +962,10 @@ install_optional_apps_nonfatal() {
 # =========================
 require_root
 
+install_clouddeploy_helpers
+
 if [[ -z "${SUNSHINE_PASS}" ]]; then
-        die "SUNSHINE_PASS is required. Re-run with: sudo SUNSHINE_PASS='<strong-password>' ... bash ./CloudDeploy-wayland.sh"
+        die "SUNSHINE_PASS is required. Run: sudo clouddeploy-write-env && sudo clouddeploy-run, or provide SUNSHINE_PASS in the environment."
 fi
 
 if id "${HEADLESS_USER}" >/dev/null 2>&1; then
@@ -817,6 +991,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
                 systemctl restart tailscaled || true
         fi
 
+        install_clouddeploy_helpers
         known_good_clean_reset_streaming_stack
 
         if command -v tailscale >/dev/null 2>&1; then
@@ -834,7 +1009,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
         systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
         rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
-        rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
+        systemctl enable --now clouddeploy-watch-streaming.timer >/dev/null 2>&1 || true
 
         echo
         echo "Service states:"
@@ -911,9 +1086,6 @@ apt_install_wait \
         kde-plasma-desktop plasma-workspace-wayland kwin-wayland weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         ubuntu-drivers-common
-
-log "Installing Gamescope package (optional)"
-apt_install_wait gamescope || echo "Gamescope apt package unavailable; continuing without it"
 
 log "Checking NVIDIA driver status"
 if nvidia_driver_ready; then
@@ -1012,6 +1184,21 @@ if [[ "${SESSION_BACKEND}" != "weston" ]]; then
         die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Phase 2 currently supports weston only."
 fi
 
+case "${STREAM_MODE}" in
+        weston)
+                log "STREAM_MODE=weston: minimal 4K120 SDR game streaming mode"
+                ;;
+        plasma)
+                die "STREAM_MODE=plasma is reserved for the future KDE Plasma SDR desktop mode and is not enabled yet."
+                ;;
+        gamescope)
+                die "STREAM_MODE=gamescope is reserved for the future HDR game mode and is not enabled yet."
+                ;;
+        *)
+                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: weston."
+                ;;
+esac
+
 log "Writing Weston KMS session startup"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \
         "${HOME_DIR}/.local/bin" \
@@ -1097,36 +1284,6 @@ EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-sunshine-headless.sh"
 chmod 0755 "${HOME_DIR}/.local/bin/start-sunshine-headless.sh"
-
-cat > "${HOME_DIR}/.local/bin/start-gamescope-hdr-test.sh" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-export HOME="${HOME_DIR}"
-export USER="${HEADLESS_USER}"
-export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
-export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-export __GLX_VENDOR_LIBRARY_NAME=nvidia
-
-mkdir -p "\$XDG_RUNTIME_DIR"
-chmod 700 "\$XDG_RUNTIME_DIR"
-
-exec /usr/bin/gamescope \
-        -O "${FORCED_CONNECTOR}" \
-        -W "${TARGET_WIDTH}" -H "${TARGET_HEIGHT}" \
-        -w "${TARGET_WIDTH}" -h "${TARGET_HEIGHT}" \
-        -r "${TARGET_FPS}" \
-        --expose-wayland \
-        --force-composition \
-        --hdr-enabled \
-        --hdr-itm-enable \
-        -- /usr/bin/weston-simple-shm
-EOF
-
-chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-gamescope-hdr-test.sh"
-chmod 0755 "${HOME_DIR}/.local/bin/start-gamescope-hdr-test.sh"
 
 cat > "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh" <<EOF
 #!/usr/bin/env bash
@@ -1273,38 +1430,8 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-log "Writing experimental Gamescope HDR test service"
-cat > /etc/systemd/system/gamescope-hdr-test.service <<EOF
-[Unit]
-Description=Experimental Gamescope HDR KMS test
-After=network-online.target
-Wants=network-online.target
-Conflicts=weston-kms-session.service sunshine-headless.service
-
-[Service]
-User=${HEADLESS_USER}
-Group=${HEADLESS_USER}
-WorkingDirectory=${HOME_DIR}
-Environment=HOME=${HOME_DIR}
-Environment=USER=${HEADLESS_USER}
-Environment=LOGNAME=${HEADLESS_USER}
-Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
-Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
-ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
-ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-gamescope-hdr-test.sh
-Restart=on-failure
-RestartSec=5
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
 log "Stopping any old broken session bits"
-pkill -u "${HEADLESS_USER}" -f 'weston|gamescope|sunshine|kwin_wayland|plasmashell|startplasma-wayland' 2>/dev/null || true
+pkill -u "${HEADLESS_USER}" -f 'weston|sunshine|kwin_wayland|plasmashell|startplasma-wayland' 2>/dev/null || true
 systemctl stop sddm 2>/dev/null || true
 
 log "Enabling services"
@@ -1313,11 +1440,11 @@ systemctl enable weston-kms-session.service sunshine-headless.service
 if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl enable tailscaled || true
 fi
-systemctl disable gamescope-hdr-test.service 2>/dev/null || true
 
 if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl restart tailscaled || true
 fi
+install_clouddeploy_helpers
 known_good_clean_reset_streaming_stack
 
 validate_streaming_stack_ready
@@ -1327,9 +1454,9 @@ echo "$SCRIPT_VERSION" > "$SENTINEL"
 systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
+systemctl enable --now clouddeploy-watch-streaming.timer >/dev/null 2>&1 || true
 
 install_optional_apps_nonfatal
-rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
 
 echo
 echo "Use Moonlight against the Tailscale IP, not the public IP."
@@ -1343,7 +1470,7 @@ if command -v tailscale >/dev/null 2>&1; then
 fi
 
 echo "Sunshine web UI username: ${SUNSHINE_USER}"
-echo "Sunshine web UI password: ${SUNSHINE_PASS}"
+echo "Sunshine web UI password: stored in ${CLOUDDEPLOY_ENV_FILE} when configured"
 echo
 echo "If Moonlight shows a PIN, enter it in Sunshine's PIN tab."
 echo "Do NOT inject sunshine_state.json pairings in the deploy script."
