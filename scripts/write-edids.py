@@ -61,7 +61,7 @@ def range_limits(vmin: int, vmax: int, hmin: int, hmax: int) -> bytes:
     d[6] = vmax
     d[7] = hmin
     d[8] = hmax
-    d[9] = 0x1E
+    d[9] = 0xFF
     return bytes(d)
 
 
@@ -95,7 +95,7 @@ def base_block(name: str) -> bytes:
 
 def cta_block(vics, hdr=False) -> bytes:
     data = bytearray()
-    data.extend([0x20 | len(vics), *vics])
+    data.extend([0x40 | len(vics), *vics])
     if hdr:
         data.extend([0x73, 0x05, 0xC0, 0x00])
         data.extend([0x76, 0x06, 0x0D, 0x01, 100, 80, 1])
