@@ -184,7 +184,6 @@ set -euo pipefail
 
 [[ -f "${REBOOT_MARKER}" ]] || exit 0
 reason="\$(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo unknown)"
-rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}"
 CLOUDDEPLOY_CONTINUE=1 CLOUDDEPLOY_CONTINUE_REASON="\${reason}" /bin/bash "${script_path}"
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-wayland-continue.sh
@@ -662,6 +661,34 @@ ordered_restart_streaming_stack() {
         return "${rc}"
 }
 
+known_good_clean_reset_streaming_stack() {
+        log "Performing exact known-good clean reset before final validation"
+
+        systemctl stop sunshine-headless.service weston-kms-session.service 2>/dev/null || true
+        pkill sunshine 2>/dev/null || true
+        pkill -f '^weston ' 2>/dev/null || true
+
+        rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock"
+
+        write_sunshine_config
+
+        chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
+
+        systemctl reset-failed weston-kms-session.service sunshine-headless.service || true
+
+        systemctl start weston-kms-session.service
+        sleep 8
+
+        journalctl -u weston-kms-session.service -n 120 --no-pager \
+          | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|fatal|error" || true
+
+        systemctl start sunshine-headless.service
+        sleep 5
+
+        journalctl -u sunshine-headless.service -n 160 --no-pager \
+          | grep -Ei 'Desktop resolution|Monitor 0|Found monitor|Screencasting|/dev/dri|Creating encoder|Nvenc initialized|Found H.264|Found AV1|Error|Fatal' || true
+}
+
 validate_streaming_stack_ready() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
 
@@ -790,7 +817,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
                 systemctl restart tailscaled || true
         fi
 
-        ordered_restart_streaming_stack || die "Streaming stack did not pass post-start stabilization"
+        known_good_clean_reset_streaming_stack
 
         if command -v tailscale >/dev/null 2>&1; then
                 if ! tailscale status >/dev/null 2>&1; then
@@ -804,6 +831,9 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         fi
 
         validate_streaming_stack_ready
+        systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+        systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+        rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
         rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
 
         echo
@@ -1288,15 +1318,15 @@ systemctl disable gamescope-hdr-test.service 2>/dev/null || true
 if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl restart tailscaled || true
 fi
-ordered_restart_streaming_stack || die "Streaming stack did not pass post-start stabilization"
+known_good_clean_reset_streaming_stack
 
 validate_streaming_stack_ready
 
 echo "$SCRIPT_VERSION" > "$SENTINEL"
 
-rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
 systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
-systemctl stop clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
 
 install_optional_apps_nonfatal
 rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
