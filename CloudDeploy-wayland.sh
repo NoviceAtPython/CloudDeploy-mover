@@ -430,6 +430,23 @@ apt_purge_wait() {
         apt-get purge -y "$@"
 }
 
+write_sunshine_config() {
+        install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
+
+        cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
+min_log_level = debug
+encoder = nvenc
+capture = kms
+adapter_name = ${SUNSHINE_DRM_DEVICE}
+hevc_mode = ${SUNSHINE_HEVC_MODE}
+av1_mode = ${SUNSHINE_AV1_MODE}
+stream_audio = enabled
+address_family = ipv4
+ping_timeout = 60000
+EOF
+        chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
+}
+
 KNOWN_WESTON_MODE_LINE=""
 KNOWN_SUNSHINE_RESOLUTION_LINE=""
 KNOWN_SUNSHINE_MONITOR_LINE=""
@@ -454,26 +471,8 @@ weston_current_mode_line_from_log() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
 
         printf '%s\n' "${weston_log}" \
-                | awk -v output="${FORCED_CONNECTOR}" \
-                        -v target="${target_mode}" \
-                        -v refresh='@(119([.][0-9]+)?|120([.][0-9]+)?)' '
-                        $0 ~ ("Output " output " video modes:") {
-                                in_target_output=1
-                                next
-                        }
-                        $0 ~ /Output .+ video modes:/ && $0 !~ ("Output " output " video modes:") {
-                                in_target_output=0
-                        }
-                        in_target_output && $0 ~ target refresh && $0 ~ /current/ {
-                                line=$0
-                        }
-                        $0 ~ output && $0 ~ target refresh && $0 ~ /current/ {
-                                line=$0
-                        }
-                        END {
-                                if (line != "") print line
-                        }' \
-                | tail -n1
+                | grep -Ei "${target_mode}@(119|120)([.][0-9]+)?, current|${target_mode}.*current" \
+                | tail -n1 || true
 }
 
 refresh_streaming_log_markers() {
@@ -544,15 +543,22 @@ print_server_validation_diagnostics() {
 
 wait_for_weston_ready() {
         local socket_path="${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}"
+        local weston_output_enabled=""
 
         for _ in $(seq 1 90); do
                 LAST_WESTON_LOG="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
                 KNOWN_WESTON_MODE_LINE="$(weston_current_mode_line_from_log "${LAST_WESTON_LOG}" || true)"
+                weston_output_enabled="$(printf '%s\n' "${LAST_WESTON_LOG}" \
+                        | grep -F "Output '${FORCED_CONNECTOR}' enabled" \
+                        | tail -n1 || true)"
 
                 if [[ -S "${socket_path}" ]] \
-                        && pgrep -u "${HEADLESS_USER}" -x weston >/dev/null 2>&1 \
-                        && [[ -n "${KNOWN_WESTON_MODE_LINE}" ]]; then
-                        return 0
+                        && pgrep -u "${HEADLESS_USER}" -x weston >/dev/null 2>&1; then
+                        if [[ -n "${KNOWN_WESTON_MODE_LINE}" ]] \
+                                || [[ -n "${weston_output_enabled}" ]] \
+                                || { connector_forced_connected && connector_has_mode "${TARGET_WIDTH}x${TARGET_HEIGHT}"; }; then
+                                return 0
+                        fi
                 fi
 
                 sleep 1
@@ -595,10 +601,16 @@ wait_for_sunshine_post_start_markers() {
 }
 
 start_streaming_stack_ordered() {
-        log "Starting Weston before Sunshine"
+        local rc=0
+
+        log "Performing known-good clean reset before starting Weston and Sunshine"
         systemctl stop sunshine-headless.service 2>/dev/null || true
         systemctl stop weston-kms-session.service 2>/dev/null || true
+        pkill -u "${HEADLESS_USER}" sunshine 2>/dev/null || true
+        pkill -u "${HEADLESS_USER}" -f '^weston ' 2>/dev/null || true
         rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock" || true
+        write_sunshine_config
+        systemctl reset-failed weston-kms-session.service sunshine-headless.service 2>/dev/null || true
 
         if ! systemctl start weston-kms-session.service; then
                 print_streaming_diagnostics
@@ -610,34 +622,44 @@ start_streaming_stack_ordered() {
                 return 1
         fi
 
+        sleep 2
+        log "Weston is ready; starting Sunshine"
         LAST_SUNSHINE_START_SINCE="$(date '+%F %T')"
         if ! systemctl start sunshine-headless.service; then
                 print_streaming_diagnostics
                 return 1
         fi
+
+        if wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}"; then
+                return 0
+        else
+                rc=$?
+                return "${rc}"
+        fi
 }
 
-stabilize_sunshine_after_start() {
+ordered_restart_streaming_stack() {
         local rc=0
 
-        wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}" && return 0
-        rc=$?
+        if start_streaming_stack_ordered; then
+                return 0
+        else
+                rc=$?
+        fi
 
         if [[ "${rc}" -eq 2 ]]; then
-                echo "Detected Sunshine Desktop resolution: 0x0; diagnostics before one clean ordered restart:"
+                echo "Detected Sunshine Desktop resolution: 0x0; diagnostics before one more full clean ordered reset:"
                 print_streaming_diagnostics
-                start_streaming_stack_ordered || return 1
-                wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}" && return 0
-                rc=$?
+
+                if start_streaming_stack_ordered; then
+                        return 0
+                else
+                        rc=$?
+                fi
         fi
 
         print_streaming_diagnostics
         return "${rc}"
-}
-
-ordered_restart_streaming_stack() {
-        start_streaming_stack_ordered || return 1
-        stabilize_sunshine_after_start
 }
 
 validate_streaming_stack_ready() {
@@ -672,6 +694,15 @@ validate_streaming_stack_ready() {
 
 print_known_good_checklist() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+        local codec_profile="baseline / H.264-first"
+        local moonlight_codec="H.264"
+        local moonlight_label="For baseline"
+
+        if [[ "${SUNSHINE_AV1_MODE}" == "2" ]]; then
+                codec_profile="AV1 test profile; set Moonlight codec to AV1"
+                moonlight_codec="AV1"
+                moonlight_label="For AV1 test"
+        fi
 
         echo
         echo "CloudDeploy 4K120 SDR status:"
@@ -685,7 +716,8 @@ print_known_good_checklist() {
         echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
         echo "[OK] Sunshine KMS capture found monitor (${KNOWN_SUNSHINE_KMS_LINE})"
         echo "[OK] NVENC initialized (${KNOWN_SUNSHINE_NVENC_LINE})"
-        echo "Next: connect Moonlight at ${target_mode} ${TARGET_FPS} FPS, HDR off"
+        echo "Codec profile: ${codec_profile}"
+        echo "${moonlight_label}: Moonlight: ${target_mode}, ${TARGET_FPS} FPS, HDR off, ${moonlight_codec}"
 }
 
 install_optional_apps_nonfatal() {
@@ -735,8 +767,21 @@ if [[ -z "${SUNSHINE_PASS}" ]]; then
         die "SUNSHINE_PASS is required. Re-run with: sudo SUNSHINE_PASS='<strong-password>' ... bash ./CloudDeploy-wayland.sh"
 fi
 
+if id "${HEADLESS_USER}" >/dev/null 2>&1; then
+        HOME_DIR="$(user_home "${HEADLESS_USER}")"
+else
+        HOME_DIR=""
+fi
+
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
+        [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
+        if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
+                SUNSHINE_DRM_DEVICE="$(detect_nvidia_drm_card || true)"
+        fi
+        [[ -n "${SUNSHINE_DRM_DEVICE}" ]] && [[ "${SUNSHINE_DRM_DEVICE}" != "auto" ]] \
+                || die "Could not detect NVIDIA DRM card node"
+
         systemctl daemon-reload || true
         systemctl reset-failed weston-kms-session.service sunshine-headless.service tailscaled || true
         systemctl enable weston-kms-session.service sunshine-headless.service || true
@@ -1117,19 +1162,7 @@ chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-km
 chmod 0755 "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
 
 log "Writing Sunshine config"
-cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
-min_log_level = debug
-encoder = nvenc
-capture = kms
-adapter_name = ${SUNSHINE_DRM_DEVICE}
-hevc_mode = ${SUNSHINE_HEVC_MODE}
-av1_mode = ${SUNSHINE_AV1_MODE}
-stream_audio = enabled
-address_family = ipv4
-ping_timeout = 60000
-EOF
-
-chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config"
+write_sunshine_config
 
 log "Removing stale Sunshine state to avoid broken pre-pairing"
 if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
