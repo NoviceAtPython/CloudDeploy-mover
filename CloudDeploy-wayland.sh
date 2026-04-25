@@ -14,8 +14,8 @@ FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
-ENABLE_HDR="${ENABLE_HDR:-1}"
-EDID_PROFILE="${EDID_PROFILE:-auto}"
+ENABLE_HDR="${ENABLE_HDR:-0}"
+EDID_PROFILE="${EDID_PROFILE:-4k120-sdr}"
 WESTON_MODE="${WESTON_MODE:-${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS}}"
 WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME:-wayland-cd}"
 SUNSHINE_CAPTURE_METHOD="${SUNSHINE_CAPTURE_METHOD:-kms}"
@@ -26,8 +26,12 @@ KMS_OUTPUT="${KMS_OUTPUT:-${FORCED_CONNECTOR}}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-${TARGET_WIDTH}x${TARGET_HEIGHT}}"
 ENABLE_AV1="${ENABLE_AV1:-1}"
 ENABLE_HEVC="${ENABLE_HEVC:-1}"
+RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="6"
+SCRIPT_VERSION="7"
+REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
+REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
+GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
 
 [[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
 
@@ -168,6 +172,14 @@ detect_nvidia_drm_card() {
         return 1
 }
 
+nvidia_modules_present_for_running_kernel() {
+        local kernel
+        kernel="$(uname -r)"
+        find "/lib/modules/${kernel}" -type f \
+                \( -name 'nvidia*.ko' -o -name 'nvidia*.ko.xz' -o -name 'nvidia*.ko.zst' \) \
+                2>/dev/null | grep -q .
+}
+
 write_phase2_edids() {
         install -d -m 0755 /lib/firmware/edid
 
@@ -212,15 +224,16 @@ install_continuation_service() {
 #!/usr/bin/env bash
 set -euo pipefail
 
-[[ -f /opt/clouddeploy-wayland.needs-reboot ]] || exit 0
-rm -f /opt/clouddeploy-wayland.needs-reboot
-CLOUDDEPLOY_CONTINUE=1 /bin/bash "${script_path}"
+[[ -f "${REBOOT_MARKER}" ]] || exit 0
+reason="$(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo unknown)"
+rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}"
+CLOUDDEPLOY_CONTINUE=1 CLOUDDEPLOY_CONTINUE_REASON="\${reason}" /bin/bash "${script_path}"
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-wayland-continue.sh
 
         cat > /etc/systemd/system/clouddeploy-wayland-continue.service <<EOF
 [Unit]
-Description=Continue CloudDeploy Wayland after EDID reboot
+Description=Continue CloudDeploy Wayland after reboot
 After=network-online.target
 Wants=network-online.target
 
@@ -236,12 +249,152 @@ EOF
         systemctl enable clouddeploy-wayland-continue.service
 }
 
+schedule_reboot_for_continuation() {
+        local reason="$1"
+        local message="$2"
+
+        install_continuation_service
+        echo "${reason}" > "${REBOOT_REASON_FILE}"
+        touch "${REBOOT_MARKER}"
+        log "${message}"
+        reboot
+        exit 0
+}
+
+strip_clouddeploy_args_from_cmdline() {
+        local cmdline="$1"
+        local token
+        local -a tokens
+        local -a kept
+
+        read -r -a tokens <<<"${cmdline}"
+        for token in "${tokens[@]}"; do
+                case "${token}" in
+                        drm.edid_firmware=*edid/virtual-*.bin|video=${FORCED_CONNECTOR}:e|nvidia-drm.modeset=*|nvidia-drm.fbdev=*)
+                                ;;
+                        *)
+                                kept+=("${token}")
+                                ;;
+                esac
+        done
+
+        printf '%s\n' "${kept[*]}"
+}
+
+sanitize_grub_default_cmdline() {
+        local current cleaned
+        [[ -f /etc/default/grub ]] || return 0
+
+        current="$(sed -n 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/p' /etc/default/grub | head -n1 || true)"
+        [[ -n "${current}" ]] || return 0
+
+        cleaned="$(strip_clouddeploy_args_from_cmdline "${current}")"
+        sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${cleaned}\"|" /etc/default/grub
+}
+
+write_phase2_grub_override() {
+        local arg_edid="$1"
+        local arg_video="$2"
+        local arg_modeset="$3"
+        local arg_fbdev="$4"
+
+        install -d -m 0755 /etc/default/grub.d
+        sanitize_grub_default_cmdline
+
+        cat > "${GRUB_OVERRIDE_FILE}" <<EOF
+# Managed by CloudDeploy Wayland script.
+GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} ${arg_edid} ${arg_video} ${arg_modeset} ${arg_fbdev}"
+EOF
+}
+
+cmdline_has_required_phase2_args() {
+        local edid_file="$1"
+        local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
+        local arg_video="video=${FORCED_CONNECTOR}:e"
+        local arg_modeset="nvidia-drm.modeset=1"
+
+        grep -qF "${arg_edid}" /proc/cmdline \
+                && grep -qF "${arg_video}" /proc/cmdline \
+                && grep -qF "${arg_modeset}" /proc/cmdline
+}
+
+print_edid_diagnostics() {
+        local edid_file="$1"
+
+        echo "=== EDID diagnostics for ${FORCED_CONNECTOR} ==="
+        dmesg | grep -Ei "edid|firmware|${FORCED_CONNECTOR}|nvidia" || true
+
+        if command -v edid-decode >/dev/null 2>&1; then
+                echo "=== edid-decode /lib/firmware/edid/${edid_file} ==="
+                edid-decode "/lib/firmware/edid/${edid_file}" || true
+
+                for edid_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/edid; do
+                        [[ -f "${edid_path}" ]] || continue
+                        echo "=== edid-decode ${edid_path} ==="
+                        edid-decode "${edid_path}" || true
+                done
+        fi
+}
+
+connector_forced_connected() {
+        local status_path
+        for status_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/status; do
+                [[ -f "${status_path}" ]] || continue
+                if grep -qx 'connected' "${status_path}"; then
+                        return 0
+                fi
+        done
+        return 1
+}
+
+connector_has_mode() {
+        local wanted_mode="$1"
+        local mode_path
+
+        for mode_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/modes; do
+                [[ -f "${mode_path}" ]] || continue
+                if grep -qx "${wanted_mode}" "${mode_path}"; then
+                        return 0
+                fi
+        done
+        return 1
+}
+
+validate_phase2_display_state() {
+        local edid_file="$1"
+        local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+
+        cmdline_has_required_phase2_args "${edid_file}" \
+                || die "Kernel cmdline missing required EDID/DRM args"
+
+        if ! connector_forced_connected; then
+                echo "${FORCED_CONNECTOR} is not connected after reboot validation"
+                print_edid_diagnostics "${edid_file}"
+                die "Forced connector ${FORCED_CONNECTOR} did not report connected"
+        fi
+
+        if connector_has_mode "${target_mode}"; then
+                return 0
+        fi
+
+        echo "${FORCED_CONNECTOR} is connected but ${target_mode} is not exposed"
+        if connector_has_mode "1920x1080"; then
+                echo "Detected fallback 1920x1080 mode only; dumping EDID diagnostics"
+        fi
+        print_edid_diagnostics "${edid_file}"
+        die "Required mode ${target_mode} not exposed on ${FORCED_CONNECTOR}"
+}
+
 ensure_phase2_kernel_args() {
         local edid_file="$1"
         local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
         local arg_video="video=${FORCED_CONNECTOR}:e"
         local arg_modeset="nvidia-drm.modeset=1"
         local arg_fbdev="nvidia-drm.fbdev=1"
+
+        log "Writing GRUB kernel args in ${GRUB_OVERRIDE_FILE} for ${FORCED_CONNECTOR} using ${edid_file}"
+        write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_modeset}" "${arg_fbdev}"
+        update-grub
 
         if grep -qF "${arg_edid}" /proc/cmdline \
                 && grep -qF "${arg_video}" /proc/cmdline \
@@ -251,34 +404,11 @@ ensure_phase2_kernel_args() {
                 return 0
         fi
 
-        if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "edid-kernel-args" ]]; then
                 die "Kernel cmdline is still missing required EDID/DRM args after reboot"
         fi
 
-        log "Applying GRUB kernel args for ${FORCED_CONNECTOR} using ${edid_file}"
-        local current
-        current="$(sed -n 's/^GRUB_CMDLINE_LINUX_DEFAULT="\(.*\)"$/\1/p' /etc/default/grub | head -n1 || true)"
-
-        for arg in "${arg_edid}" "${arg_video}" "${arg_modeset}" "${arg_fbdev}"; do
-                if [[ " ${current} " != *" ${arg} "* ]]; then
-                        current="${current} ${arg}"
-                fi
-        done
-        current="$(echo "${current}" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]+/ /g')"
-
-        if grep -q '^GRUB_CMDLINE_LINUX_DEFAULT=' /etc/default/grub; then
-                sed -i "s|^GRUB_CMDLINE_LINUX_DEFAULT=.*|GRUB_CMDLINE_LINUX_DEFAULT=\"${current}\"|" /etc/default/grub
-        else
-                echo "GRUB_CMDLINE_LINUX_DEFAULT=\"${current}\"" >> /etc/default/grub
-        fi
-
-        update-grub
-        install_continuation_service
-        touch /opt/clouddeploy-wayland.needs-reboot
-
-        log "Rebooting to apply EDID and DRM kernel arguments"
-        reboot
-        exit 0
+        schedule_reboot_for_continuation "edid-kernel-args" "Rebooting to apply EDID and DRM kernel arguments"
 }
 
 nvidia_driver_ready() {
@@ -294,7 +424,7 @@ run_as_user() {
 wait_for_cloud_init() {
         if command -v cloud-init >/dev/null 2>&1; then
                 echo "Waiting for cloud-init..."
-                cloud-init status --wait || true
+                timeout 180 cloud-init status --wait || echo "cloud-init timeout; continuing"
         fi
 }
 
@@ -340,6 +470,112 @@ apt_purge_wait() {
         apt-get purge -y "$@"
 }
 
+KNOWN_WESTON_MODE_LINE=""
+KNOWN_SUNSHINE_KMS_LINE=""
+KNOWN_SUNSHINE_NVENC_LINE=""
+
+wait_for_streaming_log_markers() {
+        local weston_log sunshine_log
+
+        for _ in $(seq 1 45); do
+                weston_log="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
+                sunshine_log="$(journalctl -u sunshine-headless.service -n 260 --no-pager 2>/dev/null || true)"
+
+                KNOWN_WESTON_MODE_LINE="$(printf '%s\n' "${weston_log}" \
+                        | grep -Ei "${FORCED_CONNECTOR}.*${TARGET_WIDTH}x${TARGET_HEIGHT}.*(119(\\.[0-9]+)?|120(\\.[0-9]+)?)" \
+                        | tail -n1 || true)"
+                KNOWN_SUNSHINE_KMS_LINE="$(printf '%s\n' "${sunshine_log}" \
+                        | grep -Ei 'kms.*monitor|monitor.*kms|kms.*capture|capture.*kms' \
+                        | tail -n1 || true)"
+                KNOWN_SUNSHINE_NVENC_LINE="$(printf '%s\n' "${sunshine_log}" \
+                        | grep -Ei 'h264_nvenc' \
+                        | tail -n1 || true)"
+
+                if [[ -n "${KNOWN_WESTON_MODE_LINE}" ]] \
+                        && [[ -n "${KNOWN_SUNSHINE_KMS_LINE}" ]] \
+                        && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]]; then
+                        return 0
+                fi
+
+                sleep 2
+        done
+
+        return 1
+}
+
+validate_streaming_stack_ready() {
+        local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+
+        nvidia_driver_ready || die "NVIDIA driver check failed: nvidia-smi is not healthy"
+        connector_forced_connected || die "${FORCED_CONNECTOR} is not connected"
+        connector_has_mode "${target_mode}" || die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
+        systemctl is-active --quiet weston-kms-session.service || die "weston-kms-session.service failed to start"
+        systemctl is-active --quiet sunshine-headless.service || die "sunshine-headless.service failed to start"
+
+        if ! wait_for_streaming_log_markers; then
+                echo "=== Weston journal (last 160) ==="
+                journalctl -u weston-kms-session.service -n 160 --no-pager || true
+                echo
+                echo "=== Sunshine journal (last 160) ==="
+                journalctl -u sunshine-headless.service -n 160 --no-pager || true
+                die "Did not observe expected Weston mode / Sunshine KMS+NVENC log markers"
+        fi
+}
+
+print_known_good_checklist() {
+        local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+
+        echo
+        echo "CloudDeploy 4K120 SDR status:"
+        echo "[OK] NVIDIA driver working"
+        echo "[OK] ${FORCED_CONNECTOR} forced connected"
+        echo "[OK] ${target_mode} mode exposed"
+        echo "[OK] Weston active"
+        echo "[OK] Weston current mode ${target_mode}@119.9-ish (${KNOWN_WESTON_MODE_LINE})"
+        echo "[OK] Sunshine active"
+        echo "[OK] Sunshine KMS capture found monitor"
+        echo "[OK] h264_nvenc initialized"
+        echo "Next: connect Moonlight at ${target_mode} ${TARGET_FPS} FPS, HDR off"
+}
+
+install_optional_apps_nonfatal() {
+        local tmpchrome
+
+        if [[ "${INSTALL_OPTIONAL_APPS}" != "1" ]]; then
+                return 0
+        fi
+
+        log "Installing optional desktop apps (non-fatal)"
+
+        if ! dpkg --print-foreign-architectures | grep -q i386; then
+                wait_for_apt
+                dpkg --add-architecture i386 || log "Could not add i386 architecture; continuing"
+                apt_update_retry || log "Apt update failed after adding i386 architecture; continuing"
+        fi
+
+        wait_for_apt
+        apt-get upgrade -y || log "apt-get upgrade failed; continuing"
+        apt_install_wait flatpak steam-installer wine64 winetricks || log "Optional apt packages failed; continuing"
+
+        if command -v flatpak >/dev/null 2>&1; then
+                flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
+                flatpak install -y flathub com.heroicgameslauncher.hgl || true
+                flatpak install -y flathub net.lutris.Lutris || true
+                flatpak install -y flathub com.usebottles.bottles || true
+                flatpak install -y flathub org.prismlauncher.PrismLauncher || true
+        else
+                log "Flatpak is unavailable; skipping Flatpak app installs"
+        fi
+
+        tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
+        if wget -O "${tmpchrome}" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
+                dpkg -i "${tmpchrome}" || apt-get -f install -y || log "Google Chrome install failed; continuing"
+                rm -f "${tmpchrome}"
+        else
+                log "Google Chrome download failed; continuing"
+        fi
+}
+
 # =========================
 # Start
 # =========================
@@ -362,18 +598,28 @@ apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
         kde-plasma-desktop plasma-workspace-wayland kwin-wayland weston xwayland seatd \
-        pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde gamescope \
+        pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         ubuntu-drivers-common
+
+log "Installing Gamescope package (optional)"
+apt_install_wait gamescope || echo "Gamescope apt package unavailable; continuing without it"
 
 log "Checking NVIDIA driver status"
 if nvidia_driver_ready; then
         log "NVIDIA drivers are already installed and working"
 else
         log "Installing NVIDIA drivers"
+        MODPROBE_FAILED=0
         ubuntu-drivers install || die "Failed to install NVIDIA drivers"
-        modprobe nvidia || true
-        modprobe nvidia_modeset || true
-        modprobe nvidia_drm || true
+        if ! modprobe nvidia; then
+                MODPROBE_FAILED=1
+        fi
+        if ! modprobe nvidia_modeset; then
+                MODPROBE_FAILED=1
+        fi
+        if ! modprobe nvidia_drm; then
+                MODPROBE_FAILED=1
+        fi
 
         for _ in $(seq 1 15); do
                 if nvidia_driver_ready; then
@@ -384,7 +630,20 @@ else
                 sleep 3
         done
 
-        nvidia_driver_ready || die "NVIDIA drivers still not ready after installation. This VM may need a reboot or may not be compatible."
+        if ! nvidia_driver_ready; then
+                if [[ "${MODPROBE_FAILED}" -eq 1 ]] && ! nvidia_modules_present_for_running_kernel; then
+                        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
+                                die "NVIDIA modules are still missing for kernel $(uname -r) after continuation reboot"
+                        fi
+                        schedule_reboot_for_continuation "nvidia-driver" "NVIDIA modules are missing for kernel $(uname -r); rebooting and continuing automatically"
+                fi
+
+                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
+                        die "NVIDIA drivers are still not ready after continuation reboot"
+                fi
+
+                die "NVIDIA drivers still not ready after installation. This VM may need a reboot or may not be compatible."
+        fi
 fi
 
 log "Removing pieces that fought the working setup"
@@ -409,8 +668,8 @@ if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
                 curl -fsSL https://tailscale.com/install.sh | sh
         fi
 
-        systemctl enable --now tailscaled
-        tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh
+        systemctl enable --now tailscaled || true
+        tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || log "tailscale up failed; continuing"
 fi
 
 log "Detecting NVIDIA BusID"
@@ -422,16 +681,21 @@ if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
         SUNSHINE_DRM_DEVICE="$(detect_nvidia_drm_card || true)"
 fi
 [[ -n "${SUNSHINE_DRM_DEVICE}" ]] || die "Could not detect NVIDIA DRM card node"
+WESTON_DRM_DEVICE="$(basename "${SUNSHINE_DRM_DEVICE}")"
+[[ -n "${WESTON_DRM_DEVICE}" ]] || die "Could not derive Weston DRM card basename"
 log "Using Sunshine DRM device: ${SUNSHINE_DRM_DEVICE}"
+log "Using Weston DRM device basename: ${WESTON_DRM_DEVICE}"
 
 log "Writing Phase 2 EDID profiles"
 write_phase2_edids
+update-initramfs -u -k all
 
 SELECTED_EDID_FILE="$(select_phase2_edid_file)"
 [[ -n "${SELECTED_EDID_FILE}" ]] || die "Could not determine EDID profile file"
 log "Selected EDID profile: ${SELECTED_EDID_FILE} on ${FORCED_CONNECTOR}"
 
 ensure_phase2_kernel_args "${SELECTED_EDID_FILE}"
+validate_phase2_display_state "${SELECTED_EDID_FILE}"
 
 if [[ "${SESSION_BACKEND}" != "weston" ]]; then
         die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Phase 2 currently supports weston only."
@@ -462,9 +726,10 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export XDG_SESSION_TYPE=wayland
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
+export LIBSEAT_BACKEND=seatd
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
@@ -473,7 +738,7 @@ chmod 700 "\$XDG_RUNTIME_DIR"
 
 exec /usr/bin/weston \
         --backend=drm-backend.so \
-        --drm-device="${SUNSHINE_DRM_DEVICE}" \
+        --drm-device="${WESTON_DRM_DEVICE}" \
         --socket="${WAYLAND_DISPLAY_NAME}" \
         --config="${HOME_DIR}/.config/weston.ini"
 EOF
@@ -489,7 +754,7 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
 
 mkdir -p "\$XDG_RUNTIME_DIR"
@@ -518,7 +783,7 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
@@ -549,8 +814,12 @@ echo "=== /proc/cmdline ==="
 cat /proc/cmdline || true
 
 echo
+echo "=== nvidia-smi ==="
+nvidia-smi || true
+
+echo
 echo "=== /dev/dri ==="
-ls -l /dev/dri || true
+ls -lah /dev/dri || true
 
 echo
 echo "=== Connector status (${FORCED_CONNECTOR}) ==="
@@ -562,6 +831,10 @@ cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
 
 if command -v edid-decode >/dev/null 2>&1; then
         echo
+        echo "=== EDID decode (firmware /lib/firmware/edid/${SELECTED_EDID_FILE}) ==="
+        edid-decode /lib/firmware/edid/${SELECTED_EDID_FILE} || true
+
+        echo
         echo "=== EDID decode (${FORCED_CONNECTOR}) ==="
         for edid_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/edid; do
                 [[ -f "\${edid_path}" ]] || continue
@@ -571,8 +844,16 @@ if command -v edid-decode >/dev/null 2>&1; then
 fi
 
 echo
-echo "=== Service status ==="
-systemctl --no-pager --full status weston-kms-session.service sunshine-headless.service gamescope-hdr-test.service || true
+echo "=== systemctl status weston-kms-session.service ==="
+systemctl --no-pager --full status weston-kms-session.service || true
+
+echo
+echo "=== systemctl status sunshine-headless.service ==="
+systemctl --no-pager --full status sunshine-headless.service || true
+
+echo
+echo "=== Weston journal (last 160) ==="
+journalctl -u weston-kms-session.service -n 160 --no-pager || true
 
 echo
 echo "=== Sunshine journal (last 160) ==="
@@ -589,29 +870,13 @@ chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-km
 chmod 0755 "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
 
 log "Writing Sunshine config"
-if [[ "${ENABLE_HEVC}" == "1" && "${ENABLE_HDR}" == "1" ]]; then
-        HEVC_MODE="3"
-else
-        HEVC_MODE="1"
-fi
-
-if [[ "${ENABLE_AV1}" == "1" && "${ENABLE_HDR}" == "1" ]]; then
-        AV1_MODE="3"
-else
-        AV1_MODE="1"
-fi
-
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = debug
 encoder = ${SUNSHINE_ENCODER}
 capture = kms
-output_name = ${FORCED_CONNECTOR}
 adapter_name = ${SUNSHINE_DRM_DEVICE}
-hevc_mode = ${HEVC_MODE}
-av1_mode = ${AV1_MODE}
-hdr = ${ENABLE_HDR}
-fps = [60, ${TARGET_FPS}]
-resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
+hevc_mode = 0
+av1_mode = 0
 stream_audio = enabled
 address_family = ipv4
 ping_timeout = 60000
@@ -643,19 +908,23 @@ Wants=network-online.target
 [Service]
 User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
-Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
 Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
+Environment=LIBSEAT_BACKEND=seatd
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 PermissionsStartOnly=true
-ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
+ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
 ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share ${HOME_DIR}/.config ${HOME_DIR}/.config/weston ${HOME_DIR}/.local/bin
 ExecStartPre=/usr/bin/chown -R ${HEADLESS_USER}:${HEADLESS_USER} ${HOME_DIR}/.local ${HOME_DIR}/.config
-ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 15); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
 ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-weston-kms.sh
 Restart=always
 RestartSec=5
@@ -681,7 +950,8 @@ Group=${HEADLESS_USER}
 WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
-Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
+Environment=LOGNAME=${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
 Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
 ExecStart=${HOME_DIR}/.local/bin/start-sunshine-headless.sh
 Restart=always
@@ -708,11 +978,11 @@ WorkingDirectory=${HOME_DIR}
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
-Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
 Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
-ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
-ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
+ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
 ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-gamescope-hdr-test.sh
 Restart=on-failure
 RestartSec=5
@@ -727,48 +997,32 @@ log "Stopping any old broken session bits"
 pkill -u "${HEADLESS_USER}" -f 'weston|gamescope|sunshine|kwin_wayland|plasmashell|startplasma-wayland' 2>/dev/null || true
 systemctl stop sddm 2>/dev/null || true
 
-log "Optional desktop apps"
-if [[ "${INSTALL_OPTIONAL_APPS}" == "1" ]]; then
-        if ! dpkg --print-foreign-architectures | grep -q i386; then
-                wait_for_apt
-                dpkg --add-architecture i386
-                apt_update_retry
-        fi
-
-        wait_for_apt
-        apt-get upgrade -y
-        apt_install_wait flatpak steam-installer wine64 winetricks
-        flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
-        flatpak install -y flathub com.heroicgameslauncher.hgl || true
-        flatpak install -y flathub net.lutris.Lutris || true
-        flatpak install -y flathub com.usebottles.bottles || true
-        flatpak install -y flathub org.prismlauncher.PrismLauncher || true
-
-        tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
-        wget -O "${tmpchrome}" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-        dpkg -i "${tmpchrome}" || apt-get -f install -y
-        rm -f "${tmpchrome}"
-fi
-
 log "Enabling services"
 systemctl daemon-reload
-systemctl enable weston-kms-session.service sunshine-headless.service tailscaled
+systemctl enable weston-kms-session.service sunshine-headless.service
+if systemctl list-unit-files | grep -q '^tailscaled'; then
+        systemctl enable tailscaled || true
+fi
 systemctl disable gamescope-hdr-test.service 2>/dev/null || true
 
-systemctl restart tailscaled || true
+if systemctl list-unit-files | grep -q '^tailscaled'; then
+        systemctl restart tailscaled || true
+fi
 systemctl restart weston-kms-session.service
 sleep 5
 systemctl restart sunshine-headless.service
 sleep 3
 
-systemctl is-active --quiet weston-kms-session.service || die "weston-kms-session.service failed to start"
-systemctl is-active --quiet sunshine-headless.service || die "sunshine-headless.service failed to start"
-systemctl is-active --quiet tailscaled || die "tailscaled failed to start"
+validate_streaming_stack_ready
 
-rm -f /opt/clouddeploy-wayland.needs-reboot || true
+echo "$SCRIPT_VERSION" > "$SENTINEL"
+
+rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
 systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+systemctl stop clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 
-log "Finished"
+install_optional_apps_nonfatal
+
 echo
 echo "Use Moonlight against the Tailscale IP, not the public IP."
 if command -v tailscale >/dev/null 2>&1; then
@@ -780,9 +1034,13 @@ if command -v tailscale >/dev/null 2>&1; then
         fi
 fi
 
-echo "$SCRIPT_VERSION" > "$SENTINEL"
 echo "Sunshine web UI username: ${SUNSHINE_USER}"
 echo "Sunshine web UI password: ${SUNSHINE_PASS}"
 echo
 echo "If Moonlight shows a PIN, enter it in Sunshine's PIN tab."
 echo "Do NOT inject sunshine_state.json pairings in the deploy script."
+echo
+echo "Weston journal marker: ${KNOWN_WESTON_MODE_LINE}"
+echo "Sunshine KMS marker: ${KNOWN_SUNSHINE_KMS_LINE}"
+echo "Sunshine NVENC marker: ${KNOWN_SUNSHINE_NVENC_LINE}"
+print_known_good_checklist
