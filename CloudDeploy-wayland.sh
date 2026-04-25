@@ -7,8 +7,8 @@ export DEBIAN_FRONTEND=noninteractive
 DEFAULT_USER="${SUDO_USER:-user}"
 HEADLESS_USER="${HEADLESS_USER:-$DEFAULT_USER}"
 SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
-SUNSHINE_PASS="${SUNSHINE_PASS:-<REMOVED_PASSWORD>@13}"
-TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-<REMOVED_TAILSCALE_AUTHKEY>}"
+SUNSHINE_PASS="${SUNSHINE_PASS:-}"
+TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
@@ -24,90 +24,17 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SESSION_BACKEND="${SESSION_BACKEND:-weston}"
 KMS_OUTPUT="${KMS_OUTPUT:-${FORCED_CONNECTOR}}"
 HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-${TARGET_WIDTH}x${TARGET_HEIGHT}}"
-ENABLE_AV1="${ENABLE_AV1:-1}"
-ENABLE_HEVC="${ENABLE_HEVC:-1}"
+ENABLE_AV1="${ENABLE_AV1:-0}"
+ENABLE_HEVC="${ENABLE_HEVC:-0}"
+SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-0}"
+SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="7"
+SCRIPT_VERSION="9"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
-
-[[ $EUID -eq 0 ]] || { echo "Run this script using 'sudo' or as root"; exit 1; }
-
-if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
-        echo "CloudDeploy.sh has already run on this machine for version $SCRIPT_VERSION. Restarting existing services and exiting..."
-        systemctl daemon-reload || true
-        systemctl reset-failed weston-kms-session.service sunshine-headless.service tailscaled || true
-        systemctl enable --now weston-kms-session.service sunshine-headless.service tailscaled || true
-        systemctl restart weston-kms-session.service sunshine-headless.service tailscaled || true
-        sleep 2
-
-        if command -v tailscale >/dev/null 2>&1; then
-                if ! tailscale status >/dev/null 2>&1; then
-                        if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
-                                echo "Tailscale is installed but not connected. Attempting to connect..."
-                                tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || true
-                        else
-                                echo "Tailscale is installed but not connected, and no auth key is set. Please set TAILSCALE_AUTHKEY and run 'tailscale up' manually."
-                        fi
-                fi
-        fi
-
-        echo
-        echo "Service states:"
-        systemctl --no-pager --full status weston-kms-session.service | sed -n '1,8p' || true
-        systemctl --no-pager --full status sunshine-headless.service | sed -n '1,8p' || true
-        systemctl --no-pager --full status tailscaled | sed -n '1,8p' || true
-
-        if command -v tailscale >/dev/null 2>&1; then
-                TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
-
-                if [[ -n "${TS_IP}" ]]; then
-                        echo
-                        echo "Sunshine web UI: https://${TS_IP}:47990"
-                        echo "Moonlight host: ${TS_IP}"
-                else 
-                        echo
-                        echo "Tailscale is installed but could not determine IP address. Check tailscale status for details."
-                fi
-        fi
-
-        exit 0
-fi
-
-echo "Running preliminary hardware diagnostics..."
-
-CPU_SPEED_MHZ="$(lscpu | awk -F: '
-/CPU max MHz|CPU MHz/ {
-    gsub(/^[ \t]+/, "", $2)
-    split($2, a, ".")
-    print a[1]
-    found=1
-    exit
-}
-END {
-    if (!found) print 0
-}
-')"
-
-if [[ "$CPU_SPEED_MHZ" =~ ^[0-9]+$ ]] && [ "$CPU_SPEED_MHZ" -gt 0 ]; then
-    CPU_SPEED_GHZ="$(awk "BEGIN { printf \"%.2f\", ${CPU_SPEED_MHZ}/1000 }")"
-    echo "CPU Clock Speed: ${CPU_SPEED_GHZ} GHz"
-    MIN_SPEED=3500
-
-    if [ "$CPU_SPEED_MHZ" -lt "$MIN_SPEED" ]; then
-        echo "CPU clock speed is below minimum threshold required"
-        echo "Proceeding anyway..."
-    else
-        echo "CPU clock speed meets minimum threshold requirement"
-        echo "Proceeding with software installation..."
-    fi
-
-else
-    echo "Could not determine CPU clock speed on this VM"
-    echo "Proceeding with software installation..."
-fi
+CLOUDDEPLOY_ENV_FILE="/etc/clouddeploy-wayland.env"
 
 INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-1}"
 
@@ -216,6 +143,37 @@ select_phase2_edid_file() {
         esac
 }
 
+write_clouddeploy_env_file() {
+        install -m 0600 /dev/null "${CLOUDDEPLOY_ENV_FILE}"
+
+        {
+                printf 'HEADLESS_USER=%q\n' "${HEADLESS_USER}"
+                printf 'SUNSHINE_USER=%q\n' "${SUNSHINE_USER}"
+                printf 'SUNSHINE_PASS=%q\n' "${SUNSHINE_PASS}"
+                printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
+                printf 'FORCED_CONNECTOR=%q\n' "${FORCED_CONNECTOR}"
+                printf 'TARGET_WIDTH=%q\n' "${TARGET_WIDTH}"
+                printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
+                printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
+                printf 'ENABLE_HDR=%q\n' "${ENABLE_HDR}"
+                printf 'EDID_PROFILE=%q\n' "${EDID_PROFILE}"
+                printf 'WESTON_MODE=%q\n' "${WESTON_MODE}"
+                printf 'WAYLAND_DISPLAY_NAME=%q\n' "${WAYLAND_DISPLAY_NAME}"
+                printf 'SUNSHINE_CAPTURE_METHOD=%q\n' "${SUNSHINE_CAPTURE_METHOD}"
+                printf 'SUNSHINE_ENCODER=%q\n' "${SUNSHINE_ENCODER}"
+                printf 'SUNSHINE_DRM_DEVICE=%q\n' "${SUNSHINE_DRM_DEVICE}"
+                printf 'SESSION_BACKEND=%q\n' "${SESSION_BACKEND}"
+                printf 'KMS_OUTPUT=%q\n' "${KMS_OUTPUT}"
+                printf 'HEADLESS_RESOLUTION=%q\n' "${HEADLESS_RESOLUTION}"
+                printf 'SUNSHINE_AV1_MODE=%q\n' "${SUNSHINE_AV1_MODE}"
+                printf 'SUNSHINE_HEVC_MODE=%q\n' "${SUNSHINE_HEVC_MODE}"
+                printf 'RUNTIME_DIR=%q\n' "${RUNTIME_DIR}"
+                printf 'INSTALL_OPTIONAL_APPS=%q\n' "${INSTALL_OPTIONAL_APPS}"
+        } > "${CLOUDDEPLOY_ENV_FILE}"
+
+        chmod 0600 "${CLOUDDEPLOY_ENV_FILE}"
+}
+
 install_continuation_service() {
         local script_path
         script_path="$(readlink -f "$0")"
@@ -225,7 +183,7 @@ install_continuation_service() {
 set -euo pipefail
 
 [[ -f "${REBOOT_MARKER}" ]] || exit 0
-reason="$(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo unknown)"
+reason="\$(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo unknown)"
 rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}"
 CLOUDDEPLOY_CONTINUE=1 CLOUDDEPLOY_CONTINUE_REASON="\${reason}" /bin/bash "${script_path}"
 EOF
@@ -239,6 +197,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+EnvironmentFile=-${CLOUDDEPLOY_ENV_FILE}
 ExecStart=/usr/local/sbin/clouddeploy-wayland-continue.sh
 
 [Install]
@@ -253,6 +212,7 @@ schedule_reboot_for_continuation() {
         local reason="$1"
         local message="$2"
 
+        write_clouddeploy_env_file
         install_continuation_service
         echo "${reason}" > "${REBOOT_REASON_FILE}"
         touch "${REBOOT_MARKER}"
@@ -434,7 +394,7 @@ wait_for_apt() {
                     /var/lib/dpkg/lock \
                     /var/lib/apt/lists/lock \
                     /var/cache/apt/archives/lock >/dev/null 2>&1
-        
+
         do
                 echo "Waiting for apt/dpkg lock..."
                 sleep 5
@@ -471,29 +431,140 @@ apt_purge_wait() {
 }
 
 KNOWN_WESTON_MODE_LINE=""
+KNOWN_SUNSHINE_RESOLUTION_LINE=""
+KNOWN_SUNSHINE_MONITOR_LINE=""
 KNOWN_SUNSHINE_KMS_LINE=""
 KNOWN_SUNSHINE_NVENC_LINE=""
+LAST_WESTON_LOG=""
+LAST_SUNSHINE_LOG=""
+LAST_SUNSHINE_START_SINCE=""
+
+sunshine_journal_since() {
+        local since="${1:-}"
+
+        if [[ -n "${since}" ]]; then
+                journalctl -u sunshine-headless.service --since "${since}" -n 260 --no-pager 2>/dev/null || true
+        else
+                journalctl -u sunshine-headless.service -n 260 --no-pager 2>/dev/null || true
+        fi
+}
+
+weston_current_mode_line_from_log() {
+        local weston_log="$1"
+        local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+
+        printf '%s\n' "${weston_log}" \
+                | awk -v output="${FORCED_CONNECTOR}" \
+                        -v target="${target_mode}" \
+                        -v refresh='@(119([.][0-9]+)?|120([.][0-9]+)?)' '
+                        $0 ~ ("Output " output " video modes:") {
+                                in_target_output=1
+                                next
+                        }
+                        $0 ~ /Output .+ video modes:/ && $0 !~ ("Output " output " video modes:") {
+                                in_target_output=0
+                        }
+                        in_target_output && $0 ~ target refresh && $0 ~ /current/ {
+                                line=$0
+                        }
+                        $0 ~ output && $0 ~ target refresh && $0 ~ /current/ {
+                                line=$0
+                        }
+                        END {
+                                if (line != "") print line
+                        }' \
+                | tail -n1
+}
+
+refresh_streaming_log_markers() {
+        local sunshine_since="${1:-}"
+
+        LAST_WESTON_LOG="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
+        LAST_SUNSHINE_LOG="$(sunshine_journal_since "${sunshine_since}")"
+
+        KNOWN_WESTON_MODE_LINE="$(weston_current_mode_line_from_log "${LAST_WESTON_LOG}" || true)"
+        KNOWN_SUNSHINE_RESOLUTION_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -F "Desktop resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}" \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_MONITOR_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -F "Monitor 0 is ${FORCED_CONNECTOR}" \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_KMS_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -F "Found monitor for DRM screencasting" \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_NVENC_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Nvenc initialized successfully|Found H[.]264 encoder: h264_nvenc|h264_nvenc' \
+                | tail -n1 || true)"
+}
+
+streaming_log_markers_ready() {
+        [[ -n "${KNOWN_WESTON_MODE_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_RESOLUTION_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_MONITOR_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_KMS_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]]
+}
+
+sunshine_started_with_zero_resolution() {
+        printf '%s\n' "${LAST_SUNSHINE_LOG}" | grep -Fq "Desktop resolution: 0x0"
+}
+
+print_streaming_diagnostics() {
+        echo "=== Wayland socket ==="
+        ls -lah "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock" 2>/dev/null || true
+        echo
+        echo "=== Weston process ==="
+        pgrep -a -u "${HEADLESS_USER}" -x weston || true
+        echo
+        echo "=== systemctl status weston-kms-session.service ==="
+        systemctl --no-pager --full status weston-kms-session.service | sed -n '1,14p' || true
+        echo
+        echo "=== systemctl status sunshine-headless.service ==="
+        systemctl --no-pager --full status sunshine-headless.service | sed -n '1,14p' || true
+        echo
+        echo "=== Weston journal (last 160) ==="
+        journalctl -u weston-kms-session.service -n 160 --no-pager || true
+        echo
+        echo "=== Sunshine journal (last 160) ==="
+        journalctl -u sunshine-headless.service -n 160 --no-pager || true
+}
+
+print_server_validation_diagnostics() {
+        echo "=== NVIDIA ==="
+        nvidia-smi || true
+        echo
+        echo "=== Connector status (${FORCED_CONNECTOR}) ==="
+        cat /sys/class/drm/card*-${FORCED_CONNECTOR}/status 2>/dev/null || true
+        echo
+        echo "=== Connector modes (${FORCED_CONNECTOR}) ==="
+        cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
+        echo
+        print_streaming_diagnostics
+}
+
+wait_for_weston_ready() {
+        local socket_path="${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}"
+
+        for _ in $(seq 1 90); do
+                LAST_WESTON_LOG="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
+                KNOWN_WESTON_MODE_LINE="$(weston_current_mode_line_from_log "${LAST_WESTON_LOG}" || true)"
+
+                if [[ -S "${socket_path}" ]] \
+                        && pgrep -u "${HEADLESS_USER}" -x weston >/dev/null 2>&1 \
+                        && [[ -n "${KNOWN_WESTON_MODE_LINE}" ]]; then
+                        return 0
+                fi
+
+                sleep 1
+        done
+
+        return 1
+}
 
 wait_for_streaming_log_markers() {
-        local weston_log sunshine_log
-
         for _ in $(seq 1 45); do
-                weston_log="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
-                sunshine_log="$(journalctl -u sunshine-headless.service -n 260 --no-pager 2>/dev/null || true)"
-
-                KNOWN_WESTON_MODE_LINE="$(printf '%s\n' "${weston_log}" \
-                        | grep -Ei "${FORCED_CONNECTOR}.*${TARGET_WIDTH}x${TARGET_HEIGHT}.*(119(\\.[0-9]+)?|120(\\.[0-9]+)?)" \
-                        | tail -n1 || true)"
-                KNOWN_SUNSHINE_KMS_LINE="$(printf '%s\n' "${sunshine_log}" \
-                        | grep -Ei 'kms.*monitor|monitor.*kms|kms.*capture|capture.*kms' \
-                        | tail -n1 || true)"
-                KNOWN_SUNSHINE_NVENC_LINE="$(printf '%s\n' "${sunshine_log}" \
-                        | grep -Ei 'h264_nvenc' \
-                        | tail -n1 || true)"
-
-                if [[ -n "${KNOWN_WESTON_MODE_LINE}" ]] \
-                        && [[ -n "${KNOWN_SUNSHINE_KMS_LINE}" ]] \
-                        && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]]; then
+                refresh_streaming_log_markers
+                if streaming_log_markers_ready; then
                         return 0
                 fi
 
@@ -503,21 +574,98 @@ wait_for_streaming_log_markers() {
         return 1
 }
 
+wait_for_sunshine_post_start_markers() {
+        local since="${1:-}"
+
+        for _ in $(seq 1 45); do
+                refresh_streaming_log_markers "${since}"
+
+                if streaming_log_markers_ready; then
+                        return 0
+                fi
+
+                if sunshine_started_with_zero_resolution; then
+                        return 2
+                fi
+
+                sleep 2
+        done
+
+        return 1
+}
+
+start_streaming_stack_ordered() {
+        log "Starting Weston before Sunshine"
+        systemctl stop sunshine-headless.service 2>/dev/null || true
+        systemctl stop weston-kms-session.service 2>/dev/null || true
+        rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock" || true
+
+        if ! systemctl start weston-kms-session.service; then
+                print_streaming_diagnostics
+                return 1
+        fi
+
+        if ! wait_for_weston_ready; then
+                print_streaming_diagnostics
+                return 1
+        fi
+
+        LAST_SUNSHINE_START_SINCE="$(date '+%F %T')"
+        if ! systemctl start sunshine-headless.service; then
+                print_streaming_diagnostics
+                return 1
+        fi
+}
+
+stabilize_sunshine_after_start() {
+        local rc=0
+
+        wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}" && return 0
+        rc=$?
+
+        if [[ "${rc}" -eq 2 ]]; then
+                echo "Detected Sunshine Desktop resolution: 0x0; diagnostics before one clean ordered restart:"
+                print_streaming_diagnostics
+                start_streaming_stack_ordered || return 1
+                wait_for_sunshine_post_start_markers "${LAST_SUNSHINE_START_SINCE}" && return 0
+                rc=$?
+        fi
+
+        print_streaming_diagnostics
+        return "${rc}"
+}
+
+ordered_restart_streaming_stack() {
+        start_streaming_stack_ordered || return 1
+        stabilize_sunshine_after_start
+}
+
 validate_streaming_stack_ready() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
 
-        nvidia_driver_ready || die "NVIDIA driver check failed: nvidia-smi is not healthy"
-        connector_forced_connected || die "${FORCED_CONNECTOR} is not connected"
-        connector_has_mode "${target_mode}" || die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
-        systemctl is-active --quiet weston-kms-session.service || die "weston-kms-session.service failed to start"
-        systemctl is-active --quiet sunshine-headless.service || die "sunshine-headless.service failed to start"
+        if ! nvidia_driver_ready; then
+                print_server_validation_diagnostics
+                die "NVIDIA driver check failed: nvidia-smi is not healthy"
+        fi
+        if ! connector_forced_connected; then
+                print_server_validation_diagnostics
+                die "${FORCED_CONNECTOR} is not connected"
+        fi
+        if ! connector_has_mode "${target_mode}"; then
+                print_server_validation_diagnostics
+                die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
+        fi
+        if ! systemctl is-active --quiet weston-kms-session.service; then
+                print_server_validation_diagnostics
+                die "weston-kms-session.service failed to start"
+        fi
+        if ! systemctl is-active --quiet sunshine-headless.service; then
+                print_server_validation_diagnostics
+                die "sunshine-headless.service failed to start"
+        fi
 
         if ! wait_for_streaming_log_markers; then
-                echo "=== Weston journal (last 160) ==="
-                journalctl -u weston-kms-session.service -n 160 --no-pager || true
-                echo
-                echo "=== Sunshine journal (last 160) ==="
-                journalctl -u sunshine-headless.service -n 160 --no-pager || true
+                print_server_validation_diagnostics
                 die "Did not observe expected Weston mode / Sunshine KMS+NVENC log markers"
         fi
 }
@@ -533,8 +681,10 @@ print_known_good_checklist() {
         echo "[OK] Weston active"
         echo "[OK] Weston current mode ${target_mode}@119.9-ish (${KNOWN_WESTON_MODE_LINE})"
         echo "[OK] Sunshine active"
-        echo "[OK] Sunshine KMS capture found monitor"
-        echo "[OK] h264_nvenc initialized"
+        echo "[OK] Sunshine Desktop resolution ${target_mode} (${KNOWN_SUNSHINE_RESOLUTION_LINE})"
+        echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
+        echo "[OK] Sunshine KMS capture found monitor (${KNOWN_SUNSHINE_KMS_LINE})"
+        echo "[OK] NVENC initialized (${KNOWN_SUNSHINE_NVENC_LINE})"
         echo "Next: connect Moonlight at ${target_mode} ${TARGET_FPS} FPS, HDR off"
 }
 
@@ -580,6 +730,92 @@ install_optional_apps_nonfatal() {
 # Start
 # =========================
 require_root
+
+if [[ -z "${SUNSHINE_PASS}" ]]; then
+        die "SUNSHINE_PASS is required. Re-run with: sudo SUNSHINE_PASS='<strong-password>' ... bash ./CloudDeploy-wayland.sh"
+fi
+
+if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
+        log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
+        systemctl daemon-reload || true
+        systemctl reset-failed weston-kms-session.service sunshine-headless.service tailscaled || true
+        systemctl enable weston-kms-session.service sunshine-headless.service || true
+        if systemctl list-unit-files | grep -q '^tailscaled'; then
+                systemctl enable tailscaled || true
+                systemctl restart tailscaled || true
+        fi
+
+        ordered_restart_streaming_stack || die "Streaming stack did not pass post-start stabilization"
+
+        if command -v tailscale >/dev/null 2>&1; then
+                if ! tailscale status >/dev/null 2>&1; then
+                        if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
+                                echo "Tailscale is installed but not connected. Attempting to connect..."
+                                tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || true
+                        else
+                                echo "Tailscale is installed but not connected, and no auth key is set. Please set TAILSCALE_AUTHKEY and run 'tailscale up' manually."
+                        fi
+                fi
+        fi
+
+        validate_streaming_stack_ready
+        rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
+
+        echo
+        echo "Service states:"
+        systemctl --no-pager --full status weston-kms-session.service | sed -n '1,8p' || true
+        systemctl --no-pager --full status sunshine-headless.service | sed -n '1,8p' || true
+        systemctl --no-pager --full status tailscaled | sed -n '1,8p' || true
+
+        if command -v tailscale >/dev/null 2>&1; then
+                TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+
+                if [[ -n "${TS_IP}" ]]; then
+                        echo
+                        echo "Sunshine web UI: https://${TS_IP}:47990"
+                        echo "Moonlight host: ${TS_IP}"
+                else
+                        echo
+                        echo "Tailscale is installed but could not determine IP address. Check tailscale status for details."
+                fi
+        fi
+
+        print_known_good_checklist
+        exit 0
+fi
+
+echo "Running preliminary hardware diagnostics..."
+
+CPU_SPEED_MHZ="$(lscpu | awk -F: '
+/CPU max MHz|CPU MHz/ {
+    gsub(/^[ \t]+/, "", $2)
+    split($2, a, ".")
+    print a[1]
+    found=1
+    exit
+}
+END {
+    if (!found) print 0
+}
+')"
+
+if [[ "$CPU_SPEED_MHZ" =~ ^[0-9]+$ ]] && [ "$CPU_SPEED_MHZ" -gt 0 ]; then
+    CPU_SPEED_GHZ="$(awk "BEGIN { printf \"%.2f\", ${CPU_SPEED_MHZ}/1000 }")"
+    echo "CPU Clock Speed: ${CPU_SPEED_GHZ} GHz"
+    MIN_SPEED=3500
+
+    if [ "$CPU_SPEED_MHZ" -lt "$MIN_SPEED" ]; then
+        echo "CPU clock speed is below minimum threshold required"
+        echo "Proceeding anyway..."
+    else
+        echo "CPU clock speed meets minimum threshold requirement"
+        echo "Proceeding with software installation..."
+    fi
+
+else
+    echo "Could not determine CPU clock speed on this VM"
+    echo "Proceeding with software installation..."
+fi
 
 log "Ensuring user exists"
 if ! id "${HEADLESS_USER}" >/dev/null 2>&1; then
@@ -761,11 +997,22 @@ mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
 SOCKET_PATH="\${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}"
+SOCKET_STABILIZED=0
 
-for _ in \$(seq 1 90); do
-        if [[ -S "\${SOCKET_PATH}" ]] && pgrep -u "${HEADLESS_USER}" -x weston >/dev/null 2>&1; then
-                exec /usr/bin/sunshine
+for _ in \$(seq 1 120); do
+        if [[ -S "\${SOCKET_PATH}" ]]; then
+                if [[ "\${SOCKET_STABILIZED}" -eq 0 ]]; then
+                        sleep 2
+                        SOCKET_STABILIZED=1
+                fi
+
+                if [[ -S "\${SOCKET_PATH}" ]] && pgrep -u "${HEADLESS_USER}" -x weston >/dev/null 2>&1; then
+                        exec /usr/bin/sunshine
+                fi
+        else
+                SOCKET_STABILIZED=0
         fi
+
         sleep 1
 done
 
@@ -872,11 +1119,11 @@ chmod 0755 "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
 log "Writing Sunshine config"
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = debug
-encoder = ${SUNSHINE_ENCODER}
+encoder = nvenc
 capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
-hevc_mode = 0
-av1_mode = 0
+hevc_mode = ${SUNSHINE_HEVC_MODE}
+av1_mode = ${SUNSHINE_AV1_MODE}
 stream_audio = enabled
 address_family = ipv4
 ping_timeout = 60000
@@ -1008,10 +1255,7 @@ systemctl disable gamescope-hdr-test.service 2>/dev/null || true
 if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl restart tailscaled || true
 fi
-systemctl restart weston-kms-session.service
-sleep 5
-systemctl restart sunshine-headless.service
-sleep 3
+ordered_restart_streaming_stack || die "Streaming stack did not pass post-start stabilization"
 
 validate_streaming_stack_ready
 
@@ -1022,6 +1266,7 @@ systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 systemctl stop clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 
 install_optional_apps_nonfatal
+rm -f "${CLOUDDEPLOY_ENV_FILE}" || true
 
 echo
 echo "Use Moonlight against the Tailscale IP, not the public IP."
@@ -1041,6 +1286,8 @@ echo "If Moonlight shows a PIN, enter it in Sunshine's PIN tab."
 echo "Do NOT inject sunshine_state.json pairings in the deploy script."
 echo
 echo "Weston journal marker: ${KNOWN_WESTON_MODE_LINE}"
+echo "Sunshine resolution marker: ${KNOWN_SUNSHINE_RESOLUTION_LINE}"
+echo "Sunshine monitor marker: ${KNOWN_SUNSHINE_MONITOR_LINE}"
 echo "Sunshine KMS marker: ${KNOWN_SUNSHINE_KMS_LINE}"
 echo "Sunshine NVENC marker: ${KNOWN_SUNSHINE_NVENC_LINE}"
 print_known_good_checklist
