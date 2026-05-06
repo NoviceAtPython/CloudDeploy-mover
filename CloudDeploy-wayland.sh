@@ -15,23 +15,19 @@ TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
 ENABLE_HDR="${ENABLE_HDR:-0}"
-EDID_PROFILE="${EDID_PROFILE:-4k120-sdr}"
+EDID_PROFILE="${EDID_PROFILE:-auto}"
+STREAM_MODE="${STREAM_MODE:-kwin}"
+SESSION_BACKEND="${SESSION_BACKEND:-$STREAM_MODE}"
+KWIN_VTNR="${KWIN_VTNR:-7}"
+KWIN_WAYLAND_DISPLAY="${KWIN_WAYLAND_DISPLAY:-wayland-0}"
+WESTON_WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY:-wayland-cd}"
 WESTON_MODE="${WESTON_MODE:-${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS}}"
-WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME:-wayland-cd}"
-SUNSHINE_CAPTURE_METHOD="${SUNSHINE_CAPTURE_METHOD:-kms}"
 SUNSHINE_ENCODER="${SUNSHINE_ENCODER:-nvenc}"
 SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
-SESSION_BACKEND="${SESSION_BACKEND:-plasma}"
-STREAM_MODE="${STREAM_MODE:-plasma}"
-KMS_OUTPUT="${KMS_OUTPUT:-${FORCED_CONNECTOR}}"
-HEADLESS_RESOLUTION="${HEADLESS_RESOLUTION:-${TARGET_WIDTH}x${TARGET_HEIGHT}}"
-ENABLE_AV1="${ENABLE_AV1:-1}"
-ENABLE_HEVC="${ENABLE_HEVC:-1}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
-SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-2}"
-RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
+SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="11"
+SCRIPT_VERSION="12-kwin-realvt"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -144,6 +140,23 @@ select_phase2_edid_file() {
         esac
 }
 
+service_for_mode() {
+        case "${STREAM_MODE}" in
+                kwin|plasma|realvt)
+                        echo "kwin-realvt.service"
+                        ;;
+                weston)
+                        echo "weston-kms-session.service"
+                        ;;
+                gamescope)
+                        die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
+                        ;;
+                *)
+                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: kwin, weston."
+                        ;;
+        esac
+}
+
 write_clouddeploy_env_file() {
         install -m 0600 /dev/null "${CLOUDDEPLOY_ENV_FILE}"
 
@@ -158,15 +171,14 @@ write_clouddeploy_env_file() {
                 printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
                 printf 'ENABLE_HDR=%q\n' "${ENABLE_HDR}"
                 printf 'EDID_PROFILE=%q\n' "${EDID_PROFILE}"
+                printf 'KWIN_VTNR=%q\n' "${KWIN_VTNR}"
+                printf 'KWIN_WAYLAND_DISPLAY=%q\n' "${KWIN_WAYLAND_DISPLAY}"
+                printf 'WESTON_WAYLAND_DISPLAY=%q\n' "${WESTON_WAYLAND_DISPLAY}"
                 printf 'WESTON_MODE=%q\n' "${WESTON_MODE}"
-                printf 'WAYLAND_DISPLAY_NAME=%q\n' "${WAYLAND_DISPLAY_NAME}"
-                printf 'SUNSHINE_CAPTURE_METHOD=%q\n' "${SUNSHINE_CAPTURE_METHOD}"
                 printf 'SUNSHINE_ENCODER=%q\n' "${SUNSHINE_ENCODER}"
                 printf 'SUNSHINE_DRM_DEVICE=%q\n' "${SUNSHINE_DRM_DEVICE}"
                 printf 'SESSION_BACKEND=%q\n' "${SESSION_BACKEND}"
                 printf 'STREAM_MODE=%q\n' "${STREAM_MODE}"
-                printf 'KMS_OUTPUT=%q\n' "${KMS_OUTPUT}"
-                printf 'HEADLESS_RESOLUTION=%q\n' "${HEADLESS_RESOLUTION}"
                 printf 'SUNSHINE_AV1_MODE=%q\n' "${SUNSHINE_AV1_MODE}"
                 printf 'SUNSHINE_HEVC_MODE=%q\n' "${SUNSHINE_HEVC_MODE}"
                 printf 'RUNTIME_DIR=%q\n' "${RUNTIME_DIR}"
@@ -260,11 +272,9 @@ write_phase2_grub_override() {
         local arg_fbdev="$4"
 
         install -d -m 0755 /etc/default/grub.d
-        sanitize_grub_default_cmdline
 
         cat > "${GRUB_OVERRIDE_FILE}" <<EOF
-# Managed by CloudDeploy Wayland script.
-GRUB_CMDLINE_LINUX_DEFAULT="\${GRUB_CMDLINE_LINUX_DEFAULT} ${arg_edid} ${arg_video} ${arg_modeset} ${arg_fbdev}"
+GRUB_CMDLINE_LINUX_DEFAULT="${arg_edid} ${arg_video} ${arg_modeset} ${arg_fbdev}"
 EOF
 }
 
@@ -273,10 +283,12 @@ cmdline_has_required_phase2_args() {
         local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
         local arg_video="video=${FORCED_CONNECTOR}:e"
         local arg_modeset="nvidia-drm.modeset=1"
+        local arg_fbdev="nvidia-drm.fbdev=1"
 
         grep -qF "${arg_edid}" /proc/cmdline \
                 && grep -qF "${arg_video}" /proc/cmdline \
-                && grep -qF "${arg_modeset}" /proc/cmdline
+                && grep -qF "${arg_modeset}" /proc/cmdline \
+                && grep -qF "${arg_fbdev}" /proc/cmdline
 }
 
 print_edid_diagnostics() {
@@ -353,10 +365,6 @@ ensure_phase2_kernel_args() {
         local arg_modeset="nvidia-drm.modeset=1"
         local arg_fbdev="nvidia-drm.fbdev=1"
 
-        log "Writing GRUB kernel args in ${GRUB_OVERRIDE_FILE} for ${FORCED_CONNECTOR} using ${edid_file}"
-        write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_modeset}" "${arg_fbdev}"
-        update-grub
-
         if grep -qF "${arg_edid}" /proc/cmdline \
                 && grep -qF "${arg_video}" /proc/cmdline \
                 && grep -qF "${arg_modeset}" /proc/cmdline \
@@ -365,11 +373,22 @@ ensure_phase2_kernel_args() {
                 return 0
         fi
 
-        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "edid-kernel-args" ]]; then
+        if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
                 die "Kernel cmdline is still missing required EDID/DRM args after reboot"
         fi
 
-        schedule_reboot_for_continuation "edid-kernel-args" "Rebooting to apply EDID and DRM kernel arguments"
+        log "Applying GRUB drop-in kernel args for ${FORCED_CONNECTOR} using ${edid_file}"
+        write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_modeset}" "${arg_fbdev}"
+        update-grub
+
+        write_clouddeploy_env_file
+        install_continuation_service
+        echo "edid-kernel-args" > "${REBOOT_REASON_FILE}"
+        touch "${REBOOT_MARKER}"
+
+        log "Rebooting to apply EDID and DRM kernel arguments"
+        reboot
+        exit 0
 }
 
 nvidia_driver_ready() {
@@ -434,13 +453,16 @@ apt_purge_wait() {
 write_sunshine_config() {
         install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
 
-        cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
+cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = debug
-encoder = nvenc
+encoder = ${SUNSHINE_ENCODER}
 capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
+hdr = ${ENABLE_HDR}
+fps = [60, ${TARGET_FPS}]
+resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
 stream_audio = enabled
 address_family = ipv4
 ping_timeout = 60000
@@ -509,15 +531,18 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TARGET_HEIGHT=%q\n' "2160"
         printf 'TARGET_FPS=%q\n' "120"
         printf 'ENABLE_HDR=%q\n' "0"
-        printf 'EDID_PROFILE=%q\n' "4k120-sdr"
-        printf 'WAYLAND_DISPLAY_NAME=%q\n' "wayland-cd"
+        printf 'EDID_PROFILE=%q\n' "auto"
+        printf 'KWIN_VTNR=%q\n' "7"
+        printf 'KWIN_WAYLAND_DISPLAY=%q\n' "wayland-0"
+        printf 'WESTON_WAYLAND_DISPLAY=%q\n' "wayland-cd"
+        printf 'WESTON_MODE=%q\n' "3840x2160@120"
+        printf 'SUNSHINE_ENCODER=%q\n' "nvenc"
         printf 'SUNSHINE_DRM_DEVICE=%q\n' "auto"
-        printf 'SESSION_BACKEND=%q\n' "plasma"
-        printf 'STREAM_MODE=%q\n' "plasma"
-        printf 'RUNTIME_DIR=%q\n' "/tmp/runtime-user"
+        printf 'SESSION_BACKEND=%q\n' "kwin"
+        printf 'STREAM_MODE=%q\n' "kwin"
         printf 'INSTALL_OPTIONAL_APPS=%q\n' "0"
         printf 'SUNSHINE_AV1_MODE=%q\n' "2"
-        printf 'SUNSHINE_HEVC_MODE=%q\n' "2"
+        printf 'SUNSHINE_HEVC_MODE=%q\n' "0"
 } > "${ENV_FILE}"
 chmod 0600 "${ENV_FILE}"
 echo "Wrote ${ENV_FILE} with mode 0600."
@@ -537,18 +562,23 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 HEADLESS_USER="${HEADLESS_USER:-user}"
-STREAM_MODE="${STREAM_MODE:-plasma}"
+STREAM_MODE="${STREAM_MODE:-kwin}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
-RUNTIME_DIR="${RUNTIME_DIR:-/tmp/runtime-user}"
-WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME:-wayland-cd}"
+ENABLE_HDR="${ENABLE_HDR:-0}"
+KWIN_WAYLAND_DISPLAY="${KWIN_WAYLAND_DISPLAY:-wayland-0}"
+WESTON_WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY:-wayland-cd}"
+SUNSHINE_ENCODER="${SUNSHINE_ENCODER:-nvenc}"
 SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
-SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-2}"
+SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 HOME_DIR="$(getent passwd "${HEADLESS_USER}" | cut -d: -f6 || true)"
 HOME_DIR="${HOME_DIR:-/home/${HEADLESS_USER}}"
+HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
 
 detect_nvidia_drm_card() {
         local card vendor
@@ -575,56 +605,64 @@ if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
 fi
 
 case "${STREAM_MODE}" in
+        kwin|plasma|realvt)
+                COMPOSITOR_SERVICE="kwin-realvt.service"
+                COMPOSITOR_LOG_UNIT="kwin-realvt.service"
+                ;;
         weston)
                 COMPOSITOR_SERVICE="weston-kms-session.service"
                 COMPOSITOR_LOG_UNIT="weston-kms-session.service"
-                ;;
-        plasma)
-                COMPOSITOR_SERVICE="plasma-kms-session.service"
-                COMPOSITOR_LOG_UNIT="plasma-kms-session.service"
                 ;;
         gamescope)
                 echo "STREAM_MODE=gamescope is reserved for the future HDR game path and is not enabled yet." >&2
                 exit 1
                 ;;
         *)
-                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: weston, plasma." >&2
+                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: kwin, weston." >&2
                 exit 1
                 ;;
 esac
 
 echo "Performing exact known-good clean reset before final validation"
 
-systemctl stop sunshine-headless.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
-pkill sunshine 2>/dev/null || true
-pkill -f '^weston ' 2>/dev/null || true
-pkill -u "${HEADLESS_USER}" -f 'kwin_wayland|plasmashell|startplasma-wayland' 2>/dev/null || true
+systemctl stop sunshine-headless.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service plasma-realvt.service gamescope-session.service 2>/dev/null || true
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
 
-rm -f "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock"
+rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
 
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<CONF
 min_log_level = debug
-encoder = nvenc
+encoder = ${SUNSHINE_ENCODER}
 capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
+hdr = ${ENABLE_HDR}
+fps = [60, ${TARGET_FPS}]
+resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
 stream_audio = enabled
 address_family = ipv4
 ping_timeout = 60000
 CONF
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 
-systemctl reset-failed weston-kms-session.service plasma-kms-session.service sunshine-headless.service || true
+systemctl reset-failed kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
 
 systemctl start "${COMPOSITOR_SERVICE}"
-sleep 10
+
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+        sleep 8
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+        systemctl restart plasma-shell-realvt.service || true
+else
+        sleep 5
+fi
 
 journalctl -u "${COMPOSITOR_LOG_UNIT}" -n 160 --no-pager \
-  | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|kwin|plasmashell|Wayland|fatal|error" || true
+  | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|kwin|plasmashell|Wayland|fatal|error|--drm|--xwayland" || true
 
-systemctl start sunshine-headless.service
+systemctl restart sunshine-headless.service
 sleep 6
 
 journalctl -u sunshine-headless.service -n 180 --no-pager \
@@ -634,7 +672,7 @@ EOF
 
         cat > /etc/systemd/system/clouddeploy-reset-streaming.service <<'EOF'
 [Unit]
-Description=Reset CloudDeploy Weston/Sunshine streaming stack
+Description=Reset CloudDeploy compositor/Sunshine streaming stack
 
 [Service]
 Type=oneshot
@@ -734,18 +772,18 @@ refresh_streaming_log_markers() {
         local sunshine_since="${1:-}"
 
         case "${STREAM_MODE}" in
-                weston)
-                        LAST_WESTON_LOG="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
-                        KNOWN_WESTON_MODE_LINE="$(weston_current_mode_line_from_log "${LAST_WESTON_LOG}" || true)"
-                        ;;
-                plasma)
-                        LAST_WESTON_LOG="$(journalctl -u plasma-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
+                kwin|plasma|realvt)
+                        LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
                         if pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 \
-                                && pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1; then
-                                KNOWN_WESTON_MODE_LINE="Plasma Wayland active: kwin_wayland + plasmashell"
+                                && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]]; then
+                                KNOWN_WESTON_MODE_LINE="KWin real VT active: kwin_wayland on ${RUNTIME_DIR}/${KWIN_DISPLAY}"
                         else
                                 KNOWN_WESTON_MODE_LINE=""
                         fi
+                        ;;
+                weston)
+                        LAST_WESTON_LOG="$(journalctl -u weston-kms-session.service -n 260 --no-pager 2>/dev/null || true)"
+                        KNOWN_WESTON_MODE_LINE="$(weston_current_mode_line_from_log "${LAST_WESTON_LOG}" || true)"
                         ;;
                 *)
                         LAST_WESTON_LOG=""
@@ -782,28 +820,34 @@ sunshine_started_with_zero_resolution() {
 }
 
 print_streaming_diagnostics() {
-        echo "=== Wayland socket ==="
-        ls -lah "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}" "${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}.lock" 2>/dev/null || true
+        echo "=== KWin Wayland socket ==="
+        ls -lah "${RUNTIME_DIR}/${KWIN_DISPLAY}" "${RUNTIME_DIR}/${KWIN_DISPLAY}.lock" 2>/dev/null || true
+        echo
+        echo "=== Weston fallback socket ==="
+        ls -lah /tmp/runtime-"${HEADLESS_USER}"/"${WESTON_WAYLAND_DISPLAY}" /tmp/runtime-"${HEADLESS_USER}"/"${WESTON_WAYLAND_DISPLAY}.lock" 2>/dev/null || true
         echo
         echo "=== Compositor processes ==="
         pgrep -a -u "${HEADLESS_USER}" -x weston || true
         pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland || true
         pgrep -a -u "${HEADLESS_USER}" -x plasmashell || true
         echo
+        echo "=== systemctl status kwin-realvt.service ==="
+        systemctl --no-pager --full status kwin-realvt.service | sed -n '1,14p' || true
+        echo
+        echo "=== systemctl status plasma-shell-realvt.service ==="
+        systemctl --no-pager --full status plasma-shell-realvt.service | sed -n '1,14p' || true
+        echo
         echo "=== systemctl status weston-kms-session.service ==="
         systemctl --no-pager --full status weston-kms-session.service | sed -n '1,14p' || true
-        echo
-        echo "=== systemctl status plasma-kms-session.service ==="
-        systemctl --no-pager --full status plasma-kms-session.service | sed -n '1,14p' || true
         echo
         echo "=== systemctl status sunshine-headless.service ==="
         systemctl --no-pager --full status sunshine-headless.service | sed -n '1,14p' || true
         echo
+        echo "=== KWin journal (last 160) ==="
+        journalctl -u kwin-realvt.service -n 160 --no-pager || true
+        echo
         echo "=== Weston journal (last 160) ==="
         journalctl -u weston-kms-session.service -n 160 --no-pager || true
-        echo
-        echo "=== Plasma journal (last 160) ==="
-        journalctl -u plasma-kms-session.service -n 160 --no-pager || true
         echo
         echo "=== Sunshine journal (last 160) ==="
         journalctl -u sunshine-headless.service -n 160 --no-pager || true
@@ -823,7 +867,7 @@ print_server_validation_diagnostics() {
 }
 
 wait_for_weston_ready() {
-        local socket_path="${RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}"
+        local socket_path="/tmp/runtime-${HEADLESS_USER}/${WESTON_WAYLAND_DISPLAY}"
         local weston_output_enabled=""
 
         for _ in $(seq 1 90); do
@@ -891,8 +935,10 @@ known_good_clean_reset_streaming_stack() {
                 TARGET_WIDTH="${TARGET_WIDTH}" \
                 TARGET_HEIGHT="${TARGET_HEIGHT}" \
                 TARGET_FPS="${TARGET_FPS}" \
-                RUNTIME_DIR="${RUNTIME_DIR}" \
-                WAYLAND_DISPLAY_NAME="${WAYLAND_DISPLAY_NAME}" \
+                ENABLE_HDR="${ENABLE_HDR}" \
+                KWIN_WAYLAND_DISPLAY="${KWIN_WAYLAND_DISPLAY}" \
+                WESTON_WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY}" \
+                SUNSHINE_ENCODER="${SUNSHINE_ENCODER}" \
                 SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE}" \
                 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE}" \
                 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE}" \
@@ -916,9 +962,9 @@ validate_streaming_stack_ready() {
                 die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
         fi
         case "${STREAM_MODE}" in
+                kwin|plasma|realvt) compositor_service="kwin-realvt.service" ;;
                 weston) compositor_service="weston-kms-session.service" ;;
-                plasma) compositor_service="plasma-kms-session.service" ;;
-                *) compositor_service="weston-kms-session.service" ;;
+                *) compositor_service="$(service_for_mode)" ;;
         esac
 
         if ! systemctl is-active --quiet "${compositor_service}"; then
@@ -951,7 +997,7 @@ print_known_good_checklist() {
         echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
         echo "[OK] Sunshine KMS capture found monitor (${KNOWN_SUNSHINE_KMS_LINE})"
         echo "[OK] NVENC initialized (${KNOWN_SUNSHINE_NVENC_LINE})"
-        echo "Codec profile: AV1/HEVC enabled SDR profile"
+        echo "Codec profile: AV1-enabled SDR profile"
         echo "Moonlight: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
 
@@ -1001,11 +1047,15 @@ require_root
 install_clouddeploy_helpers
 
 if [[ -z "${SUNSHINE_PASS}" ]]; then
-        die "SUNSHINE_PASS is required. Run: sudo clouddeploy-write-env && sudo clouddeploy-run, or provide SUNSHINE_PASS in the environment."
+        log "SUNSHINE_PASS was not provided; Sunshine credentials will be left unchanged/default."
 fi
 
 if id "${HEADLESS_USER}" >/dev/null 2>&1; then
         HOME_DIR="$(user_home "${HEADLESS_USER}")"
+        HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+        RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+        KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
+        COMPOSITOR_SERVICE="$(service_for_mode)"
 else
         HOME_DIR=""
 fi
@@ -1019,22 +1069,22 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         [[ -n "${SUNSHINE_DRM_DEVICE}" ]] && [[ "${SUNSHINE_DRM_DEVICE}" != "auto" ]] \
                 || die "Could not detect NVIDIA DRM card node"
 
-        case "${STREAM_MODE}" in
-                weston) COMPOSITOR_SERVICE="weston-kms-session.service" ;;
-                plasma) COMPOSITOR_SERVICE="plasma-kms-session.service" ;;
-                *) die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: weston, plasma." ;;
-        esac
+        COMPOSITOR_SERVICE="$(service_for_mode)"
+        write_clouddeploy_env_file
 
         systemctl daemon-reload || true
-        systemctl reset-failed weston-kms-session.service plasma-kms-session.service sunshine-headless.service tailscaled || true
-        systemctl disable weston-kms-session.service plasma-kms-session.service >/dev/null 2>&1 || true
-        systemctl enable "${COMPOSITOR_SERVICE}" sunshine-headless.service || true
+        systemctl disable kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service >/dev/null 2>&1 || true
         if systemctl list-unit-files | grep -q '^tailscaled'; then
                 systemctl enable tailscaled || true
                 systemctl restart tailscaled || true
         fi
 
         install_clouddeploy_helpers
+        if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+                systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service || true
+        else
+                systemctl enable weston-kms-session.service sunshine-headless.service || true
+        fi
         known_good_clean_reset_streaming_stack
 
         if command -v tailscale >/dev/null 2>&1; then
@@ -1054,12 +1104,8 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
         systemctl enable --now clouddeploy-watch-streaming.timer >/dev/null 2>&1 || true
 
-        echo
-        echo "Service states:"
-        systemctl --no-pager --full status weston-kms-session.service | sed -n '1,8p' || true
-        systemctl --no-pager --full status plasma-kms-session.service | sed -n '1,8p' || true
-        systemctl --no-pager --full status sunshine-headless.service | sed -n '1,8p' || true
-        systemctl --no-pager --full status tailscaled | sed -n '1,8p' || true
+        log "Final validation markers"
+        "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh" || true
 
         if command -v tailscale >/dev/null 2>&1; then
                 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -1122,12 +1168,17 @@ HOME_DIR="$(user_home "${HEADLESS_USER}")"
 usermod -aG sudo,video,input,render "${HEADLESS_USER}" || true
 loginctl enable-linger "${HEADLESS_USER}" 2>/dev/null || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
+HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
+COMPOSITOR_SERVICE="$(service_for_mode)"
 
 log "Installing base packages"
 apt_update_retry
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
+        dbus-user-session dbus-x11 \
         kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         ubuntu-drivers-common
@@ -1211,8 +1262,9 @@ fi
 [[ -n "${SUNSHINE_DRM_DEVICE}" ]] || die "Could not detect NVIDIA DRM card node"
 WESTON_DRM_DEVICE="$(basename "${SUNSHINE_DRM_DEVICE}")"
 [[ -n "${WESTON_DRM_DEVICE}" ]] || die "Could not derive Weston DRM card basename"
-log "Using Sunshine DRM device: ${SUNSHINE_DRM_DEVICE}"
+log "Using NVIDIA KMS/DRM device: ${SUNSHINE_DRM_DEVICE}"
 log "Using Weston DRM device basename: ${WESTON_DRM_DEVICE}"
+write_clouddeploy_env_file
 
 log "Writing Phase 2 EDID profiles"
 write_phase2_edids
@@ -1226,41 +1278,179 @@ ensure_phase2_kernel_args "${SELECTED_EDID_FILE}"
 validate_phase2_display_state "${SELECTED_EDID_FILE}"
 
 case "${SESSION_BACKEND}" in
-        weston|plasma)
+        kwin|plasma|realvt|weston)
                 ;;
         gamescope)
-                die "SESSION_BACKEND=gamescope is reserved for the future HDR game mode and is not enabled yet."
+                die "SESSION_BACKEND=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: weston, plasma."
+                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: kwin, weston."
                 ;;
 esac
 
 case "${STREAM_MODE}" in
+        kwin|plasma|realvt)
+                log "STREAM_MODE=${STREAM_MODE}: direct KWin Wayland DRM session on real VT${KWIN_VTNR}"
+                COMPOSITOR_SERVICE="kwin-realvt.service"
+                ;;
         weston)
-                log "STREAM_MODE=weston: minimal diagnostic 4K120 SDR streaming mode"
+                log "STREAM_MODE=weston: diagnostic Weston KMS fallback"
                 COMPOSITOR_SERVICE="weston-kms-session.service"
                 ;;
-        plasma)
-                log "STREAM_MODE=plasma: KDE Plasma Wayland desktop mode on forced DP-1 KMS"
-                COMPOSITOR_SERVICE="plasma-kms-session.service"
-                ;;
         gamescope)
-                die "STREAM_MODE=gamescope is reserved for the future HDR game mode and is not enabled yet."
+                die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: weston, plasma."
+                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: kwin, weston."
                 ;;
 esac
 
-log "Writing Weston KMS session startup"
+log "Writing direct KWin real-VT launchers and Weston fallback"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \
         "${HOME_DIR}/.local/bin" \
         "${HOME_DIR}/.local/share" \
         "${HOME_DIR}/.config" \
         "${HOME_DIR}/.config/weston" \
-        "${HOME_DIR}/.config/plasma-workspace" \
         "${HOME_DIR}/.config/sunshine"
+
+cat > "${HOME_DIR}/.config/startkderc" <<'EOF'
+[General]
+systemdBoot=false
+EOF
+
+cat > "${HOME_DIR}/.config/kscreenlockerrc" <<'EOF'
+[Daemon]
+Autolock=false
+LockOnResume=false
+EOF
+
+chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config"
+
+cat > "${HOME_DIR}/.local/bin/start-kwin-realvt.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
+
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_CLASS=user
+export XDG_SESSION_DESKTOP=KDE
+export XDG_CURRENT_DESKTOP=KDE
+export KDE_FULL_SESSION=true
+export KDE_SESSION_VERSION=6
+export XDG_VTNR="${KWIN_VTNR}"
+
+export KWIN_DRM_DEVICES="${SUNSHINE_DRM_DEVICE}"
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland,x11
+export MOZ_ENABLE_WAYLAND=1
+export TERM=xterm
+
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+unset DISPLAY
+unset WAYLAND_DISPLAY
+
+mkdir -p "\$XDG_RUNTIME_DIR" "\$HOME/.config" "\$HOME/.local/share"
+chmod 700 "\$XDG_RUNTIME_DIR"
+
+rm -f "\$XDG_RUNTIME_DIR/${KWIN_DISPLAY}" "\$XDG_RUNTIME_DIR/${KWIN_DISPLAY}.lock"
+
+exec /usr/bin/kwin_wayland --drm --xwayland --socket "${KWIN_DISPLAY}"
+EOF
+
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-kwin-realvt.sh"
+chmod 0755 "${HOME_DIR}/.local/bin/start-kwin-realvt.sh"
+
+cat > /usr/local/bin/clouddeploy-force-kwin-mode.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
+
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+export QT_QPA_PLATFORM=wayland
+
+for _ in \$(seq 1 90); do
+        if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
+                break
+        fi
+
+        echo "Waiting for KWin Wayland socket \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}..."
+        sleep 1
+done
+
+[[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] || {
+        echo "KWin Wayland socket did not appear" >&2
+        exit 1
+}
+
+OUT="\$(kscreen-doctor -o 2>&1 || true)"
+echo "\${OUT}"
+
+OUTPUT_ID="\$(printf '%s\n' "\${OUT}" | sed -nE 's/.*Output: ([0-9]+) ${FORCED_CONNECTOR}.*/\\1/p' | head -n1)"
+MODE_ID="\$(printf '%s\n' "\${OUT}" | grep -oE '[0-9]+:${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS}' | head -n1 | cut -d: -f1)"
+
+[[ -n "\${OUTPUT_ID}" ]] || OUTPUT_ID="1"
+[[ -n "\${MODE_ID}" ]] || MODE_ID="1"
+
+echo "Forcing ${FORCED_CONNECTOR} to ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} using output.\${OUTPUT_ID}.mode.\${MODE_ID}"
+
+kscreen-doctor "output.\${OUTPUT_ID}.mode.\${MODE_ID}" "output.\${OUTPUT_ID}.scale.1" || \
+        kscreen-doctor "output.${FORCED_CONNECTOR}.mode.\${MODE_ID}" "output.${FORCED_CONNECTOR}.scale.1"
+
+sleep 2
+kscreen-doctor -o
+EOF
+
+chmod 0755 /usr/local/bin/clouddeploy-force-kwin-mode.sh
+
+cat > "${HOME_DIR}/.local/bin/start-plasmashell-realvt.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
+
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_DESKTOP=KDE
+export XDG_CURRENT_DESKTOP=KDE
+export KDE_FULL_SESSION=true
+export KDE_SESSION_VERSION=6
+
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland,x11
+export MOZ_ENABLE_WAYLAND=1
+
+for _ in \$(seq 1 90); do
+        if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
+                exec /usr/bin/plasmashell
+        fi
+
+        sleep 1
+done
+
+echo "KWin never became ready for plasmashell" >&2
+exit 1
+EOF
+
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-plasmashell-realvt.sh"
+chmod 0755 "${HOME_DIR}/.local/bin/start-plasmashell-realvt.sh"
 
 cat > "${HOME_DIR}/.config/weston.ini" <<EOF
 [core]
@@ -1279,10 +1469,11 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+
+export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
 export XDG_SESSION_TYPE=wayland
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
-export LIBSEAT_BACKEND=seatd
+export WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY}"
+
 export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 export __GLX_VENDOR_LIBRARY_NAME=nvidia
 
@@ -1292,51 +1483,13 @@ chmod 700 "\$XDG_RUNTIME_DIR"
 exec /usr/bin/weston \
         --backend=drm-backend.so \
         --drm-device="${WESTON_DRM_DEVICE}" \
-        --socket="${WAYLAND_DISPLAY_NAME}" \
+        --socket="${WESTON_WAYLAND_DISPLAY}" \
         --config="${HOME_DIR}/.config/weston.ini"
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/weston.ini"
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-weston-kms.sh"
 chmod 0755 "${HOME_DIR}/.local/bin/start-weston-kms.sh"
-
-cat > "${HOME_DIR}/.local/bin/start-plasma-wayland-kms.sh" <<EOF
-#!/usr/bin/env bash
-set -euo pipefail
-
-export HOME="${HOME_DIR}"
-export USER="${HEADLESS_USER}"
-export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
-export XDG_SESSION_TYPE=wayland
-export XDG_SESSION_DESKTOP=KDE
-export XDG_CURRENT_DESKTOP=KDE
-export KDE_FULL_SESSION=true
-export KDE_SESSION_VERSION=6
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
-export KWIN_DRM_DEVICES="${SUNSHINE_DRM_DEVICE}"
-export QT_QPA_PLATFORM=wayland
-export GDK_BACKEND=wayland,x11
-export MOZ_ENABLE_WAYLAND=1
-export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-export __GLX_VENDOR_LIBRARY_NAME=nvidia
-
-mkdir -p "\$XDG_RUNTIME_DIR" "${HOME_DIR}/.local/share" "${HOME_DIR}/.config"
-chmod 700 "\$XDG_RUNTIME_DIR"
-
-# Keep KDE from immediately locking a headless streamed desktop.
-mkdir -p "${HOME_DIR}/.config"
-cat > "${HOME_DIR}/.config/kscreenlockerrc" <<KDECONF
-[Daemon]
-Autolock=false
-LockOnResume=false
-KDECONF
-
-exec dbus-run-session -- startplasma-wayland
-EOF
-
-chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-plasma-wayland-kms.sh"
-chmod 0755 "${HOME_DIR}/.local/bin/start-plasma-wayland-kms.sh"
 
 cat > "${HOME_DIR}/.local/bin/start-sunshine-headless.sh" <<EOF
 #!/usr/bin/env bash
@@ -1345,45 +1498,40 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
-export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
-export WAYLAND_DISPLAY="${WAYLAND_DISPLAY_NAME}"
 
-STREAM_MODE="${STREAM_MODE}"
-HEADLESS_USER="${HEADLESS_USER}"
+case "${STREAM_MODE}" in
+        kwin|plasma|realvt)
+                export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+                export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+                WAIT_PROCESS="kwin_wayland"
+                ;;
+        weston)
+                export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+                export WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY}"
+                WAIT_PROCESS="weston"
+                ;;
+        *)
+                echo "Unsupported STREAM_MODE for Sunshine: ${STREAM_MODE}" >&2
+                exit 1
+                ;;
+esac
 
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
-SOCKET_PATH="\${XDG_RUNTIME_DIR}/${WAYLAND_DISPLAY_NAME}"
-SOCKET_STABILIZED=0
-
 for _ in \$(seq 1 120); do
-        if [[ -S "\${SOCKET_PATH}" ]]; then
-                if [[ "\${SOCKET_STABILIZED}" -eq 0 ]]; then
-                        sleep 2
-                        SOCKET_STABILIZED=1
+        if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
+                echo "\${WAIT_PROCESS} Wayland session is ready at \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}; starting Sunshine"
+
+                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
+                        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
                 fi
 
-                if [[ -S "\${SOCKET_PATH}" ]]; then
-                        case "\${STREAM_MODE}" in
-                                weston)
-                                        pgrep -u "\${HEADLESS_USER}" -x weston >/dev/null 2>&1 && exec /usr/bin/sunshine
-                                        ;;
-                                plasma)
-                                        pgrep -u "\${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 \
-                                                && pgrep -u "\${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
-                                                && exec /usr/bin/sunshine
-                                        ;;
-                                *)
-                                        echo "Unsupported STREAM_MODE for Sunshine wait: \${STREAM_MODE}" >&2
-                                        exit 1
-                                        ;;
-                        esac
-                fi
-        else
-                SOCKET_STABILIZED=0
+                exec /usr/bin/sunshine
         fi
 
+        echo "Waiting for \${WAIT_PROCESS} Wayland socket \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}..."
         sleep 1
 done
 
@@ -1407,7 +1555,7 @@ nvidia-smi || true
 
 echo
 echo "=== /dev/dri ==="
-ls -lah /dev/dri || true
+ls -l /dev/dri || true
 
 echo
 echo "=== Connector status (${FORCED_CONNECTOR}) ==="
@@ -1417,49 +1565,34 @@ echo
 echo "=== Connector modes (${FORCED_CONNECTOR}) ==="
 cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
 
-if command -v edid-decode >/dev/null 2>&1; then
-        echo
-        echo "=== EDID decode (firmware /lib/firmware/edid/${SELECTED_EDID_FILE}) ==="
-        edid-decode /lib/firmware/edid/${SELECTED_EDID_FILE} || true
-
-        echo
-        echo "=== EDID decode (${FORCED_CONNECTOR}) ==="
-        for edid_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/edid; do
-                [[ -f "\${edid_path}" ]] || continue
-                echo "-- \${edid_path} --"
-                edid-decode "\${edid_path}" || true
-        done
+echo
+echo "=== KScreen output ==="
+if [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]]; then
+        env HOME="${HOME_DIR}" \
+            XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+            WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+            QT_QPA_PLATFORM=wayland \
+            kscreen-doctor -o || true
 fi
 
 echo
-echo "=== systemctl status weston-kms-session.service ==="
-systemctl --no-pager --full status weston-kms-session.service || true
+echo "=== Service status ==="
+systemctl --no-pager --full status \
+        kwin-realvt.service \
+        plasma-shell-realvt.service \
+        weston-kms-session.service \
+        sunshine-headless.service \
+        tailscaled || true
 
 echo
-echo "=== systemctl status plasma-kms-session.service ==="
-systemctl --no-pager --full status plasma-kms-session.service || true
+echo "=== Processes ==="
+pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|plasmashell|weston|sunshine' || true
 
 echo
-echo "=== systemctl status sunshine-headless.service ==="
-systemctl --no-pager --full status sunshine-headless.service || true
-
-echo
-echo "=== Weston journal (last 160) ==="
-journalctl -u weston-kms-session.service -n 160 --no-pager || true
-
-echo
-echo "=== Plasma journal (last 160) ==="
-journalctl -u plasma-kms-session.service -n 160 --no-pager || true
-
-echo
-echo "=== Sunshine journal (last 160) ==="
-journalctl -u sunshine-headless.service -n 160 --no-pager || true
-
-if command -v modetest >/dev/null 2>&1; then
-        echo
-        echo "=== modetest -M nvidia-drm -p ==="
-        modetest -M nvidia-drm -p || true
-fi
+echo "=== Sunshine journal markers ==="
+journalctl -u sunshine-headless.service -n 220 --no-pager \
+        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|Nvenc initialized|Found AV1|Mismatch|pair|pin|error|fatal' || true
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
@@ -1479,38 +1612,81 @@ if command -v setcap >/dev/null 2>&1 && command -v sunshine >/dev/null 2>&1; the
         setcap cap_sys_admin+p "$(readlink -f "$(command -v sunshine)")" || true
 fi
 
-log "Setting Sunshine web UI credentials"
-run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}" || true
+if [[ -n "${SUNSHINE_PASS}" ]]; then
+        log "Setting Sunshine web UI credentials"
+        run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}" || true
+else
+        log "SUNSHINE_PASS was not provided; leaving Sunshine credentials unchanged/default."
+fi
 
-log "Writing Weston KMS systemd service"
-cat > /etc/systemd/system/weston-kms-session.service <<EOF
+log "Writing KWin real-VT systemd service"
+cat > /etc/systemd/system/kwin-realvt.service <<EOF
 [Unit]
-Description=Weston KMS session on NVIDIA
-After=network-online.target
+Description=KWin Wayland DRM session on real VT${KWIN_VTNR}
+After=systemd-logind.service systemd-user-sessions.service network-online.target
 Wants=network-online.target
+Conflicts=display-manager.service getty@tty${KWIN_VTNR}.service weston-kms-session.service
+
+[Service]
+Type=simple
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
+PAMName=login
+WorkingDirectory=${HOME_DIR}
+
+TTYPath=/dev/tty${KWIN_VTNR}
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty${KWIN_VTNR}
+UtmpMode=user
+
+PermissionsStartOnly=true
+ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
+ExecStartPre=-/usr/bin/systemctl start user@${HEADLESS_UID}.service
+ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chvt ${KWIN_VTNR}
+ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+
+ExecStart=${HOME_DIR}/.local/bin/start-kwin-realvt.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+log "Writing Plasma shell real-VT systemd service"
+cat > /etc/systemd/system/plasma-shell-realvt.service <<EOF
+[Unit]
+Description=Plasma shell on direct KWin Wayland VT session
+After=kwin-realvt.service
+Requires=kwin-realvt.service
+PartOf=kwin-realvt.service
 
 [Service]
 User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 SupplementaryGroups=video render input
 WorkingDirectory=${HOME_DIR}
+
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
 Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
-Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
-Environment=LIBSEAT_BACKEND=seatd
-Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
-PermissionsStartOnly=true
-ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share ${HOME_DIR}/.config ${HOME_DIR}/.config/weston ${HOME_DIR}/.local/bin
-ExecStartPre=/usr/bin/chown -R ${HEADLESS_USER}:${HEADLESS_USER} ${HOME_DIR}/.local ${HOME_DIR}/.config
-ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-weston-kms.sh
-Restart=always
+Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+
+ExecStart=${HOME_DIR}/.local/bin/start-plasmashell-realvt.sh
+
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
@@ -1519,44 +1695,35 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-log "Writing Plasma KMS systemd service"
-cat > /etc/systemd/system/plasma-kms-session.service <<EOF
+log "Writing Weston diagnostic fallback systemd service"
+cat > /etc/systemd/system/weston-kms-session.service <<EOF
 [Unit]
-Description=KDE Plasma Wayland session on forced NVIDIA KMS connector
+Description=Weston diagnostic KMS session on NVIDIA
 After=network-online.target
 Wants=network-online.target
+Conflicts=kwin-realvt.service
 
 [Service]
 User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 SupplementaryGroups=video render input
-PAMName=login
 WorkingDirectory=${HOME_DIR}
+
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
-Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
-Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
-Environment=XDG_SESSION_TYPE=wayland
-Environment=XDG_SESSION_DESKTOP=KDE
-Environment=XDG_CURRENT_DESKTOP=KDE
-Environment=KDE_FULL_SESSION=true
-Environment=KDE_SESSION_VERSION=6
-Environment=KWIN_DRM_DEVICES=${SUNSHINE_DRM_DEVICE}
-Environment=QT_QPA_PLATFORM=wayland
-Environment=GDK_BACKEND=wayland,x11
-Environment=MOZ_ENABLE_WAYLAND=1
-Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
-Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+Environment=XDG_RUNTIME_DIR=/tmp/runtime-${HEADLESS_USER}
+Environment=WAYLAND_DISPLAY=${WESTON_WAYLAND_DISPLAY}
+
 PermissionsStartOnly=true
-ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
-ExecStartPre=/usr/bin/mkdir -p ${HOME_DIR}/.local/share ${HOME_DIR}/.config ${HOME_DIR}/.local/bin
-ExecStartPre=/usr/bin/chown -R ${HEADLESS_USER}:${HEADLESS_USER} ${HOME_DIR}/.local ${HOME_DIR}/.config
+ExecStartPre=/usr/bin/mkdir -p /tmp/runtime-${HEADLESS_USER}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} /tmp/runtime-${HEADLESS_USER}
+ExecStartPre=/usr/bin/chmod 700 /tmp/runtime-${HEADLESS_USER}
 ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
-ExecStart=/bin/bash ${HOME_DIR}/.local/bin/start-plasma-wayland-kms.sh
-Restart=always
+
+ExecStart=${HOME_DIR}/.local/bin/start-weston-kms.sh
+
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
@@ -1568,7 +1735,7 @@ EOF
 log "Writing Sunshine systemd service"
 cat > /etc/systemd/system/sunshine-headless.service <<EOF
 [Unit]
-Description=Sunshine on headless NVIDIA Wayland
+Description=Sunshine on CloudDeploy NVIDIA Wayland KMS
 After=${COMPOSITOR_SERVICE} network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service
 Requires=${COMPOSITOR_SERVICE}
@@ -1577,14 +1744,19 @@ PartOf=${COMPOSITOR_SERVICE}
 [Service]
 User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
 WorkingDirectory=${HOME_DIR}
+
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
 Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
-Environment=WAYLAND_DISPLAY=${WAYLAND_DISPLAY_NAME}
+Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+
 ExecStart=${HOME_DIR}/.local/bin/start-sunshine-headless.sh
-Restart=always
+
+Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
@@ -1593,25 +1765,66 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
-log "Stopping any old broken session bits"
-pkill -u "${HEADLESS_USER}" -f 'weston|sunshine|kwin_wayland|plasmashell|startplasma-wayland' 2>/dev/null || true
-systemctl stop sddm 2>/dev/null || true
+log "Stopping old compositor/session bits"
+systemctl stop \
+        plasma-kms-session.service \
+        plasma-realvt.service \
+        kwin-realvt.service \
+        plasma-shell-realvt.service \
+        weston-kms-session.service \
+        sunshine-headless.service \
+        2>/dev/null || true
 
-log "Enabling services"
+systemctl disable \
+        plasma-kms-session.service \
+        plasma-realvt.service \
+        2>/dev/null || true
+
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+
+rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+
+log "Enabling selected services"
 systemctl daemon-reload
-systemctl disable weston-kms-session.service plasma-kms-session.service >/dev/null 2>&1 || true
-systemctl enable "${COMPOSITOR_SERVICE}" sunshine-headless.service
+systemctl disable \
+        kwin-realvt.service \
+        plasma-shell-realvt.service \
+        weston-kms-session.service \
+        sunshine-headless.service \
+        >/dev/null 2>&1 || true
+
 if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl enable tailscaled || true
 fi
 
-if systemctl list-unit-files | grep -q '^tailscaled'; then
-        systemctl restart tailscaled || true
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+        systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service
+
+        systemctl restart kwin-realvt.service
+        sleep 8
+
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+
+        systemctl restart plasma-shell-realvt.service || true
+        systemctl restart sunshine-headless.service
+else
+        systemctl enable weston-kms-session.service sunshine-headless.service
+
+        systemctl restart weston-kms-session.service
+        sleep 5
+
+        systemctl restart sunshine-headless.service
 fi
+
+systemctl restart tailscaled 2>/dev/null || true
+
 install_clouddeploy_helpers
 known_good_clean_reset_streaming_stack
 
 validate_streaming_stack_ready
+
+log "Final validation markers"
+"${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh" || true
 
 echo "$SCRIPT_VERSION" > "$SENTINEL"
 
@@ -1639,9 +1852,7 @@ echo
 echo "If Moonlight shows a PIN, enter it in Sunshine's PIN tab."
 echo "Do NOT inject sunshine_state.json pairings in the deploy script."
 echo
-echo "Compositor journal marker: ${KNOWN_WESTON_MODE_LINE}"
-echo "Sunshine resolution marker: ${KNOWN_SUNSHINE_RESOLUTION_LINE}"
-echo "Sunshine monitor marker: ${KNOWN_SUNSHINE_MONITOR_LINE}"
-echo "Sunshine KMS marker: ${KNOWN_SUNSHINE_KMS_LINE}"
-echo "Sunshine NVENC marker: ${KNOWN_SUNSHINE_NVENC_LINE}"
+echo "Status helper: ${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
+echo "Expected KWin path: kwin_wayland --drm --xwayland --socket ${KWIN_DISPLAY}"
+echo "Expected Moonlight: ${TARGET_WIDTH}x${TARGET_HEIGHT}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 print_known_good_checklist
