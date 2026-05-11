@@ -27,7 +27,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="12-kwin-realvt"
+SCRIPT_VERSION="13-kwin-realvt-kms-diagnostic"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -107,10 +107,17 @@ nvidia_modules_present_for_running_kernel() {
 write_phase2_edids() {
         install -d -m 0755 /lib/firmware/edid
 
-        local script_dir
+        local script_dir edid_script
         script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-        python3 "${script_dir}/scripts/write-edids.py"
+        edid_script="${script_dir}/scripts/write-edids.py"
+        if [[ ! -f "${edid_script}" ]]; then
+                edid_script="${script_dir}/write-edids.py"
+        fi
+
+        [[ -f "${edid_script}" ]] || die "Could not find write-edids.py in scripts/ or repo root"
+
+        python3 "${edid_script}"
 }
 
 select_phase2_edid_file() {
@@ -463,7 +470,7 @@ av1_mode = ${SUNSHINE_AV1_MODE}
 hdr = ${ENABLE_HDR}
 fps = [60, ${TARGET_FPS}]
 resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
-stream_audio = enabled
+stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 EOF
@@ -641,7 +648,7 @@ av1_mode = ${SUNSHINE_AV1_MODE}
 hdr = ${ENABLE_HDR}
 fps = [60, ${TARGET_FPS}]
 resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
-stream_audio = enabled
+stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 CONF
@@ -736,6 +743,172 @@ Unit=clouddeploy-watch-streaming.service
 [Install]
 WantedBy=timers.target
 EOF
+
+        cat > /usr/local/sbin/clouddeploy-diagnose-kms <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+HEADLESS_USER="${HEADLESS_USER:-user}"
+KWIN_WAYLAND_DISPLAY="${KWIN_WAYLAND_DISPLAY:-wayland-0}"
+SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
+HOME_DIR="$(getent passwd "${HEADLESS_USER}" | cut -d: -f6 || true)"
+HOME_DIR="${HOME_DIR:-/home/${HEADLESS_USER}}"
+HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
+
+detect_nvidia_drm_card() {
+        local card vendor
+        for card in /sys/class/drm/card[0-9]; do
+                [[ -e "${card}/device/vendor" ]] || continue
+                vendor="$(cat "${card}/device/vendor" 2>/dev/null || true)"
+                if [[ "${vendor}" == "0x10de" ]]; then
+                        printf '/dev/dri/%s\n' "$(basename "${card}")"
+                        return 0
+                fi
+        done
+        return 1
+}
+
+if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
+        SUNSHINE_DRM_DEVICE="$(detect_nvidia_drm_card || true)"
+fi
+
+echo "=== nvidia_drm modeset ==="
+cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || true
+
+echo
+echo "=== Sunshine cap_sys_admin ==="
+if command -v sunshine >/dev/null 2>&1; then
+        sunshine_bin="$(readlink -f "$(command -v sunshine)")"
+        getcap "${sunshine_bin}" || true
+else
+        echo "sunshine not found"
+fi
+
+echo
+echo "=== KWin environment ==="
+KPID="$(pgrep -n -u "${HEADLESS_USER}" kwin_wayland || true)"
+if [[ -n "${KPID}" ]]; then
+        echo "KWin PID: ${KPID}"
+        tr '\0' '\n' < "/proc/${KPID}/environ" \
+                | grep -E 'KWIN_DRM_DEVICES|KWIN_DRM_NO_DIRECT_SCANOUT|KWIN_FORCE_SW_CURSOR|KWIN_USE_OVERLAYS|GBM_BACKEND|GLX' || true
+else
+        echo "kwin_wayland is not running for ${HEADLESS_USER}"
+fi
+
+echo
+echo "=== KScreen output ==="
+runuser -u "${HEADLESS_USER}" -- env \
+        HOME="${HOME_DIR}" \
+        XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+        WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+        QT_QPA_PLATFORM=wayland \
+        kscreen-doctor -o || true
+
+echo
+echo "=== Launching a visible KDE app briefly ==="
+if command -v systemsettings >/dev/null 2>&1; then
+        runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                systemsettings >/tmp/clouddeploy-systemsettings.log 2>&1 &
+        app_pid="$!"
+        sleep 4
+        kill "${app_pid}" >/dev/null 2>&1 || true
+        echo "systemsettings log: /tmp/clouddeploy-systemsettings.log"
+else
+        echo "systemsettings not found"
+fi
+
+rm -f /tmp/wayland-grim.png /tmp/kmsgrab.png
+
+echo
+echo "=== Wayland screenshot via grim ==="
+runuser -u "${HEADLESS_USER}" -- env \
+        HOME="${HOME_DIR}" \
+        XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+        WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+        DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+        grim /tmp/wayland-grim.png || true
+
+echo
+echo "=== Raw KMS screenshot via ffmpeg kmsgrab (${SUNSHINE_DRM_DEVICE}) ==="
+ffmpeg -y -loglevel warning \
+        -f kmsgrab \
+        -device "${SUNSHINE_DRM_DEVICE}" \
+        -i - \
+        -frames:v 1 \
+        -vf 'hwdownload,format=bgr0' \
+        /tmp/kmsgrab.png </dev/null || true
+
+echo
+echo "=== Image identification ==="
+if command -v identify >/dev/null 2>&1; then
+        identify /tmp/wayland-grim.png 2>/dev/null || echo "/tmp/wayland-grim.png missing or unreadable"
+        identify /tmp/kmsgrab.png 2>/dev/null || echo "/tmp/kmsgrab.png missing or unreadable"
+else
+        ls -lh /tmp/wayland-grim.png /tmp/kmsgrab.png 2>/dev/null || true
+fi
+
+echo
+echo "=== Interpretation ==="
+echo "grim good + kmsgrab black = KWin/DRM plane issue"
+echo "grim good + kmsgrab good + Moonlight black = Sunshine KMS backend issue"
+echo "grim black = KWin/Plasma rendering issue"
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-diagnose-kms
+
+        cat > /usr/local/sbin/clouddeploy-pair-pin <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+SUNSHINE_USER="${SUNSHINE_USER:-user}"
+
+read -s -r -p "Sunshine web password: " SP
+echo
+read -r -p "Moonlight PIN: " PIN
+read -r -p "Client name [roth]: " CLIENT_NAME
+CLIENT_NAME="${CLIENT_NAME:-roth}"
+
+if command -v jq >/dev/null 2>&1; then
+        payload="$(jq -cn --arg pin "${PIN}" --arg name "${CLIENT_NAME}" '{pin: $pin, name: $name}')"
+else
+        payload="{\"pin\":\"${PIN}\",\"name\":\"${CLIENT_NAME}\"}"
+fi
+
+curl -ks -u "${SUNSHINE_USER}:${SP}" \
+        -H 'Content-Type: application/json' \
+        -d "${payload}" \
+        https://127.0.0.1:47990/api/pin
+
+echo
+echo "=== Sunshine clients ==="
+curl -ks -u "${SUNSHINE_USER}:${SP}" https://127.0.0.1:47990/api/clients/list || true
+echo
+echo "Pairing helper used Sunshine's API only; it did not inject sunshine_state.json."
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-pair-pin
 
         systemctl daemon-reload
 }
@@ -1181,6 +1354,7 @@ apt_install_wait \
         dbus-user-session dbus-x11 \
         kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
+        grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
 
 log "Checking NVIDIA driver status"
@@ -1346,6 +1520,10 @@ export KDE_SESSION_VERSION=6
 export XDG_VTNR="${KWIN_VTNR}"
 
 export KWIN_DRM_DEVICES="${SUNSHINE_DRM_DEVICE}"
+export KWIN_DRM_NO_DIRECT_SCANOUT=1
+export KWIN_FORCE_SW_CURSOR=1
+export KWIN_USE_OVERLAYS=0
+export GBM_BACKEND=nvidia-drm
 export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
 export MOZ_ENABLE_WAYLAND=1
@@ -1550,12 +1728,25 @@ echo "=== /proc/cmdline ==="
 cat /proc/cmdline || true
 
 echo
+echo "=== nvidia_drm modeset ==="
+cat /sys/module/nvidia_drm/parameters/modeset 2>/dev/null || true
+
+echo
 echo "=== nvidia-smi ==="
 nvidia-smi || true
 
 echo
 echo "=== /dev/dri ==="
 ls -l /dev/dri || true
+
+echo
+echo "=== Sunshine cap_sys_admin ==="
+if command -v sunshine >/dev/null 2>&1; then
+        sunshine_bin="\$(readlink -f "\$(command -v sunshine)")"
+        getcap "\${sunshine_bin}" || true
+else
+        echo "sunshine not found"
+fi
 
 echo
 echo "=== Connector status (${FORCED_CONNECTOR}) ==="
@@ -1588,6 +1779,16 @@ systemctl --no-pager --full status \
 echo
 echo "=== Processes ==="
 pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|plasmashell|weston|sunshine' || true
+
+echo
+echo "=== KWin environment ==="
+KPID="\$(pgrep -n -u "${HEADLESS_USER}" kwin_wayland || true)"
+if [[ -n "\${KPID}" ]]; then
+        tr '\0' '\n' < "/proc/\${KPID}/environ" \
+                | grep -E 'KWIN_DRM_DEVICES|KWIN_DRM_NO_DIRECT_SCANOUT|KWIN_FORCE_SW_CURSOR|KWIN_USE_OVERLAYS|GBM_BACKEND|GLX' || true
+else
+        echo "kwin_wayland is not running"
+fi
 
 echo
 echo "=== Sunshine journal markers ==="
@@ -1644,6 +1845,13 @@ TTYVHangup=yes
 TTYVTDisallocate=yes
 UtmpIdentifier=tty${KWIN_VTNR}
 UtmpMode=user
+
+Environment=KWIN_DRM_DEVICES=${SUNSHINE_DRM_DEVICE}
+Environment=KWIN_DRM_NO_DIRECT_SCANOUT=1
+Environment=KWIN_FORCE_SW_CURSOR=1
+Environment=KWIN_USE_OVERLAYS=0
+Environment=GBM_BACKEND=nvidia-drm
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 
 PermissionsStartOnly=true
 ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
@@ -1853,6 +2061,10 @@ echo "If Moonlight shows a PIN, enter it in Sunshine's PIN tab."
 echo "Do NOT inject sunshine_state.json pairings in the deploy script."
 echo
 echo "Status helper: ${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
+echo "Diagnostic helper: sudo clouddeploy-diagnose-kms"
+echo "Pairing helper: sudo clouddeploy-pair-pin"
+echo "Audio is intentionally disabled until video capture is stable."
+echo "Expected current milestone: Plasma Wayland visible, raw KMS capture tested, Sunshine KMS/NVENC alive."
 echo "Expected KWin path: kwin_wayland --drm --xwayland --socket ${KWIN_DISPLAY}"
 echo "Expected Moonlight: ${TARGET_WIDTH}x${TARGET_HEIGHT}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 print_known_good_checklist
