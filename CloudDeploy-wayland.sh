@@ -42,7 +42,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="16-plasma-wayland-sunshine-source-apps"
+SCRIPT_VERSION="17-driver-cleanup-provider-diagnostics"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -574,8 +574,95 @@ ensure_cuda_ubuntu_repo() {
         apt_update_retry
 }
 
+cleanup_conflicting_nvidia_driver_packages() {
+        local pkg branch
+        local -a installed_pkgs purge_pkgs
+        local -a known_branches
+
+        known_branches=(535 550 560 565 570 575 580)
+
+        log "Cleaning up conflicting non-target NVIDIA/CUDA driver packages"
+        systemctl stop sunshine-headless.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service 2>/dev/null || true
+        apt-mark unhold 'cuda*' 'nvidia*' 'libnvidia*' >/dev/null 2>&1 || true
+
+        mapfile -t installed_pkgs < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null | sort -u)
+        purge_pkgs=()
+
+        for pkg in "${installed_pkgs[@]}"; do
+                case "${pkg}" in
+                        cuda-drivers|cuda-drivers-*)
+                                purge_pkgs+=("${pkg}")
+                                continue
+                                ;;
+                esac
+
+                case "${pkg}" in
+                        nvidia-*|libnvidia-*|linux-modules-nvidia-*|linux-objects-nvidia-*|linux-signatures-nvidia-*|xserver-xorg-video-nvidia-*)
+                                for branch in "${known_branches[@]}"; do
+                                        [[ "${branch}" == "${TARGET_NVIDIA_DRIVER_MAJOR}" ]] && continue
+                                        if [[ "${pkg}" =~ (^|[-_])${branch}($|[-_.]) ]]; then
+                                                purge_pkgs+=("${pkg}")
+                                                break
+                                        fi
+                                done
+                                ;;
+                esac
+        done
+
+        if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
+                log "Purging conflicting NVIDIA/CUDA driver packages: ${purge_pkgs[*]}"
+                wait_for_apt
+                apt-get purge -y "${purge_pkgs[@]}" || log "NVIDIA conflict purge had errors; continuing to target driver install"
+        else
+                log "No obvious non-target NVIDIA driver branch packages found"
+        fi
+
+        wait_for_apt
+        apt-get autoremove --purge -y || log "apt autoremove after NVIDIA cleanup failed; continuing"
+        wait_for_apt
+        apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20 || log "apt update after NVIDIA cleanup failed; continuing"
+}
+
+diagnose_nvidia_init_failure() {
+        echo
+        echo "=== NVIDIA init diagnostics ==="
+        echo "=== nvidia-smi ==="
+        nvidia-smi || true
+        echo
+        echo "=== uname -r ==="
+        uname -r || true
+        echo
+        echo "=== dkms status | grep -i nvidia ==="
+        dkms status 2>/dev/null | grep -i nvidia || true
+        echo
+        echo "=== lsmod | grep -i nvidia ==="
+        lsmod 2>/dev/null | grep -i nvidia || true
+        echo
+        echo "=== /dev/nvidia* ==="
+        ls -l /dev/nvidia* 2>/dev/null || true
+        echo
+        echo "=== /proc/driver/nvidia/version ==="
+        cat /proc/driver/nvidia/version 2>/dev/null || true
+        echo
+        echo "=== /proc/driver/nvidia/gpus ==="
+        ls -R /proc/driver/nvidia/gpus 2>/dev/null || true
+        echo
+        echo "=== lspci NVIDIA/display devices ==="
+        lspci -nnk 2>/dev/null | grep -A5 -Ei 'nvidia|vga|3d|display' || true
+        echo
+        echo "=== dmesg NVIDIA/provider markers ==="
+        dmesg -T 2>/dev/null \
+                | grep -Ei 'nvidia|NVRM|GSP|Xid|RmInit|NvKmsKapiDevice|nouveau|secure|mok|vfio|drm' \
+                | tail -n 240 || true
+}
+
+nvidia_provider_init_failure_seen() {
+        dmesg -T 2>/dev/null | grep -Eiq 'RmInitAdapter|Xid.*62|Failed to allocate NvKmsKapiDevice'
+}
+
 install_target_nvidia_driver() {
         local current_version current_major
+        local old_driver_packages_installed=0
         current_version="$(current_nvidia_driver_version || true)"
         current_major="$(current_nvidia_driver_major || true)"
 
@@ -594,6 +681,16 @@ install_target_nvidia_driver() {
 
         apt_install_wait "linux-headers-$(uname -r)" dkms build-essential pkg-config
         ensure_cuda_ubuntu_repo
+
+        if dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
+                | grep -Eq '^(cuda-drivers|cuda-drivers-|nvidia-|libnvidia-|linux-modules-nvidia-|linux-objects-nvidia-|linux-signatures-nvidia-)'; then
+                old_driver_packages_installed=1
+        fi
+
+        if [[ -z "${current_major}" || "${current_major}" != "${TARGET_NVIDIA_DRIVER_MAJOR}" ]] \
+                || { ! nvidia_driver_ready && [[ "${old_driver_packages_installed}" == "1" ]]; }; then
+                cleanup_conflicting_nvidia_driver_packages
+        fi
 
         local driver_pkg=""
         local candidate
@@ -644,6 +741,13 @@ install_target_nvidia_driver() {
                 echo "Waiting for NVIDIA driver ${TARGET_NVIDIA_DRIVER_MAJOR} to become active..."
                 sleep 3
         done
+
+        if ! nvidia_driver_ready; then
+                diagnose_nvidia_init_failure
+                if nvidia_provider_init_failure_seen; then
+                        die "NVIDIA driver packages installed, but the provider GPU allocation failed to initialize. This is likely a bad/dirty cloud GPU passthrough allocation, not a Plasma/Sunshine/CUDA problem. Fully power-cycle this VM from the provider panel or create a new VM/GPU allocation."
+                fi
+        fi
 
         current_version="$(current_nvidia_driver_version || true)"
         current_major="$(current_nvidia_driver_major || true)"
@@ -1933,7 +2037,7 @@ apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
         dbus-user-session dbus-x11 \
-        kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 spectacle weston xwayland seatd \
+        kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 kde-spectacle weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
@@ -1942,8 +2046,10 @@ log "Ensuring CUDA/NVIDIA apt repository is available"
 ensure_cuda_ubuntu_repo
 
 log "Checking NVIDIA driver target"
+log "CUDA toolkit install is deferred until nvidia-smi works."
 install_target_nvidia_driver
 
+log "NVIDIA driver is active; proceeding to CUDA toolkit."
 log "Handling CUDA toolkit install"
 install_cuda_toolkit_if_requested
 
