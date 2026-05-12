@@ -10,14 +10,29 @@ SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
+TARGET_NVIDIA_DRIVER_MAJOR="${TARGET_NVIDIA_DRIVER_MAJOR:-580}"
+INSTALL_CUDA_TOOLKIT="${INSTALL_CUDA_TOOLKIT:-1}"
+CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-cuda-toolkit}"
+FORCE_DRIVER_UPGRADE="${FORCE_DRIVER_UPGRADE:-1}"
+# Safe/stable deploys use the packaged .deb by default. Fresh VMs may still
+# need SUNSHINE_SOURCE_MODE=fork until the CloudDeploy pairing/stream fixes are upstreamed.
+SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE:-deb}"
+SUNSHINE_FORK_REPO="${SUNSHINE_FORK_REPO:-https://github.com/NoviceAtPython/Sunshine.git}"
+SUNSHINE_DIAGNOSTIC_FORK_BRANCH="${SUNSHINE_DIAGNOSTIC_FORK_BRANCH:-codex/sunshine-pairing-diagnostics}"
+SUNSHINE_CLEAN_FORK_BRANCH="${SUNSHINE_CLEAN_FORK_BRANCH:-clouddeploy-clean-pairing-stream-fix}"
+SUNSHINE_FORK_BRANCH="${SUNSHINE_FORK_BRANCH:-$SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
+SUNSHINE_BUILD_DIR="${SUNSHINE_BUILD_DIR:-/opt/sunshine-src}"
+SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS:-2}"
+SUNSHINE_INSTALL_BIN="${SUNSHINE_INSTALL_BIN:-/usr/local/bin/sunshine-clouddeploy}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
 ENABLE_HDR="${ENABLE_HDR:-0}"
 EDID_PROFILE="${EDID_PROFILE:-auto}"
-STREAM_MODE="${STREAM_MODE:-kwin}"
+STREAM_MODE="${STREAM_MODE:-plasma}"
 SESSION_BACKEND="${SESSION_BACKEND:-$STREAM_MODE}"
+PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 KWIN_VTNR="${KWIN_VTNR:-7}"
 KWIN_WAYLAND_DISPLAY="${KWIN_WAYLAND_DISPLAY:-wayland-0}"
 WESTON_WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY:-wayland-cd}"
@@ -27,7 +42,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="13-kwin-realvt-kms-diagnostic"
+SCRIPT_VERSION="16-plasma-wayland-sunshine-source-apps"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -149,7 +164,10 @@ select_phase2_edid_file() {
 
 service_for_mode() {
         case "${STREAM_MODE}" in
-                kwin|plasma|realvt)
+                plasma)
+                        echo "plasma-realvt.service"
+                        ;;
+                kwin|realvt)
                         echo "kwin-realvt.service"
                         ;;
                 weston)
@@ -159,7 +177,7 @@ service_for_mode() {
                         die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                         ;;
                 *)
-                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: kwin, weston."
+                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston."
                         ;;
         esac
 }
@@ -172,6 +190,7 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_USER=%q\n' "${SUNSHINE_USER}"
                 printf 'SUNSHINE_PASS=%q\n' "${SUNSHINE_PASS}"
                 printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
+                printf 'SUNSHINE_DEB_URL=%q\n' "${SUNSHINE_DEB_URL}"
                 printf 'FORCED_CONNECTOR=%q\n' "${FORCED_CONNECTOR}"
                 printf 'TARGET_WIDTH=%q\n' "${TARGET_WIDTH}"
                 printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
@@ -186,10 +205,23 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_DRM_DEVICE=%q\n' "${SUNSHINE_DRM_DEVICE}"
                 printf 'SESSION_BACKEND=%q\n' "${SESSION_BACKEND}"
                 printf 'STREAM_MODE=%q\n' "${STREAM_MODE}"
+                printf 'PLASMA_LAUNCH_MODE=%q\n' "${PLASMA_LAUNCH_MODE}"
                 printf 'SUNSHINE_AV1_MODE=%q\n' "${SUNSHINE_AV1_MODE}"
                 printf 'SUNSHINE_HEVC_MODE=%q\n' "${SUNSHINE_HEVC_MODE}"
                 printf 'RUNTIME_DIR=%q\n' "${RUNTIME_DIR}"
                 printf 'INSTALL_OPTIONAL_APPS=%q\n' "${INSTALL_OPTIONAL_APPS}"
+                printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "${TARGET_NVIDIA_DRIVER_MAJOR}"
+                printf 'INSTALL_CUDA_TOOLKIT=%q\n' "${INSTALL_CUDA_TOOLKIT}"
+                printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "${CUDA_TOOLKIT_PACKAGE}"
+                printf 'FORCE_DRIVER_UPGRADE=%q\n' "${FORCE_DRIVER_UPGRADE}"
+                printf 'SUNSHINE_SOURCE_MODE=%q\n' "${SUNSHINE_SOURCE_MODE}"
+                printf 'SUNSHINE_FORK_REPO=%q\n' "${SUNSHINE_FORK_REPO}"
+                printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "${SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
+                printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "${SUNSHINE_CLEAN_FORK_BRANCH}"
+                printf 'SUNSHINE_FORK_BRANCH=%q\n' "${SUNSHINE_FORK_BRANCH}"
+                printf 'SUNSHINE_BUILD_DIR=%q\n' "${SUNSHINE_BUILD_DIR}"
+                printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
+                printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
 
         chmod 0600 "${CLOUDDEPLOY_ENV_FILE}"
@@ -402,6 +434,353 @@ nvidia_driver_ready() {
         command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
 }
 
+current_nvidia_driver_version() {
+        if command -v nvidia-smi >/dev/null 2>&1; then
+                nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true
+        fi
+}
+
+current_nvidia_driver_major() {
+        local version
+        version="$(current_nvidia_driver_version || true)"
+        [[ -n "${version}" ]] || return 0
+        printf '%s\n' "${version%%.*}"
+}
+
+cuda_version_line() {
+        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                /usr/local/cuda/bin/nvcc --version 2>/dev/null | grep -E 'release|Cuda compilation tools' | tail -n1 || true
+        elif command -v nvcc >/dev/null 2>&1; then
+                nvcc --version 2>/dev/null | grep -E 'release|Cuda compilation tools' | tail -n1 || true
+        fi
+}
+
+find_qdbus_bin() {
+        local candidate
+        for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+                if command -v "${candidate}" >/dev/null 2>&1; then
+                        command -v "${candidate}"
+                        return 0
+                elif [[ -x "${candidate}" ]]; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+        return 1
+}
+
+kwin_support_information() {
+        local qdbus_bin
+        qdbus_bin="$(find_qdbus_bin || true)"
+        [[ -n "${qdbus_bin}" ]] || return 1
+
+        run_as_user "${HEADLESS_USER}" env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                "${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null || true
+}
+
+kwin_connector_block_from_support_info() {
+        local support_info="$1"
+        printf '%s\n' "${support_info}" \
+                | awk -v connector="${FORCED_CONNECTOR}" '
+                        /^Name:/ {
+                                if (in_block) exit
+                                in_block = ($0 ~ ("Name:[[:space:]]*" connector "$"))
+                        }
+                        in_block { print }
+                '
+}
+
+kwin_mode_line_from_support_info() {
+        local support_info="$1"
+        local block geometry refresh
+
+        block="$(kwin_connector_block_from_support_info "${support_info}")"
+        geometry="$(printf '%s\n' "${block}" | grep -E 'Geometry:' | tail -n1 || true)"
+        refresh="$(printf '%s\n' "${block}" | grep -E 'Refresh Rate:' | tail -n1 || true)"
+
+        if [[ -n "${geometry}" || -n "${refresh}" ]]; then
+                printf '%s %s\n' "${geometry}" "${refresh}" | sed 's/[[:space:]][[:space:]]*/ /g'
+        fi
+}
+
+kwin_support_reports_target_mode() {
+        local support_info="$1"
+        local block geometry refresh
+
+        block="$(kwin_connector_block_from_support_info "${support_info}")"
+        geometry="$(printf '%s\n' "${block}" | grep -E 'Geometry:' | tail -n1 || true)"
+        refresh="$(printf '%s\n' "${block}" | sed -nE 's/.*Refresh Rate:[[:space:]]*([0-9.]+).*/\1/p' | tail -n1)"
+
+        [[ "${geometry}" == *"Geometry: 0,0,${TARGET_WIDTH}x${TARGET_HEIGHT}"* \
+                || "${geometry}" == *"Geometry: 0,0 ${TARGET_WIDTH}x${TARGET_HEIGHT}"* ]] || return 1
+        [[ "${refresh}" =~ ^(119|120) ]] || return 1
+}
+
+wait_for_kwin_target_mode() {
+        local support_info
+
+        for _ in $(seq 1 60); do
+                support_info="$(kwin_support_information || true)"
+                if kwin_support_reports_target_mode "${support_info}"; then
+                        KNOWN_WESTON_MODE_LINE="$(kwin_mode_line_from_support_info "${support_info}")"
+                        return 0
+                fi
+                sleep 1
+        done
+
+        return 1
+}
+
+apt_package_available() {
+        local pkg="$1"
+        local candidate
+
+        candidate="$(apt-cache policy "${pkg}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+        [[ -n "${candidate}" && "${candidate}" != "(none)" ]]
+}
+
+ensure_cuda_ubuntu_repo() {
+        local os_id="" version_id=""
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                os_id="${ID:-}"
+                version_id="${VERSION_ID:-}"
+        fi
+
+        [[ "${os_id}" == "ubuntu" && "${version_id}" == "24.04" ]] \
+                || die "CUDA/NVIDIA repo setup currently supports Ubuntu 24.04 only; detected ${os_id:-unknown} ${version_id:-unknown}"
+
+        if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
+                log "CUDA apt keyring already installed"
+                apt_update_retry
+                return 0
+        fi
+
+        log "Installing NVIDIA CUDA apt keyring for Ubuntu 24.04"
+        local tmpdeb
+        tmpdeb="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
+        wget -O "${tmpdeb}" "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+        wait_for_apt
+        dpkg -i "${tmpdeb}"
+        rm -f "${tmpdeb}"
+        apt_update_retry
+}
+
+install_target_nvidia_driver() {
+        local current_version current_major
+        current_version="$(current_nvidia_driver_version || true)"
+        current_major="$(current_nvidia_driver_major || true)"
+
+        if [[ "${current_major}" == "${TARGET_NVIDIA_DRIVER_MAJOR}" ]] && nvidia_driver_ready; then
+                log "NVIDIA driver ${current_version} already matches target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                return 0
+        fi
+
+        if nvidia_driver_ready && [[ "${FORCE_DRIVER_UPGRADE}" != "1" ]]; then
+                log "NVIDIA driver ${current_version:-unknown} is working; FORCE_DRIVER_UPGRADE=0 so not forcing target ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                return 0
+        fi
+
+        log "Installing NVIDIA driver target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
+        systemctl stop sunshine-headless.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service 2>/dev/null || true
+
+        apt_install_wait "linux-headers-$(uname -r)" dkms build-essential pkg-config
+        ensure_cuda_ubuntu_repo
+
+        local driver_pkg=""
+        local candidate
+        for candidate in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if apt_package_available "${candidate}"; then
+                        driver_pkg="${candidate}"
+                        break
+                fi
+        done
+
+        [[ -n "${driver_pkg}" ]] || die "Could not find an installable NVIDIA ${TARGET_NVIDIA_DRIVER_MAJOR} driver package"
+
+        local pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
+        if [[ "${driver_pkg}" == "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" ]]; then
+                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+        fi
+
+        local -a install_pkgs
+        install_pkgs=("${driver_pkg}")
+        for candidate in \
+                "nvidia-utils-${pkg_suffix}" \
+                "libnvidia-encode-${pkg_suffix}" \
+                "libnvidia-fbc1-${pkg_suffix}"
+        do
+                if apt_package_available "${candidate}"; then
+                        install_pkgs+=("${candidate}")
+                fi
+        done
+
+        log "Installing NVIDIA packages: ${install_pkgs[*]}"
+        apt_install_wait "${install_pkgs[@]}"
+
+        modprobe nvidia 2>/dev/null || true
+        modprobe nvidia_modeset 2>/dev/null || true
+        modprobe nvidia_drm 2>/dev/null || true
+
+        for _ in $(seq 1 15); do
+                current_version="$(current_nvidia_driver_version || true)"
+                current_major="$(current_nvidia_driver_major || true)"
+                if [[ "${current_major}" == "${TARGET_NVIDIA_DRIVER_MAJOR}" ]] && nvidia_driver_ready; then
+                        log "NVIDIA driver ${current_version} is loaded and matches target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                        return 0
+                fi
+                echo "Waiting for NVIDIA driver ${TARGET_NVIDIA_DRIVER_MAJOR} to become active..."
+                sleep 3
+        done
+
+        current_version="$(current_nvidia_driver_version || true)"
+        current_major="$(current_nvidia_driver_major || true)"
+        if [[ "${current_major}" != "${TARGET_NVIDIA_DRIVER_MAJOR}" ]]; then
+                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
+                        die "NVIDIA driver major is still ${current_major:-missing} after continuation reboot; expected ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                fi
+                schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver target ${TARGET_NVIDIA_DRIVER_MAJOR} installed but loaded driver is ${current_version:-missing}; rebooting and continuing automatically"
+        fi
+
+        nvidia_driver_ready || die "NVIDIA driver ${TARGET_NVIDIA_DRIVER_MAJOR} is installed but nvidia-smi is not working"
+}
+
+install_cuda_toolkit_if_requested() {
+        if [[ "${INSTALL_CUDA_TOOLKIT}" == "0" ]]; then
+                log "INSTALL_CUDA_TOOLKIT=0; skipping CUDA toolkit install"
+                return 0
+        fi
+
+        log "Installing CUDA toolkit package: ${CUDA_TOOLKIT_PACKAGE}"
+        ensure_cuda_ubuntu_repo
+        apt_install_wait "${CUDA_TOOLKIT_PACKAGE}"
+
+        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                /usr/local/cuda/bin/nvcc --version || true
+        elif command -v nvcc >/dev/null 2>&1; then
+                nvcc --version || true
+        else
+                log "CUDA toolkit installed, but nvcc was not found on PATH"
+        fi
+}
+
+install_sunshine_deb() {
+        if command -v sunshine >/dev/null 2>&1; then
+                log "Packaged Sunshine already installed at $(command -v sunshine)"
+                return 0
+        fi
+
+        log "Installing packaged Sunshine from ${SUNSHINE_DEB_URL}"
+        local tmpdeb
+        tmpdeb="$(mktemp /tmp/sunshine.XXXXXX.deb)"
+        wget -O "${tmpdeb}" "${SUNSHINE_DEB_URL}"
+        wait_for_apt
+        dpkg -i "${tmpdeb}" || apt-get -f install -y
+        rm -f "${tmpdeb}"
+}
+
+sunshine_runtime_bin() {
+        if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
+                printf '%s\n' "${SUNSHINE_INSTALL_BIN}"
+        elif command -v sunshine >/dev/null 2>&1; then
+                command -v sunshine
+        else
+                printf '%s\n' "/usr/bin/sunshine"
+        fi
+}
+
+resolve_sunshine_fork_branch() {
+        local requested_branch="${SUNSHINE_FORK_BRANCH}"
+
+        if [[ "${requested_branch}" == "${SUNSHINE_DIAGNOSTIC_FORK_BRANCH}" ]] \
+                && git ls-remote --exit-code --heads "${SUNSHINE_FORK_REPO}" "${SUNSHINE_CLEAN_FORK_BRANCH}" >/dev/null 2>&1; then
+                printf '%s\n' "${SUNSHINE_CLEAN_FORK_BRANCH}"
+                return 0
+        fi
+
+        printf '%s\n' "${requested_branch}"
+}
+
+install_sunshine_from_fork_if_requested() {
+        case "${SUNSHINE_SOURCE_MODE}" in
+                deb)
+                        install_sunshine_deb
+                        ;;
+                fork)
+                        install_sunshine_deb
+                        apt_install_wait \
+                                git cmake ninja-build build-essential pkg-config python3 nodejs npm \
+                                libssl-dev libcurl4-openssl-dev libcap-dev libdrm-dev libevdev-dev libgbm-dev \
+                                libminiupnpc-dev libnotify-dev libnuma-dev libopus-dev libpulse-dev libva-dev libvdpau-dev \
+                                libwayland-dev libx11-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxfixes-dev \
+                                libxrandr-dev libxtst-dev libsystemd-dev libudev-dev libayatana-appindicator3-dev \
+                                libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
+                                libboost-filesystem-dev libboost-log-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
+
+                        local resolved_branch
+                        resolved_branch="$(resolve_sunshine_fork_branch)"
+                        SUNSHINE_FORK_BRANCH="${resolved_branch}"
+
+                        log "Installing Sunshine from custom fork ${SUNSHINE_FORK_REPO} branch ${SUNSHINE_FORK_BRANCH}"
+                        if [[ "${SUNSHINE_FORK_BRANCH}" == "${SUNSHINE_DIAGNOSTIC_FORK_BRANCH}" ]]; then
+                                log "Using heavy diagnostic Sunshine branch; switch to ${SUNSHINE_CLEAN_FORK_BRANCH} when it exists upstream."
+                        else
+                                log "Using clean CloudDeploy Sunshine branch ${SUNSHINE_FORK_BRANCH}."
+                        fi
+                        log "SUNSHINE_SOURCE_MODE=fork is custom/diagnostic until these fixes are upstreamed."
+
+                        install -d -m 0755 "$(dirname "${SUNSHINE_BUILD_DIR}")"
+                        if [[ -d "${SUNSHINE_BUILD_DIR}/.git" ]]; then
+                                git -C "${SUNSHINE_BUILD_DIR}" fetch origin "${SUNSHINE_FORK_BRANCH}"
+                                git -C "${SUNSHINE_BUILD_DIR}" checkout -B "${SUNSHINE_FORK_BRANCH}" "origin/${SUNSHINE_FORK_BRANCH}"
+                        elif [[ -e "${SUNSHINE_BUILD_DIR}" ]]; then
+                                die "${SUNSHINE_BUILD_DIR} exists but is not a git checkout"
+                        else
+                                git clone --recursive --branch "${SUNSHINE_FORK_BRANCH}" "${SUNSHINE_FORK_REPO}" "${SUNSHINE_BUILD_DIR}"
+                        fi
+
+                        git -C "${SUNSHINE_BUILD_DIR}" submodule update --init --recursive
+                        local -a cmake_cuda_args
+                        cmake_cuda_args=()
+                        if [[ -d /usr/local/cuda ]]; then
+                                export PATH="/usr/local/cuda/bin:${PATH}"
+                                export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+                                cmake_cuda_args+=("-DCUDAToolkit_ROOT=/usr/local/cuda" "-DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda")
+                        fi
+                        cmake -S "${SUNSHINE_BUILD_DIR}" -B "${SUNSHINE_BUILD_DIR}/build" -G Ninja \
+                                -DCMAKE_BUILD_TYPE=Release \
+                                -DBUILD_TESTS=OFF \
+                                -DSUNSHINE_BUILD_TESTS=OFF \
+                                "${cmake_cuda_args[@]}"
+                        cmake --build "${SUNSHINE_BUILD_DIR}/build" --target sunshine -j "${SUNSHINE_BUILD_JOBS}"
+
+                        local built_bin
+                        built_bin="$(find "${SUNSHINE_BUILD_DIR}/build" -type f -name sunshine -perm -111 2>/dev/null | head -n1)"
+                        [[ -x "${built_bin}" ]] || die "Could not find built Sunshine binary in ${SUNSHINE_BUILD_DIR}/build"
+
+                        install -m 0755 "${built_bin}" "${SUNSHINE_INSTALL_BIN}"
+                        if command -v setcap >/dev/null 2>&1; then
+                                setcap cap_sys_admin,cap_sys_nice+ep "${SUNSHINE_INSTALL_BIN}" || true
+                        fi
+                        ;;
+                *)
+                        die "Unsupported SUNSHINE_SOURCE_MODE='${SUNSHINE_SOURCE_MODE}'. Supported now: deb, fork."
+                        ;;
+        esac
+}
+
 run_as_user() {
         local user="$1"
         shift
@@ -483,12 +862,17 @@ install_clouddeploy_helpers() {
 set -euo pipefail
 
 ENV_FILE="/etc/clouddeploy-wayland.env"
+OVERRIDE_INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS-}"
 
 if [[ -f "${ENV_FILE}" ]]; then
         set -a
         # shellcheck disable=SC1090
         source "${ENV_FILE}"
         set +a
+fi
+
+if [[ -n "${OVERRIDE_INSTALL_OPTIONAL_APPS}" ]]; then
+        export INSTALL_OPTIONAL_APPS="${OVERRIDE_INSTALL_OPTIONAL_APPS}"
 fi
 
 REPO_DIR="${CLOUDDEPLOY_REPO_DIR:-/home/user/CloudDeploy-mover}"
@@ -533,6 +917,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_USER=%q\n' "${SUNSHINE_USER}"
         printf 'SUNSHINE_PASS=%q\n' "${SUNSHINE_PASS}"
         printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
+        printf 'SUNSHINE_DEB_URL=%q\n' "https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb"
         printf 'FORCED_CONNECTOR=%q\n' "DP-1"
         printf 'TARGET_WIDTH=%q\n' "3840"
         printf 'TARGET_HEIGHT=%q\n' "2160"
@@ -545,11 +930,24 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'WESTON_MODE=%q\n' "3840x2160@120"
         printf 'SUNSHINE_ENCODER=%q\n' "nvenc"
         printf 'SUNSHINE_DRM_DEVICE=%q\n' "auto"
-        printf 'SESSION_BACKEND=%q\n' "kwin"
-        printf 'STREAM_MODE=%q\n' "kwin"
+        printf 'SESSION_BACKEND=%q\n' "plasma"
+        printf 'STREAM_MODE=%q\n' "plasma"
+        printf 'PLASMA_LAUNCH_MODE=%q\n' "startplasma"
         printf 'INSTALL_OPTIONAL_APPS=%q\n' "0"
         printf 'SUNSHINE_AV1_MODE=%q\n' "2"
         printf 'SUNSHINE_HEVC_MODE=%q\n' "0"
+        printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "580"
+        printf 'INSTALL_CUDA_TOOLKIT=%q\n' "1"
+        printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "cuda-toolkit"
+        printf 'FORCE_DRIVER_UPGRADE=%q\n' "1"
+        printf 'SUNSHINE_SOURCE_MODE=%q\n' "deb"
+        printf 'SUNSHINE_FORK_REPO=%q\n' "https://github.com/NoviceAtPython/Sunshine.git"
+        printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
+        printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "clouddeploy-clean-pairing-stream-fix"
+        printf 'SUNSHINE_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
+        printf 'SUNSHINE_BUILD_DIR=%q\n' "/opt/sunshine-src"
+        printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
+        printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
 } > "${ENV_FILE}"
 chmod 0600 "${ENV_FILE}"
 echo "Wrote ${ENV_FILE} with mode 0600."
@@ -569,7 +967,8 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 HEADLESS_USER="${HEADLESS_USER:-user}"
-STREAM_MODE="${STREAM_MODE:-kwin}"
+STREAM_MODE="${STREAM_MODE:-plasma}"
+PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
@@ -612,7 +1011,11 @@ if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
 fi
 
 case "${STREAM_MODE}" in
-        kwin|plasma|realvt)
+        plasma)
+                COMPOSITOR_SERVICE="plasma-realvt.service"
+                COMPOSITOR_LOG_UNIT="plasma-realvt.service"
+                ;;
+        kwin|realvt)
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 COMPOSITOR_LOG_UNIT="kwin-realvt.service"
                 ;;
@@ -625,15 +1028,15 @@ case "${STREAM_MODE}" in
                 exit 1
                 ;;
         *)
-                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: kwin, weston." >&2
+                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston." >&2
                 exit 1
                 ;;
 esac
 
 echo "Performing exact known-good clean reset before final validation"
 
-systemctl stop sunshine-headless.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service plasma-realvt.service gamescope-session.service 2>/dev/null || true
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+systemctl stop sunshine-headless.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
 
 rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
 
@@ -654,20 +1057,23 @@ ping_timeout = 60000
 CONF
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 
-systemctl reset-failed kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
+systemctl reset-failed plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
 
 systemctl start "${COMPOSITOR_SERVICE}"
 
-if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
+        sleep 12
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh
+elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         sleep 8
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh
         systemctl restart plasma-shell-realvt.service || true
 else
         sleep 5
 fi
 
 journalctl -u "${COMPOSITOR_LOG_UNIT}" -n 160 --no-pager \
-  | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|kwin|plasmashell|Wayland|fatal|error|--drm|--xwayland" || true
+  | grep -Ei "Output ${FORCED_CONNECTOR}|${TARGET_WIDTH}x${TARGET_HEIGHT}|current|EGL vendor|kwin|plasmashell|plasma_session|kded|startplasma|Wayland|fatal|error|--drm|--xwayland" || true
 
 systemctl restart sunshine-headless.service
 sleep 6
@@ -816,6 +1222,39 @@ runuser -u "${HEADLESS_USER}" -- env \
         kscreen-doctor -o || true
 
 echo
+echo "=== KWin supportInformation ==="
+qdbus_bin=""
+for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+        if command -v "${candidate}" >/dev/null 2>&1; then
+                qdbus_bin="$(command -v "${candidate}")"
+                break
+        elif [[ -x "${candidate}" ]]; then
+                qdbus_bin="${candidate}"
+                break
+        fi
+done
+if [[ -n "${qdbus_bin}" ]]; then
+        runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                "${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null \
+                        | awk -v connector="${FORCED_CONNECTOR:-DP-1}" '
+                                /^Name:/ {
+                                        if (in_block) exit
+                                        in_block = ($0 ~ ("Name:[[:space:]]*" connector "$"))
+                                }
+                                in_block && /Name:|Geometry:|Refresh Rate:/ { print }
+                        ' || true
+else
+        echo "qdbus not found"
+fi
+
+echo
 echo "=== Launching a visible KDE app briefly ==="
 if command -v systemsettings >/dev/null 2>&1; then
         runuser -u "${HEADLESS_USER}" -- env \
@@ -833,7 +1272,7 @@ else
         echo "systemsettings not found"
 fi
 
-rm -f /tmp/wayland-grim.png /tmp/kmsgrab.png
+rm -f /tmp/wayland-grim.png /tmp/wayland-spectacle.png /tmp/kmsgrab.png
 
 echo
 echo "=== Wayland screenshot via grim ==="
@@ -843,6 +1282,18 @@ runuser -u "${HEADLESS_USER}" -- env \
         WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
         DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
         grim /tmp/wayland-grim.png || true
+
+if [[ ! -s /tmp/wayland-grim.png ]] && command -v spectacle >/dev/null 2>&1; then
+        echo
+        echo "=== Wayland screenshot fallback via Spectacle ==="
+        runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                spectacle -b -n -o /tmp/wayland-spectacle.png || true
+fi
 
 echo
 echo "=== Raw KMS screenshot via ffmpeg kmsgrab (${SUNSHINE_DRM_DEVICE}) ==="
@@ -858,9 +1309,10 @@ echo
 echo "=== Image identification ==="
 if command -v identify >/dev/null 2>&1; then
         identify /tmp/wayland-grim.png 2>/dev/null || echo "/tmp/wayland-grim.png missing or unreadable"
+        identify /tmp/wayland-spectacle.png 2>/dev/null || echo "/tmp/wayland-spectacle.png missing or unreadable"
         identify /tmp/kmsgrab.png 2>/dev/null || echo "/tmp/kmsgrab.png missing or unreadable"
 else
-        ls -lh /tmp/wayland-grim.png /tmp/kmsgrab.png 2>/dev/null || true
+        ls -lh /tmp/wayland-grim.png /tmp/wayland-spectacle.png /tmp/kmsgrab.png 2>/dev/null || true
 fi
 
 echo
@@ -945,11 +1397,27 @@ refresh_streaming_log_markers() {
         local sunshine_since="${1:-}"
 
         case "${STREAM_MODE}" in
-                kwin|plasma|realvt)
-                        LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
+                plasma)
+                        LAST_WESTON_LOG="$(journalctl -u plasma-realvt.service -n 260 --no-pager 2>/dev/null || true)"
+                        local support_info
+                        support_info="$(kwin_support_information || true)"
                         if pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 \
-                                && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]]; then
-                                KNOWN_WESTON_MODE_LINE="KWin real VT active: kwin_wayland on ${RUNTIME_DIR}/${KWIN_DISPLAY}"
+                                && pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
+                                && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]] \
+                                && kwin_support_reports_target_mode "${support_info}"; then
+                                KNOWN_WESTON_MODE_LINE="$(kwin_mode_line_from_support_info "${support_info}")"
+                        else
+                                KNOWN_WESTON_MODE_LINE=""
+                        fi
+                        ;;
+                kwin|realvt)
+                        LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
+                        local support_info
+                        support_info="$(kwin_support_information || true)"
+                        if pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 \
+                                && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]] \
+                                && kwin_support_reports_target_mode "${support_info}"; then
+                                KNOWN_WESTON_MODE_LINE="$(kwin_mode_line_from_support_info "${support_info}")"
                         else
                                 KNOWN_WESTON_MODE_LINE=""
                         fi
@@ -1003,6 +1471,19 @@ print_streaming_diagnostics() {
         pgrep -a -u "${HEADLESS_USER}" -x weston || true
         pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland || true
         pgrep -a -u "${HEADLESS_USER}" -x plasmashell || true
+        pgrep -a -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session|startplasma-wayland' || true
+        echo
+        echo "=== KWin supportInformation DP marker ==="
+        kwin_support_information | awk -v connector="${FORCED_CONNECTOR}" '
+                /^Name:/ {
+                        if (in_block) exit
+                        in_block = ($0 ~ ("Name:[[:space:]]*" connector "$"))
+                }
+                in_block && /Name:|Geometry:|Refresh Rate:/ { print }
+        ' || true
+        echo
+        echo "=== systemctl status plasma-realvt.service ==="
+        systemctl --no-pager --full status plasma-realvt.service | sed -n '1,14p' || true
         echo
         echo "=== systemctl status kwin-realvt.service ==="
         systemctl --no-pager --full status kwin-realvt.service | sed -n '1,14p' || true
@@ -1016,7 +1497,10 @@ print_streaming_diagnostics() {
         echo "=== systemctl status sunshine-headless.service ==="
         systemctl --no-pager --full status sunshine-headless.service | sed -n '1,14p' || true
         echo
-        echo "=== KWin journal (last 160) ==="
+        echo "=== Plasma real-VT journal (last 160) ==="
+        journalctl -u plasma-realvt.service -n 160 --no-pager || true
+        echo
+        echo "=== KWin fallback journal (last 160) ==="
         journalctl -u kwin-realvt.service -n 160 --no-pager || true
         echo
         echo "=== Weston journal (last 160) ==="
@@ -1135,7 +1619,8 @@ validate_streaming_stack_ready() {
                 die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
         fi
         case "${STREAM_MODE}" in
-                kwin|plasma|realvt) compositor_service="kwin-realvt.service" ;;
+                plasma) compositor_service="plasma-realvt.service" ;;
+                kwin|realvt) compositor_service="kwin-realvt.service" ;;
                 weston) compositor_service="weston-kms-session.service" ;;
                 *) compositor_service="$(service_for_mode)" ;;
         esac
@@ -1155,6 +1640,53 @@ validate_streaming_stack_ready() {
         fi
 }
 
+print_driver_cuda_sunshine_summary() {
+        local actual_driver packaged_sunshine cuda_version runtime_kind
+
+        actual_driver="$(current_nvidia_driver_version || true)"
+        packaged_sunshine="$(command -v sunshine 2>/dev/null || true)"
+        cuda_version="$(cuda_version_line || true)"
+        if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
+                runtime_kind="clouddeploy fork binary"
+        else
+                runtime_kind="packaged .deb Sunshine"
+        fi
+
+        echo "NVIDIA driver target: ${TARGET_NVIDIA_DRIVER_MAJOR}"
+        echo "NVIDIA driver actual: ${actual_driver:-unknown}"
+        echo "CUDA toolkit requested: ${INSTALL_CUDA_TOOLKIT}"
+        echo "CUDA version: ${cuda_version:-not detected}"
+        echo "Sunshine source mode: ${SUNSHINE_SOURCE_MODE}"
+        echo "Sunshine runtime type: ${runtime_kind}"
+        echo "Sunshine binary: ${packaged_sunshine:-not installed}"
+        if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
+                echo "Sunshine fork branch: ${SUNSHINE_FORK_BRANCH}"
+                echo "Sunshine fork binary: ${SUNSHINE_INSTALL_BIN}"
+                echo "Sunshine runtime binary: ${SUNSHINE_INSTALL_BIN}"
+        else
+                echo "Sunshine fork note: fresh VMs may still need SUNSHINE_SOURCE_MODE=fork until CloudDeploy pairing/stream fixes are upstreamed."
+                echo "Sunshine clean branch target: ${SUNSHINE_CLEAN_FORK_BRANCH} (used automatically once it exists when fork mode is requested)."
+        fi
+}
+
+print_final_validation_summary() {
+        local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
+        local edid_file cmdline_args
+
+        edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
+        cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
+                | grep -E "drm[.]edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}|video=${FORCED_CONNECTOR}:e|nvidia-drm[.]modeset=1|nvidia-drm[.]fbdev=1" \
+                | tr '\n' ' ' || true)"
+
+        echo "EDID file active: ${edid_file:-unknown}"
+        echo "Kernel cmdline EDID/NVIDIA args: ${cmdline_args:-missing expected args}"
+        echo "KWin reported geometry/refresh: ${KNOWN_WESTON_MODE_LINE:-not observed}"
+        echo "Sunshine desktop resolution: ${KNOWN_SUNSHINE_RESOLUTION_LINE:-not observed}"
+        echo "Sunshine KMS monitor found: ${KNOWN_SUNSHINE_KMS_LINE:-not observed}"
+        echo "NVENC initialized: ${KNOWN_SUNSHINE_NVENC_LINE:-not observed}"
+        echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
+}
+
 print_known_good_checklist() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
 
@@ -1164,7 +1696,7 @@ print_known_good_checklist() {
         echo "[OK] ${FORCED_CONNECTOR} forced connected"
         echo "[OK] ${target_mode} mode exposed"
         echo "[OK] ${STREAM_MODE} compositor active"
-        echo "[OK] Compositor readiness marker (${KNOWN_WESTON_MODE_LINE})"
+        echo "[OK] KWin ${FORCED_CONNECTOR} ${target_mode}@120-ish (${KNOWN_WESTON_MODE_LINE})"
         echo "[OK] Sunshine active"
         echo "[OK] Sunshine Desktop resolution ${target_mode} (${KNOWN_SUNSHINE_RESOLUTION_LINE})"
         echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
@@ -1176,8 +1708,23 @@ print_known_good_checklist() {
 
 install_optional_apps_nonfatal() {
         local tmpchrome
+        local steam_status="skipped"
+        local heroic_status="skipped"
+        local lutris_status="skipped"
+        local bottles_status="skipped"
+        local prism_status="skipped"
+        local protonup_status="skipped"
+        local chrome_status="skipped"
 
         if [[ "${INSTALL_OPTIONAL_APPS}" != "1" ]]; then
+                echo "Optional game/app installs requested: ${INSTALL_OPTIONAL_APPS}"
+                echo "Steam installer: ${steam_status}"
+                echo "Heroic: ${heroic_status}"
+                echo "Lutris: ${lutris_status}"
+                echo "Bottles: ${bottles_status}"
+                echo "PrismLauncher: ${prism_status}"
+                echo "ProtonUp-Qt: ${protonup_status}"
+                echo "Chrome: ${chrome_status}"
                 return 0
         fi
 
@@ -1186,30 +1733,55 @@ install_optional_apps_nonfatal() {
         if ! dpkg --print-foreign-architectures | grep -q i386; then
                 wait_for_apt
                 dpkg --add-architecture i386 || log "Could not add i386 architecture; continuing"
-                apt_update_retry || log "Apt update failed after adding i386 architecture; continuing"
         fi
 
+        apt_update_retry || log "Apt update failed before optional app installs; continuing"
+
         wait_for_apt
-        apt-get upgrade -y || log "apt-get upgrade failed; continuing"
-        apt_install_wait flatpak steam-installer wine64 winetricks || log "Optional apt packages failed; continuing"
+        apt-get install -y flatpak wine64 winetricks || log "Optional non-Steam apt packages failed; continuing"
+        if apt-get install -y steam-installer; then
+                steam_status="installed"
+        else
+                steam_status="failed"
+                log "Steam installer apt package failed; continuing"
+        fi
 
         if command -v flatpak >/dev/null 2>&1; then
-                flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo || true
-                flatpak install -y flathub com.heroicgameslauncher.hgl || true
-                flatpak install -y flathub net.lutris.Lutris || true
-                flatpak install -y flathub com.usebottles.bottles || true
-                flatpak install -y flathub org.prismlauncher.PrismLauncher || true
+                flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo \
+                        || log "Flathub remote add failed; continuing"
+                if flatpak install -y flathub com.heroicgameslauncher.hgl; then heroic_status="installed"; else heroic_status="failed"; log "Heroic Flatpak install failed; continuing"; fi
+                if flatpak install -y flathub net.lutris.Lutris; then lutris_status="installed"; else lutris_status="failed"; log "Lutris Flatpak install failed; continuing"; fi
+                if flatpak install -y flathub com.usebottles.bottles; then bottles_status="installed"; else bottles_status="failed"; log "Bottles Flatpak install failed; continuing"; fi
+                if flatpak install -y flathub org.prismlauncher.PrismLauncher; then prism_status="installed"; else prism_status="failed"; log "PrismLauncher Flatpak install failed; continuing"; fi
+                if flatpak install -y flathub net.davidotek.pupgui2; then protonup_status="installed"; else protonup_status="failed"; log "ProtonUp-Qt Flatpak install failed; continuing"; fi
         else
                 log "Flatpak is unavailable; skipping Flatpak app installs"
         fi
 
         tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
         if wget -O "${tmpchrome}" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
-                dpkg -i "${tmpchrome}" || apt-get -f install -y || log "Google Chrome install failed; continuing"
+                wait_for_apt
+                if apt-get install -y "${tmpchrome}"; then
+                        chrome_status="installed"
+                else
+                        chrome_status="failed"
+                        log "Google Chrome install failed; continuing"
+                fi
                 rm -f "${tmpchrome}"
         else
+                chrome_status="failed"
                 log "Google Chrome download failed; continuing"
         fi
+
+        echo
+        echo "Optional app install summary:"
+        echo "Steam installer: ${steam_status}"
+        echo "Heroic: ${heroic_status}"
+        echo "Lutris: ${lutris_status}"
+        echo "Bottles: ${bottles_status}"
+        echo "PrismLauncher: ${prism_status}"
+        echo "ProtonUp-Qt: ${protonup_status}"
+        echo "Chrome: ${chrome_status}"
 }
 
 # =========================
@@ -1246,14 +1818,16 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         write_clouddeploy_env_file
 
         systemctl daemon-reload || true
-        systemctl disable kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service >/dev/null 2>&1 || true
+        systemctl disable plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service >/dev/null 2>&1 || true
         if systemctl list-unit-files | grep -q '^tailscaled'; then
                 systemctl enable tailscaled || true
                 systemctl restart tailscaled || true
         fi
 
         install_clouddeploy_helpers
-        if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+        if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
+                systemctl enable plasma-realvt.service sunshine-headless.service || true
+        elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
                 systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service || true
         else
                 systemctl enable weston-kms-session.service sunshine-headless.service || true
@@ -1280,6 +1854,9 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "Final validation markers"
         "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh" || true
 
+        print_driver_cuda_sunshine_summary
+        print_final_validation_summary
+
         if command -v tailscale >/dev/null 2>&1; then
                 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
 
@@ -1293,6 +1870,10 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
                 fi
         fi
 
+        install_optional_apps_nonfatal
+
+        echo "Optional game/app installs requested: ${INSTALL_OPTIONAL_APPS}"
+        echo "App install helper: sudo bash -lc 'INSTALL_OPTIONAL_APPS=1 clouddeploy-run'"
         print_known_good_checklist
         exit 0
 fi
@@ -1352,52 +1933,19 @@ apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
         dbus-user-session dbus-x11 \
-        kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen weston xwayland seatd \
+        kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 spectacle weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
 
-log "Checking NVIDIA driver status"
-if nvidia_driver_ready; then
-        log "NVIDIA drivers are already installed and working"
-else
-        log "Installing NVIDIA drivers"
-        MODPROBE_FAILED=0
-        ubuntu-drivers install || die "Failed to install NVIDIA drivers"
-        if ! modprobe nvidia; then
-                MODPROBE_FAILED=1
-        fi
-        if ! modprobe nvidia_modeset; then
-                MODPROBE_FAILED=1
-        fi
-        if ! modprobe nvidia_drm; then
-                MODPROBE_FAILED=1
-        fi
+log "Ensuring CUDA/NVIDIA apt repository is available"
+ensure_cuda_ubuntu_repo
 
-        for _ in $(seq 1 15); do
-                if nvidia_driver_ready; then
-                        log "NVIDIA drivers are now working"
-                        break
-                fi
-                echo "Waiting for NVIDIA drivers to be ready..."
-                sleep 3
-        done
+log "Checking NVIDIA driver target"
+install_target_nvidia_driver
 
-        if ! nvidia_driver_ready; then
-                if [[ "${MODPROBE_FAILED}" -eq 1 ]] && ! nvidia_modules_present_for_running_kernel; then
-                        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
-                                die "NVIDIA modules are still missing for kernel $(uname -r) after continuation reboot"
-                        fi
-                        schedule_reboot_for_continuation "nvidia-driver" "NVIDIA modules are missing for kernel $(uname -r); rebooting and continuing automatically"
-                fi
-
-                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
-                        die "NVIDIA drivers are still not ready after continuation reboot"
-                fi
-
-                die "NVIDIA drivers still not ready after installation. This VM may need a reboot or may not be compatible."
-        fi
-fi
+log "Handling CUDA toolkit install"
+install_cuda_toolkit_if_requested
 
 log "Removing pieces that fought the working setup"
 systemctl disable --now sddm 2>/dev/null || true
@@ -1406,13 +1954,10 @@ rm -f /etc/sddm.conf.d/autologin.conf
 rm -f /etc/sddm.conf.d/zz-autologin.conf
 
 log "Installing Sunshine"
-if ! command -v sunshine >/dev/null 2>&1; then
-        tmpdeb="$(mktemp /tmp/sunshine.XXXXXX.deb)"
-        wget -O "${tmpdeb}" "${SUNSHINE_DEB_URL}"
-        wait_for_apt
-        dpkg -i "${tmpdeb}" || apt-get -f install -y
-        rm -f "${tmpdeb}"
-fi
+install_sunshine_from_fork_if_requested
+SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
+[[ -x "${SUNSHINE_RUNTIME_BIN}" ]] || die "Sunshine runtime binary is not executable: ${SUNSHINE_RUNTIME_BIN}"
+log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
 
 log "Installing Tailscale if requested"
 if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
@@ -1458,13 +2003,17 @@ case "${SESSION_BACKEND}" in
                 die "SESSION_BACKEND=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: kwin, weston."
+                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: plasma, kwin, weston."
                 ;;
 esac
 
 case "${STREAM_MODE}" in
-        kwin|plasma|realvt)
-                log "STREAM_MODE=${STREAM_MODE}: direct KWin Wayland DRM session on real VT${KWIN_VTNR}"
+        plasma)
+                log "STREAM_MODE=plasma: full Plasma Wayland session on real VT${KWIN_VTNR}"
+                COMPOSITOR_SERVICE="plasma-realvt.service"
+                ;;
+        kwin|realvt)
+                log "STREAM_MODE=${STREAM_MODE}: bare KWin Wayland DRM fallback on real VT${KWIN_VTNR}"
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 ;;
         weston)
@@ -1475,11 +2024,11 @@ case "${STREAM_MODE}" in
                 die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: kwin, weston."
+                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: plasma, kwin, weston."
                 ;;
 esac
 
-log "Writing direct KWin real-VT launchers and Weston fallback"
+log "Writing full Plasma real-VT launchers, bare KWin fallback, and Weston fallback"
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" \
         "${HOME_DIR}/.local/bin" \
         "${HOME_DIR}/.local/share" \
@@ -1504,6 +2053,20 @@ cat > "${HOME_DIR}/.local/bin/start-kwin-realvt.sh" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ "\$(id -u)" == "0" ]]; then
+        exec runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                USER="${HEADLESS_USER}" \
+                LOGNAME="${HEADLESS_USER}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                "\$0" "\$@"
+fi
+
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
@@ -1515,8 +2078,8 @@ export XDG_SESSION_TYPE=wayland
 export XDG_SESSION_CLASS=user
 export XDG_SESSION_DESKTOP=KDE
 export XDG_CURRENT_DESKTOP=KDE
+export DESKTOP_SESSION=plasmawayland
 export KDE_FULL_SESSION=true
-export KDE_SESSION_VERSION=6
 export XDG_VTNR="${KWIN_VTNR}"
 
 export KWIN_DRM_DEVICES="${SUNSHINE_DRM_DEVICE}"
@@ -1546,9 +2109,111 @@ EOF
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-kwin-realvt.sh"
 chmod 0755 "${HOME_DIR}/.local/bin/start-kwin-realvt.sh"
 
+cat > "${HOME_DIR}/.local/bin/start-plasma-realvt.sh" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
+
+export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+
+export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_CLASS=user
+export XDG_SESSION_DESKTOP=KDE
+export XDG_CURRENT_DESKTOP=KDE
+export DESKTOP_SESSION=plasmawayland
+export KDE_FULL_SESSION=true
+export XDG_VTNR="${KWIN_VTNR}"
+export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+
+export KWIN_DRM_DEVICES="${SUNSHINE_DRM_DEVICE}"
+export KWIN_DRM_NO_DIRECT_SCANOUT=1
+export KWIN_FORCE_SW_CURSOR=1
+export KWIN_USE_OVERLAYS=0
+export GBM_BACKEND=nvidia-drm
+export QT_QPA_PLATFORM=wayland
+export GDK_BACKEND=wayland,x11
+export MOZ_ENABLE_WAYLAND=1
+export TERM=xterm
+
+export __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+export __GLX_VENDOR_LIBRARY_NAME=nvidia
+
+unset DISPLAY
+
+mkdir -p "\$XDG_RUNTIME_DIR" "\$HOME/.config" "\$HOME/.local/share"
+chmod 700 "\$XDG_RUNTIME_DIR"
+
+rm -f "\$XDG_RUNTIME_DIR/${KWIN_DISPLAY}" "\$XDG_RUNTIME_DIR/${KWIN_DISPLAY}.lock"
+
+for _ in \$(seq 1 30); do
+        [[ -S "\$XDG_RUNTIME_DIR/bus" ]] && break
+        sleep 1
+done
+
+if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+        dbus-update-activation-environment --systemd \
+                DISPLAY WAYLAND_DISPLAY XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP DESKTOP_SESSION \
+                XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS QT_QPA_PLATFORM KWIN_DRM_DEVICES || true
+fi
+
+PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE}"
+case "\${PLASMA_LAUNCH_MODE}" in
+        startplasma)
+                exec /usr/bin/startplasma-wayland
+                ;;
+        kwin-exit-with-session)
+                SESSION_HELPER=""
+                for candidate in \
+                        /usr/lib/*/libexec/startplasma-waylandsession \
+                        /usr/lib/*/libexec/startplasma-wayland \
+                        /usr/libexec/startplasma-waylandsession \
+                        /usr/libexec/startplasma-wayland \
+                        /usr/bin/startplasma-wayland
+                do
+                        if [[ -x "\${candidate}" ]]; then
+                                SESSION_HELPER="\${candidate}"
+                                break
+                        fi
+                done
+
+                [[ -n "\${SESSION_HELPER}" ]] || {
+                        echo "Could not find a Plasma Wayland session helper for kwin-exit-with-session mode" >&2
+                        exit 1
+                }
+
+                exec /usr/bin/kwin_wayland --drm --xwayland --socket "${KWIN_DISPLAY}" --exit-with-session "\${SESSION_HELPER}"
+                ;;
+        *)
+                echo "Unsupported PLASMA_LAUNCH_MODE='\${PLASMA_LAUNCH_MODE}'. Supported: startplasma, kwin-exit-with-session." >&2
+                exit 1
+                ;;
+esac
+EOF
+
+chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-plasma-realvt.sh"
+chmod 0755 "${HOME_DIR}/.local/bin/start-plasma-realvt.sh"
+
 cat > /usr/local/bin/clouddeploy-force-kwin-mode.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
+
+if [[ "\$(id -u)" == "0" ]]; then
+        exec runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                USER="${HEADLESS_USER}" \
+                LOGNAME="${HEADLESS_USER}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                "\$0" "\$@"
+fi
 
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
@@ -1558,6 +2223,49 @@ export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
 export QT_QPA_PLATFORM=wayland
+export XDG_CURRENT_DESKTOP=KDE
+export XDG_SESSION_TYPE=wayland
+
+find_qdbus_bin() {
+        local candidate
+        for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+                if command -v "\${candidate}" >/dev/null 2>&1; then
+                        command -v "\${candidate}"
+                        return 0
+                elif [[ -x "\${candidate}" ]]; then
+                        printf '%s\n' "\${candidate}"
+                        return 0
+                fi
+        done
+        return 1
+}
+
+kwin_support_info() {
+        local qdbus_bin
+        qdbus_bin="\$(find_qdbus_bin || true)"
+        [[ -n "\${qdbus_bin}" ]] || return 1
+        "\${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null || true
+}
+
+kwin_mode_ready() {
+        local info block geometry refresh
+        info="\$(kwin_support_info || true)"
+        block="\$(printf '%s\n' "\${info}" | awk -v connector="${FORCED_CONNECTOR}" '
+                /^Name:/ {
+                        if (in_block) exit
+                        in_block = (\$0 ~ ("Name:[[:space:]]*" connector "\$"))
+                }
+                in_block { print }
+        ')"
+        geometry="\$(printf '%s\n' "\${block}" | grep -E 'Geometry:' | tail -n1 || true)"
+        refresh="\$(printf '%s\n' "\${block}" | sed -nE 's/.*Refresh Rate:[[:space:]]*([0-9.]+).*/\\1/p' | tail -n1)"
+
+        printf '%s\n' "\${block}" | grep -E 'Name:|Geometry:|Refresh Rate:' || true
+
+        [[ "\${geometry}" == *"Geometry: 0,0,${TARGET_WIDTH}x${TARGET_HEIGHT}"* \
+                || "\${geometry}" == *"Geometry: 0,0 ${TARGET_WIDTH}x${TARGET_HEIGHT}"* ]] || return 1
+        [[ "\${refresh}" =~ ^(119|120) ]] || return 1
+}
 
 for _ in \$(seq 1 90); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
@@ -1577,18 +2285,23 @@ OUT="\$(kscreen-doctor -o 2>&1 || true)"
 echo "\${OUT}"
 
 OUTPUT_ID="\$(printf '%s\n' "\${OUT}" | sed -nE 's/.*Output: ([0-9]+) ${FORCED_CONNECTOR}.*/\\1/p' | head -n1)"
-MODE_ID="\$(printf '%s\n' "\${OUT}" | grep -oE '[0-9]+:${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS}' | head -n1 | cut -d: -f1)"
+MODE_ID="\$(printf '%s\n' "\${OUT}" | grep -oE '[0-9]+:${TARGET_WIDTH}x${TARGET_HEIGHT}@1(19|20)([.][0-9]+)?' | head -n1 | cut -d: -f1)"
 
 [[ -n "\${OUTPUT_ID}" ]] || OUTPUT_ID="1"
 [[ -n "\${MODE_ID}" ]] || MODE_ID="1"
 
 echo "Forcing ${FORCED_CONNECTOR} to ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} using output.\${OUTPUT_ID}.mode.\${MODE_ID}"
 
-kscreen-doctor "output.\${OUTPUT_ID}.mode.\${MODE_ID}" "output.\${OUTPUT_ID}.scale.1" || \
-        kscreen-doctor "output.${FORCED_CONNECTOR}.mode.\${MODE_ID}" "output.${FORCED_CONNECTOR}.scale.1"
+if ! kscreen-doctor "output.\${OUTPUT_ID}.enable" "output.\${OUTPUT_ID}.mode.\${MODE_ID}" "output.\${OUTPUT_ID}.scale.1" "output.\${OUTPUT_ID}.position.0,0"; then
+        kscreen-doctor "output.${FORCED_CONNECTOR}.enable" "output.${FORCED_CONNECTOR}.mode.\${MODE_ID}" "output.${FORCED_CONNECTOR}.scale.1" "output.${FORCED_CONNECTOR}.position.0,0" || true
+fi
 
 sleep 2
-kscreen-doctor -o
+kscreen-doctor -o || true
+kwin_mode_ready || {
+        echo "KWin did not report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish after force-mode." >&2
+        exit 1
+}
 EOF
 
 chmod 0755 /usr/local/bin/clouddeploy-force-kwin-mode.sh
@@ -1609,7 +2322,6 @@ export XDG_SESSION_TYPE=wayland
 export XDG_SESSION_DESKTOP=KDE
 export XDG_CURRENT_DESKTOP=KDE
 export KDE_FULL_SESSION=true
-export KDE_SESSION_VERSION=6
 
 export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
@@ -1676,9 +2388,68 @@ set -euo pipefail
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
 export LOGNAME="${HEADLESS_USER}"
+SUNSHINE_BIN="${SUNSHINE_RUNTIME_BIN}"
 
+if [[ ! -x "\${SUNSHINE_BIN}" ]]; then
+        echo "Sunshine binary is not executable: \${SUNSHINE_BIN}" >&2
+        exit 1
+fi
+
+find_qdbus_bin() {
+        local candidate
+        for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+                if command -v "\${candidate}" >/dev/null 2>&1; then
+                        command -v "\${candidate}"
+                        return 0
+                elif [[ -x "\${candidate}" ]]; then
+                        printf '%s\n' "\${candidate}"
+                        return 0
+                fi
+        done
+        return 1
+}
+
+kwin_mode_ready() {
+        local qdbus_bin info block geometry refresh
+        qdbus_bin="\$(find_qdbus_bin || true)"
+        [[ -n "\${qdbus_bin}" ]] || return 1
+        info="\$("\${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null || true)"
+        block="\$(printf '%s\n' "\${info}" | awk -v connector="${FORCED_CONNECTOR}" '
+                /^Name:/ {
+                        if (in_block) exit
+                        in_block = (\$0 ~ ("Name:[[:space:]]*" connector "\$"))
+                }
+                in_block { print }
+        ')"
+        geometry="\$(printf '%s\n' "\${block}" | grep -E 'Geometry:' | tail -n1 || true)"
+        refresh="\$(printf '%s\n' "\${block}" | sed -nE 's/.*Refresh Rate:[[:space:]]*([0-9.]+).*/\\1/p' | tail -n1)"
+        [[ "\${geometry}" == *"Geometry: 0,0,${TARGET_WIDTH}x${TARGET_HEIGHT}"* \
+                || "\${geometry}" == *"Geometry: 0,0 ${TARGET_WIDTH}x${TARGET_HEIGHT}"* ]] || return 1
+        [[ "\${refresh}" =~ ^(119|120) ]] || return 1
+}
+
+verify_sunshine_kms_config() {
+        local conf="${HOME_DIR}/.config/sunshine/sunshine.conf"
+        grep -Eq '^capture[[:space:]]*=[[:space:]]*kms[[:space:]]*$' "\${conf}" || {
+                echo "Sunshine config is not using capture = kms" >&2
+                exit 1
+        }
+        grep -Eq '^adapter_name[[:space:]]*=[[:space:]]*/dev/dri/card[0-9]+[[:space:]]*$' "\${conf}" || {
+                echo "Sunshine config is not using a DRM card node adapter_name" >&2
+                exit 1
+        }
+}
+
+REQUIRE_PLASMASHELL=0
 case "${STREAM_MODE}" in
-        kwin|plasma|realvt)
+        plasma)
+                export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+                export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+                WAIT_PROCESS="kwin_wayland"
+                REQUIRE_PLASMASHELL=1
+                ;;
+        kwin|realvt)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
@@ -1698,15 +2469,39 @@ esac
 mkdir -p "\$XDG_RUNTIME_DIR"
 chmod 700 "\$XDG_RUNTIME_DIR"
 
+FORCE_ATTEMPTED=0
+SESSION_MARKER_LOGGED=0
 for _ in \$(seq 1 120); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
-                echo "\${WAIT_PROCESS} Wayland session is ready at \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}; starting Sunshine"
-
-                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
-                        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+                if [[ "${STREAM_MODE}" == "plasma" && "\${REQUIRE_PLASMASHELL}" == "1" ]] \
+                        && ! pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1; then
+                        echo "Waiting for plasmashell before Sunshine..."
+                        sleep 1
+                        continue
+                fi
+                if [[ "${STREAM_MODE}" == "plasma" && "\${REQUIRE_PLASMASHELL}" == "1" ]] \
+                        && ! pgrep -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session' >/dev/null 2>&1; then
+                        if [[ "\${SESSION_MARKER_LOGGED}" == "0" ]]; then
+                                echo "KDE session service marker not observed yet; continuing because plasmashell and KWin DBus/mode validation are authoritative."
+                                SESSION_MARKER_LOGGED=1
+                        fi
                 fi
 
-                exec /usr/bin/sunshine
+                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
+                        if [[ "\${FORCE_ATTEMPTED}" == "0" ]]; then
+                                /usr/local/bin/clouddeploy-force-kwin-mode.sh
+                                FORCE_ATTEMPTED=1
+                        fi
+                        if ! kwin_mode_ready; then
+                                echo "Waiting for KWin to report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish..."
+                                sleep 1
+                                continue
+                        fi
+                fi
+
+                verify_sunshine_kms_config
+                echo "\${WAIT_PROCESS} Wayland session is ready at \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}; starting Sunshine"
+                exec "\${SUNSHINE_BIN}"
         fi
 
         echo "Waiting for \${WAIT_PROCESS} Wayland socket \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}..."
@@ -1740,12 +2535,19 @@ echo "=== /dev/dri ==="
 ls -l /dev/dri || true
 
 echo
-echo "=== Sunshine cap_sys_admin ==="
+echo "=== Sunshine binaries and capabilities ==="
 if command -v sunshine >/dev/null 2>&1; then
         sunshine_bin="\$(readlink -f "\$(command -v sunshine)")"
+        echo "packaged sunshine: \${sunshine_bin}"
         getcap "\${sunshine_bin}" || true
 else
         echo "sunshine not found"
+fi
+clouddeploy_sunshine_bin="${SUNSHINE_INSTALL_BIN}"
+if [[ -e "\${clouddeploy_sunshine_bin}" ]]; then
+        clouddeploy_sunshine_bin="\$(readlink -f "\${clouddeploy_sunshine_bin}")"
+        echo "clouddeploy sunshine: \${clouddeploy_sunshine_bin}"
+        getcap "\${clouddeploy_sunshine_bin}" || true
 fi
 
 echo
@@ -1759,7 +2561,7 @@ cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
 echo
 echo "=== KScreen output ==="
 if [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]]; then
-        env HOME="${HOME_DIR}" \
+        runuser -u "${HEADLESS_USER}" -- env HOME="${HOME_DIR}" \
             XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
             WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
             DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
@@ -1768,8 +2570,41 @@ if [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]]; then
 fi
 
 echo
+echo "=== KWin supportInformation (${FORCED_CONNECTOR}) ==="
+qdbus_bin=""
+for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+        if command -v "\${candidate}" >/dev/null 2>&1; then
+                qdbus_bin="\$(command -v "\${candidate}")"
+                break
+        elif [[ -x "\${candidate}" ]]; then
+                qdbus_bin="\${candidate}"
+                break
+        fi
+done
+if [[ -n "\${qdbus_bin}" ]]; then
+        runuser -u "${HEADLESS_USER}" -- env HOME="${HOME_DIR}" \
+            XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+            WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+            DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+            QT_QPA_PLATFORM=wayland \
+            XDG_CURRENT_DESKTOP=KDE \
+            XDG_SESSION_TYPE=wayland \
+            "\${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null \
+                | awk -v connector="${FORCED_CONNECTOR}" '
+                        /^Name:/ {
+                                if (in_block) exit
+                                in_block = (\$0 ~ ("Name:[[:space:]]*" connector "\$"))
+                        }
+                        in_block && /Name:|Geometry:|Refresh Rate:/ { print }
+                ' || true
+else
+        echo "qdbus not found"
+fi
+
+echo
 echo "=== Service status ==="
 systemctl --no-pager --full status \
+        plasma-realvt.service \
         kwin-realvt.service \
         plasma-shell-realvt.service \
         weston-kms-session.service \
@@ -1778,7 +2613,7 @@ systemctl --no-pager --full status \
 
 echo
 echo "=== Processes ==="
-pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|plasmashell|weston|sunshine' || true
+pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|plasmashell|startplasma-wayland|ksmserver|kded5|kded6|plasma_session|weston|sunshine' || true
 
 echo
 echo "=== KWin environment ==="
@@ -1809,16 +2644,84 @@ if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
 fi
 
 log "Ensuring Sunshine has cap_sys_admin for KMS capture"
-if command -v setcap >/dev/null 2>&1 && command -v sunshine >/dev/null 2>&1; then
-        setcap cap_sys_admin+p "$(readlink -f "$(command -v sunshine)")" || true
+if command -v setcap >/dev/null 2>&1 && [[ -x "${SUNSHINE_RUNTIME_BIN}" ]]; then
+        setcap cap_sys_admin,cap_sys_nice+ep "$(readlink -f "${SUNSHINE_RUNTIME_BIN}")" || true
 fi
 
 if [[ -n "${SUNSHINE_PASS}" ]]; then
         log "Setting Sunshine web UI credentials"
-        run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" sunshine --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}" || true
+        run_as_user "${HEADLESS_USER}" env HOME="${HOME_DIR}" "${SUNSHINE_RUNTIME_BIN}" --creds "${SUNSHINE_USER}" "${SUNSHINE_PASS}" || true
 else
         log "SUNSHINE_PASS was not provided; leaving Sunshine credentials unchanged/default."
 fi
+
+log "Writing full Plasma real-VT systemd service"
+cat > /etc/systemd/system/plasma-realvt.service <<EOF
+[Unit]
+Description=Full KDE Plasma Wayland session on real VT${KWIN_VTNR}
+After=systemd-logind.service systemd-user-sessions.service network-online.target
+Wants=network-online.target
+Conflicts=display-manager.service getty@tty${KWIN_VTNR}.service kwin-realvt.service weston-kms-session.service
+
+[Service]
+Type=simple
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
+PAMName=login
+WorkingDirectory=${HOME_DIR}
+
+TTYPath=/dev/tty${KWIN_VTNR}
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+UtmpIdentifier=tty${KWIN_VTNR}
+UtmpMode=user
+
+Environment=HOME=${HOME_DIR}
+Environment=USER=${HEADLESS_USER}
+Environment=LOGNAME=${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
+Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_SESSION_CLASS=user
+Environment=XDG_SESSION_DESKTOP=KDE
+Environment=XDG_CURRENT_DESKTOP=KDE
+Environment=DESKTOP_SESSION=plasmawayland
+Environment=KDE_FULL_SESSION=true
+Environment=QT_QPA_PLATFORM=wayland
+Environment=GDK_BACKEND=wayland,x11
+Environment=MOZ_ENABLE_WAYLAND=1
+Environment=KWIN_DRM_DEVICES=${SUNSHINE_DRM_DEVICE}
+Environment=KWIN_DRM_NO_DIRECT_SCANOUT=1
+Environment=KWIN_FORCE_SW_CURSOR=1
+Environment=KWIN_USE_OVERLAYS=0
+Environment=GBM_BACKEND=nvidia-drm
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+
+PermissionsStartOnly=true
+ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
+ExecStartPre=-/usr/bin/systemctl start user@${HEADLESS_UID}.service
+ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chvt ${KWIN_VTNR}
+ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+
+ExecStart=${HOME_DIR}/.local/bin/start-plasma-realvt.sh
+ExecStartPost=-/usr/local/bin/clouddeploy-force-kwin-mode.sh
+
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
 
 log "Writing KWin real-VT systemd service"
 cat > /etc/systemd/system/kwin-realvt.service <<EOF
@@ -1826,7 +2729,7 @@ cat > /etc/systemd/system/kwin-realvt.service <<EOF
 Description=KWin Wayland DRM session on real VT${KWIN_VTNR}
 After=systemd-logind.service systemd-user-sessions.service network-online.target
 Wants=network-online.target
-Conflicts=display-manager.service getty@tty${KWIN_VTNR}.service weston-kms-session.service
+Conflicts=display-manager.service getty@tty${KWIN_VTNR}.service plasma-realvt.service weston-kms-session.service
 
 [Service]
 Type=simple
@@ -1863,6 +2766,7 @@ ExecStartPre=/usr/bin/chvt ${KWIN_VTNR}
 ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
 
 ExecStart=${HOME_DIR}/.local/bin/start-kwin-realvt.sh
+ExecStartPost=-/usr/local/bin/clouddeploy-force-kwin-mode.sh
 
 Restart=on-failure
 RestartSec=5
@@ -1988,13 +2892,14 @@ systemctl disable \
         plasma-realvt.service \
         2>/dev/null || true
 
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
 
 rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
 
 log "Enabling selected services"
 systemctl daemon-reload
 systemctl disable \
+        plasma-realvt.service \
         kwin-realvt.service \
         plasma-shell-realvt.service \
         weston-kms-session.service \
@@ -2005,13 +2910,21 @@ if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl enable tailscaled || true
 fi
 
-if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
+        systemctl enable plasma-realvt.service sunshine-headless.service
+
+        systemctl restart plasma-realvt.service
+        sleep 12
+
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh
+        systemctl restart sunshine-headless.service
+elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service
 
         systemctl restart kwin-realvt.service
         sleep 8
 
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh
 
         systemctl restart plasma-shell-realvt.service || true
         systemctl restart sunshine-headless.service
@@ -2033,6 +2946,9 @@ validate_streaming_stack_ready
 
 log "Final validation markers"
 "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh" || true
+
+print_driver_cuda_sunshine_summary
+print_final_validation_summary
 
 echo "$SCRIPT_VERSION" > "$SENTINEL"
 
@@ -2063,6 +2979,8 @@ echo
 echo "Status helper: ${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
 echo "Diagnostic helper: sudo clouddeploy-diagnose-kms"
 echo "Pairing helper: sudo clouddeploy-pair-pin"
+echo "Optional game/app installs requested: ${INSTALL_OPTIONAL_APPS}"
+echo "App install helper: sudo bash -lc 'INSTALL_OPTIONAL_APPS=1 clouddeploy-run'"
 echo "Audio is intentionally disabled until video capture is stable."
 echo "Expected current milestone: Plasma Wayland visible, raw KMS capture tested, Sunshine KMS/NVENC alive."
 echo "Expected KWin path: kwin_wayland --drm --xwayland --socket ${KWIN_DISPLAY}"
