@@ -3,14 +3,17 @@ from pathlib import Path
 OUTDIR = Path('/lib/firmware/edid')
 OUTDIR.mkdir(parents=True, exist_ok=True)
 
+
 def mfg_id(code: str) -> bytes:
     code = code.upper()
     value = ((ord(code[0]) - 64) << 10) | ((ord(code[1]) - 64) << 5) | (ord(code[2]) - 64)
     return value.to_bytes(2, 'big')
 
+
 def checksum(block: bytearray) -> bytearray:
     block[127] = (-sum(block[:127])) & 0xFF
     return block
+
 
 def detailed_timing(pixel_clock_khz: int, hact: int, hblank: int, vact: int, vblank: int,
                     hsync_off: int, hsync_width: int, vsync_off: int, vsync_width: int,
@@ -36,6 +39,11 @@ def detailed_timing(pixel_clock_khz: int, hact: int, hblank: int, vact: int, vbl
     d[17] = 0x1A
     return bytes(d)
 
+
+DTD_1080P60 = detailed_timing(148500, 1920, 280, 1080, 45, 88, 44, 4, 5, 600, 340)
+DTD_4K60 = detailed_timing(594000, 3840, 560, 2160, 90, 176, 88, 8, 10, 600, 340)
+
+
 def descriptor(tag: int, text: str) -> bytes:
     d = bytearray(18)
     d[0:3] = b'\x00\x00\x00'
@@ -46,6 +54,7 @@ def descriptor(tag: int, text: str) -> bytes:
     if len(payload) < 13:
         d[5 + len(payload)] = 0x0A
     return bytes(d)
+
 
 def range_limits(vmin: int, vmax: int, hmin: int, hmax: int) -> bytes:
     d = bytearray(18)
@@ -59,7 +68,8 @@ def range_limits(vmin: int, vmax: int, hmin: int, hmax: int) -> bytes:
     d[9] = 0xFF
     return bytes(d)
 
-def base_block(name: str) -> bytes:
+
+def base_block(name: str, preferred_timing: bytes) -> bytes:
     b = bytearray(128)
     b[0:8] = b'\x00\xff\xff\xff\xff\xff\xff\x00'
     b[8:10] = mfg_id('CDP')
@@ -79,16 +89,18 @@ def base_block(name: str) -> bytes:
     b[35:38] = b'\x00\x00\x00'
     for i in range(38, 54, 2):
         b[i:i + 2] = b'\x01\x01'
-    b[54:72] = detailed_timing(148500, 1920, 280, 1080, 45, 88, 44, 4, 5, 600, 340)
+    b[54:72] = preferred_timing
     b[72:90] = descriptor(0xFC, name)
     b[90:108] = range_limits(48, 144, 30, 255)
     b[108:126] = descriptor(0xFE, 'CloudDeploy EDID')
     b[126] = 1
     return bytes(checksum(b))
 
-def cta_block(vics, hdr=False) -> bytes:
+
+def cta_block(vics, hdr=False, native_vic=None) -> bytes:
     data = bytearray()
-    data.extend([0x40 | len(vics), *vics])
+    svds = [(0x80 | vic) if vic == native_vic else vic for vic in vics]
+    data.extend([0x40 | len(svds), *svds])
     if hdr:
         data.extend([0x73, 0x05, 0xC0, 0x00])
         data.extend([0x76, 0x06, 0x0D, 0x01, 100, 80, 1])
@@ -101,11 +113,13 @@ def cta_block(vics, hdr=False) -> bytes:
     ext[4:4 + len(data)] = data
     return bytes(checksum(ext))
 
-def write_profile(filename: str, name: str, vics, hdr=False):
-    blob = base_block(name) + cta_block(vics=vics, hdr=hdr)
+
+def write_profile(filename: str, name: str, vics, preferred_timing: bytes, hdr=False, native_vic=None):
+    blob = base_block(name, preferred_timing=preferred_timing) + cta_block(vics=vics, hdr=hdr, native_vic=native_vic)
     (OUTDIR / filename).write_bytes(blob)
 
-write_profile('virtual-1080p-sdr.bin', 'CloudDeploy 1080p', [16], hdr=False)
-write_profile('virtual-4k60-sdr.bin', 'CloudDeploy 4K60', [97], hdr=False)
-write_profile('virtual-4k120-sdr.bin', 'CloudDeploy 4K120', [118, 97], hdr=False)
-write_profile('virtual-4k120-hdr.bin', 'CloudDeploy 4K120 HDR', [118, 97], hdr=True)
+
+write_profile('virtual-1080p-sdr.bin', 'CloudDeploy 1080p', [16], DTD_1080P60, hdr=False)
+write_profile('virtual-4k60-sdr.bin', 'CloudDeploy 4K60', [97], DTD_4K60, hdr=False, native_vic=97)
+write_profile('virtual-4k120-sdr.bin', 'CloudDeploy 4K120', [118, 97], DTD_4K60, hdr=False, native_vic=118)
+write_profile('virtual-4k120-hdr.bin', 'CloudDeploy 4K120 HDR', [118, 97], DTD_4K60, hdr=True, native_vic=118)
