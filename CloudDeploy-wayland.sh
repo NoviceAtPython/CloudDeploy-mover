@@ -431,12 +431,19 @@ ensure_phase2_kernel_args() {
 }
 
 nvidia_driver_ready() {
-        command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1
+        local version
+        command -v nvidia-smi >/dev/null 2>&1 || return 1
+        version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
+        [[ "${version}" =~ ^[0-9]+([.][0-9]+)+$ ]]
 }
 
 current_nvidia_driver_version() {
+        local version
         if command -v nvidia-smi >/dev/null 2>&1; then
-                nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true
+                version="$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -n1 || true)"
+                if [[ "${version}" =~ ^[0-9]+([.][0-9]+)+$ ]]; then
+                        printf '%s\n' "${version}"
+                fi
         fi
 }
 
@@ -660,6 +667,12 @@ nvidia_provider_init_failure_seen() {
         dmesg -T 2>/dev/null | grep -Eiq 'RmInitAdapter|Xid.*62|Failed to allocate NvKmsKapiDevice'
 }
 
+fail_if_nvidia_provider_init_failure_seen() {
+        if nvidia_provider_init_failure_seen; then
+                die "NVIDIA driver packages installed, but the provider GPU allocation failed to initialize. This is likely a bad/dirty cloud GPU passthrough allocation, not a Plasma/Sunshine/CUDA problem. Fully power-cycle this VM from the provider panel or create a new VM/GPU allocation."
+        fi
+}
+
 install_target_nvidia_driver() {
         local current_version current_major
         local old_driver_packages_installed=0
@@ -744,14 +757,16 @@ install_target_nvidia_driver() {
 
         if ! nvidia_driver_ready; then
                 diagnose_nvidia_init_failure
-                if nvidia_provider_init_failure_seen; then
-                        die "NVIDIA driver packages installed, but the provider GPU allocation failed to initialize. This is likely a bad/dirty cloud GPU passthrough allocation, not a Plasma/Sunshine/CUDA problem. Fully power-cycle this VM from the provider panel or create a new VM/GPU allocation."
-                fi
+                fail_if_nvidia_provider_init_failure_seen
         fi
 
         current_version="$(current_nvidia_driver_version || true)"
         current_major="$(current_nvidia_driver_major || true)"
         if [[ "${current_major}" != "${TARGET_NVIDIA_DRIVER_MAJOR}" ]]; then
+                if nvidia_provider_init_failure_seen; then
+                        diagnose_nvidia_init_failure
+                        fail_if_nvidia_provider_init_failure_seen
+                fi
                 if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
                         die "NVIDIA driver major is still ${current_major:-missing} after continuation reboot; expected ${TARGET_NVIDIA_DRIVER_MAJOR}"
                 fi
