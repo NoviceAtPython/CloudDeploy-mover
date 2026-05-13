@@ -1,5 +1,13 @@
 #!/bin/bash
 
+if LC_ALL=C grep -q $'\r' "$0" 2>/dev/null; then
+        echo "ERROR: CloudDeploy-wayland.sh appears to contain CRLF line endings." >&2
+        echo "Repair it before running:" >&2
+        echo "  sed -i 's/\\r$//' CloudDeploy-wayland.sh" >&2
+        echo "  chmod +x CloudDeploy-wayland.sh" >&2
+        exit 2
+fi
+
 set -Eeuo pipefail
 trap 'echo "Failed at line $LINENO"; exit 1' ERR
 export DEBIAN_FRONTEND=noninteractive
@@ -744,6 +752,10 @@ nvidia_server_dkms_installed_for_current_kernel() {
         dkms status 2>/dev/null | grep -Eiq "nvidia-srv/.*${current_kernel}.*installed|nvidia.*${current_kernel}.*installed"
 }
 
+nvidia_current_boot_rm_failure_seen() {
+        dmesg -T 2>/dev/null | grep -Eiq 'Xid.*62|RmInitAdapter failed|rm_init_adapter failed'
+}
+
 nvidia_target_dkms_package() {
         local candidate
         for candidate in \
@@ -963,6 +975,11 @@ validate_nvidia_driver_acceptance() {
                 print_nvidia_driver_diagnostics
                 detect_provider_gpu_init_failure
                 die "NVIDIA driver packages and DKMS are installed, but nvidia-smi is not working"
+        fi
+
+        if nvidia_current_boot_rm_failure_seen; then
+                print_nvidia_driver_diagnostics
+                die "NVIDIA current boot contains Xid 62 / RmInitAdapter failure markers"
         fi
 
         detect_provider_gpu_init_failure
@@ -1235,11 +1252,83 @@ install_sunshine_from_fork_if_requested() {
                         cp -a "${SUNSHINE_BUILD_DIR}/build/assets/." /usr/local/assets/
                         chown -R root:root /usr/local/assets
                         [[ -f /usr/local/assets/apps.json ]] || die "Sunshine runtime asset missing after install: /usr/local/assets/apps.json"
+
+                        [[ -d /usr/share/sunshine/web ]] || die "Packaged Sunshine web UI missing: /usr/share/sunshine/web"
+                        rm -rf /usr/local/assets/web
+                        install -d -m 0755 /usr/local/assets/web
+                        cp -a /usr/share/sunshine/web/. /usr/local/assets/web/
+                        chown -R root:root /usr/local/assets/web
+                        [[ -f /usr/local/assets/web/index.html ]] || die "Sunshine web UI asset missing after install: /usr/local/assets/web/index.html"
+                        find /usr/local/assets/web -type f \( -name '*.js' -o -name '*.css' \) 2>/dev/null | grep -q . \
+                                || die "Sunshine web UI assets missing built JS/CSS under /usr/local/assets/web"
                         ;;
                 *)
                         die "Unsupported SUNSHINE_SOURCE_MODE='${SUNSHINE_SOURCE_MODE}'. Supported now: deb, fork."
                         ;;
         esac
+}
+
+find_nvidia_vulkan_icd() {
+        find /usr/share/vulkan/icd.d -name '*nvidia*_icd.json' 2>/dev/null | head -n1 || true
+}
+
+library_available_to_loader() {
+        local lib="$1"
+        ldconfig -p 2>/dev/null | grep -Fq "${lib}" \
+                || find /usr -type f -name "${lib}" 2>/dev/null | grep -q .
+}
+
+write_egl_external_platform_json() {
+        local path="$1"
+        local library="$2"
+
+        cat > "${path}" <<EOF
+{
+    "file_format_version": "1.0.0",
+    "ICD": {
+        "library_path": "${library}"
+    }
+}
+EOF
+}
+
+ensure_nvidia_egl_vulkan_runtime_config() {
+        local nvidia_icd
+
+        log "Ensuring NVIDIA EGL external platform and Vulkan runtime configuration for Sunshine"
+        install -d -m 0755 /usr/share/egl/egl_external_platform.d
+
+        if library_available_to_loader "libnvidia-egl-gbm.so.1"; then
+                write_egl_external_platform_json \
+                        /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json \
+                        "libnvidia-egl-gbm.so.1"
+        else
+                log "WARNING: libnvidia-egl-gbm.so.1 was not found; GBM external platform JSON was not written"
+        fi
+
+        if library_available_to_loader "libnvidia-egl-wayland.so.1"; then
+                write_egl_external_platform_json \
+                        /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json \
+                        "libnvidia-egl-wayland.so.1"
+        else
+                log "WARNING: libnvidia-egl-wayland.so.1 was not found; Wayland external platform JSON was not written"
+        fi
+
+        nvidia_icd="$(find_nvidia_vulkan_icd)"
+        nvidia_icd="${nvidia_icd:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
+        install -d -m 0755 /etc/systemd/system/sunshine-headless.service.d
+        cat > /etc/systemd/system/sunshine-headless.service.d/20-nvidia-vulkan-egl.conf <<EOF
+[Service]
+Environment=GBM_BACKEND=nvidia-drm
+Environment=EGL_PLATFORM=gbm
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+Environment=VK_ICD_FILENAMES=${nvidia_icd}
+Environment=VK_DRIVER_FILES=${nvidia_icd}
+Environment=LIBGL_ALWAYS_SOFTWARE=0
+Environment=CUDA_VISIBLE_DEVICES=0
+EOF
 }
 
 run_as_user() {
@@ -1653,10 +1742,24 @@ esac
 
 echo "Performing exact known-good clean reset before final validation"
 
-systemctl stop sunshine-headless.service sunshine-direct.service sunshine-manual.service sunshine-wayland-nodbus.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+KWIN_HEALTHY=0
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]] \
+        && systemctl is-active --quiet kwin-realvt.service \
+        && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]] \
+        && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
+        KWIN_HEALTHY=1
+        echo "kwin-realvt.service already active; not restarting real-VT KWin"
+fi
 
-rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+if [[ "${KWIN_HEALTHY}" == "1" ]]; then
+        systemctl stop sunshine-headless.service sunshine-direct.service sunshine-manual.service sunshine-wayland-nodbus.service plasma-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
+        pkill -9 -u "${HEADLESS_USER}" -f 'plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston' 2>/dev/null || true
+        rm -f /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+else
+        systemctl stop sunshine-headless.service sunshine-direct.service sunshine-manual.service sunshine-wayland-nodbus.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
+        pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+        rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+fi
 
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
 TS_IP=""
@@ -1684,11 +1787,15 @@ chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine
 
 systemctl reset-failed plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
 
-systemctl start "${COMPOSITOR_SERVICE}"
+if [[ "${KWIN_HEALTHY}" == "1" ]]; then
+        echo "Skipping compositor start because real-VT KWin is already healthy"
+else
+        systemctl start "${COMPOSITOR_SERVICE}"
+fi
 
 if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         sleep 8
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh || echo "WARNING: clouddeploy-force-kwin-mode failed; final validation will decide success."
         systemctl restart plasma-shell-realvt.service || true
 else
         sleep 5
@@ -1701,7 +1808,7 @@ systemctl restart sunshine-headless.service
 sleep 6
 
 journalctl -u sunshine-headless.service -n 180 --no-pager \
-  | grep -Ei 'Desktop resolution|Monitor 0|Found monitor|Screencasting|/dev/dri|Creating encoder|Nvenc initialized|Found H.264|Found AV1|Error|Fatal' || true
+  | grep -Ei 'Desktop resolution|Monitor 0|Found monitor|Screencasting|/dev/dri|Creating encoder|Nvenc initialized|Found H.264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Error|Fatal' || true
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-reset-streaming
 
@@ -1992,6 +2099,13 @@ KNOWN_SUNSHINE_RESOLUTION_LINE=""
 KNOWN_SUNSHINE_MONITOR_LINE=""
 KNOWN_SUNSHINE_KMS_LINE=""
 KNOWN_SUNSHINE_NVENC_LINE=""
+KNOWN_SUNSHINE_H264_LINE=""
+KNOWN_SUNSHINE_HEVC_LINE=""
+KNOWN_SUNSHINE_AV1_LINE=""
+KNOWN_SUNSHINE_SAMPLE_LINE=""
+KNOWN_SUNSHINE_EGL_LINE=""
+KNOWN_SUNSHINE_GL_LINE=""
+KNOWN_SUNSHINE_FAILURE_LINE=""
 LAST_WESTON_LOG=""
 LAST_SUNSHINE_LOG=""
 LAST_SUNSHINE_START_SINCE=""
@@ -2069,6 +2183,27 @@ refresh_streaming_log_markers() {
         KNOWN_SUNSHINE_NVENC_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'Nvenc initialized successfully|Found H[.]264 encoder: h264_nvenc|h264_nvenc' \
                 | tail -n1 || true)"
+        KNOWN_SUNSHINE_H264_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Found H[.]264 encoder: h264_nvenc|h264_nvenc' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_HEVC_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Found HEVC encoder: hevc_nvenc|hevc_nvenc' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_AV1_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Found AV1 encoder: av1_nvenc|av1_nvenc' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_SAMPLE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'sample_all_black=false|all_black=false|sample_nonblack=([1-9][0-9]*)' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_EGL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'EGL:.*NVIDIA|EGL vendor.*NVIDIA' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_GL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'GL: renderer:.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_FAILURE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'sample_all_black=true|llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
+                | tail -n1 || true)"
 }
 
 streaming_log_markers_ready() {
@@ -2076,7 +2211,14 @@ streaming_log_markers_ready() {
                 && [[ -n "${KNOWN_SUNSHINE_RESOLUTION_LINE}" ]] \
                 && [[ -n "${KNOWN_SUNSHINE_MONITOR_LINE}" ]] \
                 && [[ -n "${KNOWN_SUNSHINE_KMS_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]]
+                && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_H264_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_HEVC_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_AV1_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_SAMPLE_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_EGL_LINE}" ]] \
+                && [[ -n "${KNOWN_SUNSHINE_GL_LINE}" ]] \
+                && [[ -z "${KNOWN_SUNSHINE_FAILURE_LINE}" ]]
 }
 
 sunshine_started_with_zero_resolution() {
@@ -2230,10 +2372,30 @@ known_good_clean_reset_streaming_stack() {
 validate_streaming_stack_ready() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
         local compositor_service
+        local edid_file ts_ip
 
         if ! nvidia_driver_ready; then
                 print_server_validation_diagnostics
                 die "NVIDIA driver check failed: nvidia-smi is not healthy"
+        fi
+        if ! nvidia_dkms_installed_for_current_kernel; then
+                print_server_validation_diagnostics
+                die "NVIDIA DKMS module is not installed for running kernel $(uname -r)"
+        fi
+        if [[ "${INSTALL_CUDA_TOOLKIT}" == "1" ]] \
+                && ! { [[ -x /usr/local/cuda/bin/nvcc ]] || command -v nvcc >/dev/null 2>&1; }; then
+                print_server_validation_diagnostics
+                die "CUDA toolkit was requested, but nvcc is not available"
+        fi
+        detect_provider_gpu_init_failure
+        if nvidia_smi_driver_library_mismatch; then
+                print_server_validation_diagnostics
+                die "nvidia-smi reports Driver/library version mismatch"
+        fi
+        edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
+        if [[ -n "${edid_file}" ]] && ! cmdline_has_required_phase2_args "${edid_file}"; then
+                print_server_validation_diagnostics
+                die "Kernel cmdline is missing required EDID/NVIDIA DRM args"
         fi
         if ! connector_forced_connected; then
                 print_server_validation_diagnostics
@@ -2283,9 +2445,27 @@ validate_streaming_stack_ready() {
                 fi
         fi
 
+        if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
+                [[ -f /usr/local/assets/apps.json ]] || die "Missing Sunshine runtime asset: /usr/local/assets/apps.json"
+                [[ -f /usr/local/assets/web/index.html ]] || die "Missing file: /usr/local/assets/web/index.html"
+                find /usr/local/assets/web -type f \( -name '*.js' -o -name '*.css' \) 2>/dev/null | grep -q . \
+                        || die "Sunshine web UI assets are missing built JS/CSS under /usr/local/assets/web"
+        fi
+
+        ts_ip="$(tailscale_ipv4 || true)"
+        if [[ -n "${ts_ip}" ]] && ! curl -kfsS --connect-timeout 3 "https://${ts_ip}:47990" >/dev/null 2>&1; then
+                print_server_validation_diagnostics
+                die "Sunshine web UI is not reachable at https://${ts_ip}:47990"
+        fi
+
         if ! wait_for_streaming_log_markers; then
                 print_server_validation_diagnostics
                 die "Did not observe expected compositor / Sunshine KMS+NVENC log markers"
+        fi
+
+        if [[ -n "${KNOWN_SUNSHINE_FAILURE_LINE}" ]]; then
+                print_server_validation_diagnostics
+                die "Sunshine failure marker observed: ${KNOWN_SUNSHINE_FAILURE_LINE}"
         fi
 }
 
@@ -2347,6 +2527,12 @@ print_final_validation_summary() {
         echo "Sunshine desktop resolution: ${KNOWN_SUNSHINE_RESOLUTION_LINE:-not observed}"
         echo "Sunshine KMS monitor found: ${KNOWN_SUNSHINE_KMS_LINE:-not observed}"
         echo "NVENC initialized: ${KNOWN_SUNSHINE_NVENC_LINE:-not observed}"
+        echo "Sunshine non-black KMS sample: ${KNOWN_SUNSHINE_SAMPLE_LINE:-not observed}"
+        echo "Sunshine EGL NVIDIA marker: ${KNOWN_SUNSHINE_EGL_LINE:-not observed}"
+        echo "Sunshine GL NVIDIA marker: ${KNOWN_SUNSHINE_GL_LINE:-not observed}"
+        echo "Sunshine H.264 encoder: ${KNOWN_SUNSHINE_H264_LINE:-not observed}"
+        echo "Sunshine HEVC encoder: ${KNOWN_SUNSHINE_HEVC_LINE:-not observed}"
+        echo "Sunshine AV1 encoder: ${KNOWN_SUNSHINE_AV1_LINE:-not observed}"
         echo "Sunshine web UI over Tailscale: ${web_status}"
         echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
@@ -2366,6 +2552,9 @@ print_known_good_checklist() {
         echo "[OK] Sunshine Monitor 0 is ${FORCED_CONNECTOR} (${KNOWN_SUNSHINE_MONITOR_LINE})"
         echo "[OK] Sunshine KMS capture found monitor (${KNOWN_SUNSHINE_KMS_LINE})"
         echo "[OK] NVENC initialized (${KNOWN_SUNSHINE_NVENC_LINE})"
+        echo "[OK] Sunshine KMS sample non-black (${KNOWN_SUNSHINE_SAMPLE_LINE})"
+        echo "[OK] Sunshine EGL/GL NVIDIA (${KNOWN_SUNSHINE_EGL_LINE}; ${KNOWN_SUNSHINE_GL_LINE})"
+        echo "[OK] Sunshine NVENC encoders (${KNOWN_SUNSHINE_H264_LINE}; ${KNOWN_SUNSHINE_HEVC_LINE}; ${KNOWN_SUNSHINE_AV1_LINE})"
         echo "Codec profile: AV1-enabled SDR profile"
         echo "Moonlight: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
@@ -2478,6 +2667,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
 
         COMPOSITOR_SERVICE="$(service_for_mode)"
         write_clouddeploy_env_file
+        ensure_nvidia_egl_vulkan_runtime_config
 
         systemctl daemon-reload || true
         systemctl disable plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service >/dev/null 2>&1 || true
@@ -2621,6 +2811,7 @@ install_sunshine_from_fork_if_requested
 SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
 [[ -x "${SUNSHINE_RUNTIME_BIN}" ]] || die "Sunshine runtime binary is not executable: ${SUNSHINE_RUNTIME_BIN}"
 log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
+ensure_nvidia_egl_vulkan_runtime_config
 
 log "Installing Tailscale if requested"
 if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
@@ -3313,7 +3504,7 @@ for _ in \$(seq 1 120); do
 
                 if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
                         if [[ "\${FORCE_ATTEMPTED}" == "0" ]]; then
-                                /usr/local/bin/clouddeploy-force-kwin-mode.sh
+                                /usr/local/bin/clouddeploy-force-kwin-mode.sh || echo "WARNING: clouddeploy-force-kwin-mode failed; waiting for KWin mode validation."
                                 FORCE_ATTEMPTED=1
                         fi
                         if ! kwin_mode_ready; then
@@ -3374,6 +3565,16 @@ if [[ -e "\${clouddeploy_sunshine_bin}" ]]; then
         echo "clouddeploy sunshine: \${clouddeploy_sunshine_bin}"
         getcap "\${clouddeploy_sunshine_bin}" || true
 fi
+
+echo
+echo "=== NVIDIA EGL/Vulkan runtime files ==="
+ls -l /usr/share/egl/egl_external_platform.d/10_nvidia_wayland.json \
+      /usr/share/egl/egl_external_platform.d/15_nvidia_gbm.json \
+      /usr/share/glvnd/egl_vendor.d/10_nvidia.json \
+      /usr/share/vulkan/icd.d/*nvidia*_icd.json 2>/dev/null || true
+echo
+echo "=== Sunshine NVIDIA EGL/Vulkan drop-in ==="
+cat /etc/systemd/system/sunshine-headless.service.d/20-nvidia-vulkan-egl.conf 2>/dev/null || true
 
 echo
 echo "=== Connector status (${FORCED_CONNECTOR}) ==="
@@ -3453,7 +3654,7 @@ fi
 echo
 echo "=== Sunshine journal markers ==="
 journalctl -u sunshine-headless.service -n 220 --no-pager \
-        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|Nvenc initialized|Found AV1|Mismatch|pair|pin|error|fatal' || true
+        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|Nvenc initialized|Found H[.]264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Mismatch|pair|pin|error|fatal' || true
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
@@ -3501,10 +3702,11 @@ StandardInput=tty
 StandardOutput=journal
 StandardError=journal
 TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=yes
+TTYVHangup=no
+TTYVTDisallocate=no
 UtmpIdentifier=tty${KWIN_VTNR}
 UtmpMode=user
+TimeoutStartSec=45
 
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
@@ -3569,10 +3771,11 @@ StandardInput=tty
 StandardOutput=journal
 StandardError=journal
 TTYReset=yes
-TTYVHangup=yes
-TTYVTDisallocate=yes
+TTYVHangup=no
+TTYVTDisallocate=no
 UtmpIdentifier=tty${KWIN_VTNR}
 UtmpMode=user
+TimeoutStartSec=45
 
 Environment=KWIN_DRM_DEVICES=${SUNSHINE_DRM_DEVICE}
 Environment=KWIN_DRM_NO_DIRECT_SCANOUT=1
@@ -3591,10 +3794,9 @@ ExecStartPre=/usr/bin/chvt ${KWIN_VTNR}
 ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
 
 ExecStart=${HOME_DIR}/.local/bin/start-kwin-realvt.sh
-ExecStartPost=-/usr/local/bin/clouddeploy-force-kwin-mode.sh
+ExecStartPost=
 
-Restart=on-failure
-RestartSec=5
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
@@ -3707,17 +3909,39 @@ WantedBy=multi-user.target
 EOF
 
 log "Stopping old compositor/session bits"
-systemctl stop \
-        sunshine-direct.service \
-        sunshine-manual.service \
-        sunshine-wayland-nodbus.service \
-        plasma-kms-session.service \
-        plasma-realvt.service \
-        kwin-realvt.service \
-        plasma-shell-realvt.service \
-        weston-kms-session.service \
-        sunshine-headless.service \
-        2>/dev/null || true
+KWIN_ALREADY_HEALTHY=0
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]] \
+        && systemctl is-active --quiet kwin-realvt.service \
+        && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]] \
+        && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
+        KWIN_ALREADY_HEALTHY=1
+        log "kwin-realvt.service already active; not stopping real-VT KWin"
+fi
+
+if [[ "${KWIN_ALREADY_HEALTHY}" == "1" ]]; then
+        systemctl stop \
+                sunshine-direct.service \
+                sunshine-manual.service \
+                sunshine-wayland-nodbus.service \
+                plasma-kms-session.service \
+                plasma-realvt.service \
+                plasma-shell-realvt.service \
+                weston-kms-session.service \
+                sunshine-headless.service \
+                2>/dev/null || true
+else
+        systemctl stop \
+                sunshine-direct.service \
+                sunshine-manual.service \
+                sunshine-wayland-nodbus.service \
+                plasma-kms-session.service \
+                plasma-realvt.service \
+                kwin-realvt.service \
+                plasma-shell-realvt.service \
+                weston-kms-session.service \
+                sunshine-headless.service \
+                2>/dev/null || true
+fi
 
 systemctl disable \
         sunshine-direct.service \
@@ -3727,9 +3951,17 @@ systemctl disable \
         plasma-realvt.service \
         2>/dev/null || true
 
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+if [[ "${KWIN_ALREADY_HEALTHY}" == "1" ]]; then
+        pkill -9 -u "${HEADLESS_USER}" -f 'plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston' 2>/dev/null || true
+else
+        pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+fi
 
-rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+if [[ "${KWIN_ALREADY_HEALTHY}" == "1" ]]; then
+        rm -f /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+else
+        rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
+fi
 
 log "Enabling selected services"
 systemctl daemon-reload
@@ -3748,10 +3980,14 @@ fi
 if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service
 
-        systemctl restart kwin-realvt.service
+        if [[ "${KWIN_ALREADY_HEALTHY}" == "1" ]] && systemctl is-active --quiet kwin-realvt.service; then
+                log "kwin-realvt.service already active; not restarting real-VT KWin"
+        else
+                systemctl restart kwin-realvt.service
+        fi
         sleep 8
 
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh || log "WARNING: clouddeploy-force-kwin-mode failed; final validation will decide success."
 
         systemctl restart plasma-shell-realvt.service || true
         systemctl restart sunshine-headless.service
