@@ -681,26 +681,297 @@ fail_if_nvidia_provider_init_failure_seen() {
         fi
 }
 
+installed_dpkg_package() {
+        dpkg-query -W -f='${binary:Package}\n' "$1" >/dev/null 2>&1
+}
+
+dpkg_package_configured_ii() {
+        local status
+        status="$(dpkg-query -W -f='${db:Status-Abbrev}' "$1" 2>/dev/null || true)"
+        [[ "${status}" == "ii " || "${status}" == "ii" ]]
+}
+
+print_nvidia_driver_diagnostics() {
+        echo
+        echo "=== NVIDIA package/DKMS diagnostics ==="
+        echo "=== dkms status ==="
+        dkms status 2>/dev/null || true
+        echo
+        echo "=== dpkg NVIDIA/kernel package states ==="
+        dpkg -l 2>/dev/null \
+                | awk '/nvidia-dkms|nvidia-driver|linux-image|linux-headers|linux-modules/ { print }' \
+                || true
+        diagnose_nvidia_init_failure
+}
+
+provider_gpu_failure_message() {
+        printf '%s\n' "Provider GPU initialization failure: NVIDIA GPU is present and bound to nvidia, but NVRM reports Xid 62 / RmInitAdapter failed. This is not a CloudDeploy/KDE/Sunshine issue. Power-cycle the VM from the provider panel or recreate the instance on a different host/datacenter."
+}
+
+detect_provider_gpu_init_failure() {
+        local smi_out lspci_block
+
+        lspci_block="$(lspci -nnk 2>/dev/null | grep -A5 -Ei 'nvidia|vga|3d|display' || true)"
+        if ! printf '%s\n' "${lspci_block}" | grep -Eiq 'nvidia'; then
+                print_nvidia_driver_diagnostics
+                die "No NVIDIA GPU is visible on PCI. This is a provider allocation issue."
+        fi
+
+        smi_out="$(nvidia-smi 2>&1)" && return 0 || true
+        if printf '%s\n' "${smi_out}" | grep -Eiq 'No devices were found' \
+                && printf '%s\n' "${lspci_block}" | grep -Eiq 'Kernel driver in use:[[:space:]]*nvidia' \
+                && dmesg -T 2>/dev/null | grep -Eiq 'Xid.*62|RmInitAdapter failed|rm_init_adapter failed'; then
+                print_nvidia_driver_diagnostics
+                die "$(provider_gpu_failure_message)"
+        fi
+}
+
+nvidia_smi_driver_library_mismatch() {
+        local smi_out
+        smi_out="$(nvidia-smi 2>&1)" && return 1 || true
+        printf '%s\n' "${smi_out}" | grep -Eiq 'Driver/library version mismatch'
+}
+
+nvidia_dkms_installed_for_current_kernel() {
+        local current_kernel
+        current_kernel="$(uname -r)"
+        dkms status 2>/dev/null | grep -Eiq "nvidia.*${current_kernel}.*installed"
+}
+
+nvidia_recent_boot_provider_failure_seen() {
+        dmesg -T 2>/dev/null | grep -Eiq 'Xid.*62|RmInitAdapter failed|rm_init_adapter failed'
+}
+
+nvidia_target_dkms_package() {
+        local candidate
+        for candidate in \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+        printf '%s\n' "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+}
+
+nvidia_target_driver_package() {
+        local candidate
+        for candidate in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+        printf '%s\n' "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+}
+
+collect_non_current_kernel_versions() {
+        local current_kernel="$1"
+        local pkg path kernel
+        local -A seen
+
+        shopt -s nullglob
+        for path in /lib/modules/* /boot/vmlinuz-*; do
+                [[ -e "${path}" ]] || continue
+                kernel="$(basename "${path}")"
+                kernel="${kernel#vmlinuz-}"
+                [[ "${kernel}" == "${current_kernel}" ]] && continue
+                [[ "${kernel}" =~ ^[0-9].* ]] || continue
+                seen["${kernel}"]=1
+        done
+        shopt -u nullglob
+
+        while read -r pkg; do
+                case "${pkg}" in
+                        linux-image-[0-9]*|linux-modules-[0-9]*|linux-modules-extra-[0-9]*|linux-tools-[0-9]*)
+                                kernel="${pkg#linux-image-}"
+                                kernel="${kernel#linux-modules-}"
+                                kernel="${kernel#linux-modules-extra-}"
+                                kernel="${kernel#linux-tools-}"
+                                [[ "${kernel}" == "${current_kernel}" ]] && continue
+                                [[ "${kernel}" =~ ^[0-9].* ]] || continue
+                                seen["${kernel}"]=1
+                                ;;
+                        linux-headers-[0-9]*)
+                                kernel="${pkg#linux-headers-}"
+                                [[ "${kernel}" == "${current_kernel}" || "${kernel}" == "${current_kernel%-*}" ]] && continue
+                                [[ "${kernel}" =~ ^[0-9].* ]] || continue
+                                seen["${kernel}"]=1
+                                ;;
+                esac
+        done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
+
+        printf '%s\n' "${!seen[@]}" | sort -V
+}
+
+prepare_single_kernel_for_nvidia_dkms() {
+        local current_kernel current_base other_kernel other_base pkg
+        local -a other_kernels purge_candidates purge_pkgs
+        local -A seen_pkg seen_base
+
+        current_kernel="$(uname -r)"
+        current_base="${current_kernel%-*}"
+        log "Preparing single running kernel for NVIDIA DKMS: ${current_kernel}"
+
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential dkms pkg-config "linux-headers-${current_kernel}" \
+                || log "Kernel/DKMS prerequisite install reported errors; continuing with stale-kernel cleanup and dpkg reconfigure"
+
+        mapfile -t other_kernels < <(collect_non_current_kernel_versions "${current_kernel}")
+        if [[ "${#other_kernels[@]}" -gt 0 ]]; then
+                log "Non-running kernels to remove before NVIDIA DKMS: ${other_kernels[*]}"
+        else
+                log "No non-running kernel versions found before NVIDIA DKMS"
+        fi
+
+        purge_candidates=(linux-virtual linux-image-virtual linux-headers-virtual linux-headers-generic)
+        for other_kernel in "${other_kernels[@]}"; do
+                [[ "${other_kernel}" == "${current_kernel}" ]] && continue
+                other_base="${other_kernel%-*}"
+                purge_candidates+=(
+                        "linux-image-${other_kernel}"
+                        "linux-modules-${other_kernel}"
+                        "linux-modules-extra-${other_kernel}"
+                        "linux-headers-${other_kernel}"
+                        "linux-tools-${other_kernel}"
+                )
+
+                if [[ "${other_base}" != "${current_base}" && -z "${seen_base[${other_base}]:-}" ]]; then
+                        purge_candidates+=(
+                                "linux-headers-${other_base}"
+                                "linux-tools-${other_base}"
+                        )
+                        seen_base["${other_base}"]=1
+                fi
+        done
+
+        purge_pkgs=()
+        for pkg in "${purge_candidates[@]}"; do
+                [[ -n "${seen_pkg[${pkg}]:-}" ]] && continue
+                seen_pkg["${pkg}"]=1
+                if installed_dpkg_package "${pkg}"; then
+                        purge_pkgs+=("${pkg}")
+                fi
+        done
+
+        if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
+                log "Purging non-current/provider kernel packages before NVIDIA DKMS: ${purge_pkgs[*]}"
+                wait_for_apt
+                apt-get purge -y "${purge_pkgs[@]}" || log "Kernel package purge reported errors; continuing with cleanup/reconfigure"
+        fi
+
+        for other_kernel in "${other_kernels[@]}"; do
+                [[ "${other_kernel}" == "${current_kernel}" ]] && continue
+                log "Removing stale non-current kernel leftovers for ${other_kernel}"
+                rm -rf "/lib/modules/${other_kernel}" \
+                        "/boot/vmlinuz-${other_kernel}" \
+                        "/boot/initrd.img-${other_kernel}" \
+                        "/boot/System.map-${other_kernel}" \
+                        "/boot/config-${other_kernel}" || true
+        done
+
+        rm -f "/var/crash/nvidia-kernel-source-${TARGET_NVIDIA_DRIVER_MAJOR}-server.0.crash" || true
+
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        update-initramfs -u -k "${current_kernel}"
+        update-grub
+}
+
+nvidia_install_output_has_dkms_kernel_failure() {
+        local output="$1"
+        local make_log
+
+        if printf '%s\n' "${output}" \
+                | grep -Eiq "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}|nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}|DKMS.*failed|No rule to make target ['\`]?modules|bad return status"; then
+                return 0
+        fi
+
+        while IFS= read -r make_log; do
+                if grep -Eiq "No rule to make target ['\`]?modules|bad return status|Error [0-9]+" "${make_log}" 2>/dev/null; then
+                        log "Detected NVIDIA DKMS failure marker in ${make_log}"
+                        return 0
+                fi
+        done < <(find /var/lib/dkms -type f -name make.log -path '*nvidia*' 2>/dev/null || true)
+
+        return 1
+}
+
+recover_nvidia_dkms_after_kernel_failure() {
+        log "NVIDIA DKMS/package configuration failed; pruning stale provider kernels and retrying configuration"
+        prepare_single_kernel_for_nvidia_dkms
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+        DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+}
+
+validate_nvidia_driver_acceptance() {
+        local driver_pkg="$1"
+        local dkms_pkg="$2"
+
+        detect_provider_gpu_init_failure
+
+        if ! dpkg_package_configured_ii "${dkms_pkg}" || ! dpkg_package_configured_ii "${driver_pkg}"; then
+                print_nvidia_driver_diagnostics
+                die "NVIDIA target packages are not fully configured as ii: ${dkms_pkg}, ${driver_pkg}"
+        fi
+
+        if ! nvidia_dkms_installed_for_current_kernel; then
+                print_nvidia_driver_diagnostics
+                die "DKMS does not show an installed NVIDIA module for running kernel $(uname -r)"
+        fi
+
+        if nvidia_smi_driver_library_mismatch; then
+                print_nvidia_driver_diagnostics
+                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
+                        die "nvidia-smi still reports driver/library version mismatch after continuation reboot"
+                fi
+                schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver/userland version mismatch detected; rebooting to load the matching kernel module"
+        fi
+
+        if ! nvidia_driver_ready; then
+                print_nvidia_driver_diagnostics
+                detect_provider_gpu_init_failure
+                die "NVIDIA driver packages and DKMS are installed, but nvidia-smi is not working"
+        fi
+
+        if nvidia_recent_boot_provider_failure_seen; then
+                print_nvidia_driver_diagnostics
+                die "$(provider_gpu_failure_message)"
+        fi
+}
+
 install_target_nvidia_driver() {
-        local current_version current_major
+        local current_version current_major install_out install_rc dkms_pkg
         local old_driver_packages_installed=0
         current_version="$(current_nvidia_driver_version || true)"
         current_major="$(current_nvidia_driver_major || true)"
 
         if [[ "${current_major}" == "${TARGET_NVIDIA_DRIVER_MAJOR}" ]] && nvidia_driver_ready; then
                 log "NVIDIA driver ${current_version} already matches target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                detect_provider_gpu_init_failure
+                validate_nvidia_driver_acceptance "$(nvidia_target_driver_package)" "$(nvidia_target_dkms_package)"
                 return 0
         fi
 
         if nvidia_driver_ready && [[ "${FORCE_DRIVER_UPGRADE}" != "1" ]]; then
                 log "NVIDIA driver ${current_version:-unknown} is working; FORCE_DRIVER_UPGRADE=0 so not forcing target ${TARGET_NVIDIA_DRIVER_MAJOR}"
+                detect_provider_gpu_init_failure
                 return 0
         fi
 
         log "Installing NVIDIA driver target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
         systemctl stop sunshine-headless.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service 2>/dev/null || true
 
-        apt_install_wait "linux-headers-$(uname -r)" dkms build-essential pkg-config
+        repair_dpkg_state_if_needed
+        prepare_single_kernel_for_nvidia_dkms
         ensure_cuda_ubuntu_repo
 
         if dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
@@ -746,7 +1017,19 @@ install_target_nvidia_driver() {
         done
 
         log "Installing NVIDIA packages: ${install_pkgs[*]}"
-        apt_install_wait "${install_pkgs[@]}"
+        wait_for_apt
+        repair_dpkg_state_if_needed
+        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get install -y "${install_pkgs[@]}" 2>&1)" && install_rc=0 || install_rc=$?
+        printf '%s\n' "${install_out}"
+        if [[ "${install_rc}" -ne 0 ]]; then
+                if nvidia_install_output_has_dkms_kernel_failure "${install_out}"; then
+                        recover_nvidia_dkms_after_kernel_failure
+                else
+                        die "Failed to install NVIDIA packages: ${install_pkgs[*]}"
+                fi
+        fi
+
+        dkms_pkg="$(nvidia_target_dkms_package)"
 
         modprobe nvidia 2>/dev/null || true
         modprobe nvidia_modeset 2>/dev/null || true
@@ -766,6 +1049,12 @@ install_target_nvidia_driver() {
         if ! nvidia_driver_ready; then
                 diagnose_nvidia_init_failure
                 fail_if_nvidia_provider_init_failure_seen
+                if nvidia_smi_driver_library_mismatch; then
+                        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
+                                die "nvidia-smi still reports driver/library version mismatch after continuation reboot"
+                        fi
+                        schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver/userland version mismatch detected; rebooting to load the matching kernel module"
+                fi
         fi
 
         current_version="$(current_nvidia_driver_version || true)"
@@ -781,7 +1070,8 @@ install_target_nvidia_driver() {
                 schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver target ${TARGET_NVIDIA_DRIVER_MAJOR} installed but loaded driver is ${current_version:-missing}; rebooting and continuing automatically"
         fi
 
-        nvidia_driver_ready || die "NVIDIA driver ${TARGET_NVIDIA_DRIVER_MAJOR} is installed but nvidia-smi is not working"
+        validate_nvidia_driver_acceptance "${driver_pkg}" "${dkms_pkg}"
+        log "NVIDIA driver acceptance gate passed for ${TARGET_NVIDIA_DRIVER_MAJOR} on kernel $(uname -r)"
 }
 
 install_cuda_toolkit_if_requested() {
@@ -965,21 +1255,155 @@ wait_for_apt() {
         done
 }
 
+dpkg_output_has_updates_parse_error() {
+        local output="$1"
+        printf '%s\n' "${output}" \
+                | grep -Eiq "parsing file ['\"]?/var/lib/dpkg/updates/[0-9]+|/var/lib/dpkg/updates/[0-9]+.*(end of file|field name|parse)"
+}
+
+dpkg_output_has_snapd_postinst_error() {
+        local output="$1"
+        if printf '%s\n' "${output}" | grep -Eiq 'snapd'; then
+                printf '%s\n' "${output}" \
+                        | grep -Eiq 'error processing package snapd|post-installation script|setcap|must be a regular [(]non-symlink[)] file'
+                return $?
+        fi
+
+        return 1
+}
+
+move_corrupt_dpkg_updates_aside() {
+        local backup_dir="/root/dpkg-bad-updates-backup"
+        local stamp update_file moved=0
+
+        log "Detected corrupt dpkg updates queue; moving /var/lib/dpkg/updates/* aside"
+        install -d -m 0700 "${backup_dir}"
+        stamp="$(date '+%Y%m%d-%H%M%S')"
+
+        shopt -s nullglob
+        for update_file in /var/lib/dpkg/updates/*; do
+                [[ -e "${update_file}" ]] || continue
+                mv "${update_file}" "${backup_dir}/${stamp}-$(basename "${update_file}")" || true
+                moved=1
+        done
+        shopt -u nullglob
+
+        if [[ "${moved}" == "1" ]]; then
+                log "Moved corrupt dpkg update files to ${backup_dir}"
+        else
+                log "No dpkg update queue files were present to move"
+        fi
+}
+
+purge_snapd_after_postinst_failure() {
+        log "Detected snapd postinst failure blocking dpkg; purging snapd because CloudDeploy does not require Snap"
+
+        systemctl stop snapd.service snapd.socket snapd.seeded.service >/dev/null 2>&1 || true
+        systemctl disable snapd.service snapd.socket snapd.seeded.service >/dev/null 2>&1 || true
+        dpkg --purge --force-all snapd || true
+}
+
+repair_dpkg_state_if_needed() {
+        if [[ "${CLOUDDEPLOY_DPKG_REPAIR_ACTIVE:-0}" == "1" ]]; then
+                return 0
+        fi
+
+        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=1
+        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+
+        wait_for_apt
+
+        local audit_out audit_rc configure_out configure_rc fix_out fix_rc
+
+        audit_out="$(dpkg --audit 2>&1)" && audit_rc=0 || audit_rc=$?
+        if [[ "${audit_rc}" -ne 0 ]] && dpkg_output_has_updates_parse_error "${audit_out}"; then
+                printf '%s\n' "${audit_out}"
+                move_corrupt_dpkg_updates_aside
+        fi
+
+        configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+        if [[ "${configure_rc}" -eq 0 ]]; then
+                CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                return 0
+        fi
+
+        printf '%s\n' "${configure_out}"
+
+        if dpkg_output_has_updates_parse_error "${configure_out}"; then
+                move_corrupt_dpkg_updates_aside
+                configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+                if [[ "${configure_rc}" -eq 0 ]]; then
+                        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                        return 0
+                fi
+
+                printf '%s\n' "${configure_out}"
+        fi
+
+        if dpkg_output_has_snapd_postinst_error "${configure_out}"; then
+                purge_snapd_after_postinst_failure
+
+                fix_out="$(DEBIAN_FRONTEND=noninteractive apt-get -f install -y 2>&1)" && fix_rc=0 || fix_rc=$?
+                printf '%s\n' "${fix_out}"
+                if [[ "${fix_rc}" -ne 0 ]]; then
+                        log "apt-get -f install failed during snapd repair; rerunning dpkg --configure -a before deciding"
+                fi
+
+                configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+                printf '%s\n' "${configure_out}"
+                if [[ "${configure_rc}" -eq 0 ]]; then
+                        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                        return 0
+                fi
+        fi
+
+        if nvidia_install_output_has_dkms_kernel_failure "${configure_out}"; then
+                log "dpkg is blocked by NVIDIA DKMS configuration; deferring to NVIDIA stale-kernel recovery"
+                CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                return 0
+        fi
+
+        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+        die "dpkg remains broken after conservative repair; see diagnostics above"
+}
+
 apt_update_retry() {
         wait_for_cloud_init
         wait_for_apt
-        DEBIAN_FRONTEND=noninteractive
-        apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20
+
+        local update_out update_rc
+        update_out="$(DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20 2>&1)" && update_rc=0 || update_rc=$?
+        printf '%s\n' "${update_out}"
+
+        if [[ "${update_rc}" -eq 0 ]]; then
+                return 0
+        fi
+
+        if printf '%s\n' "${update_out}" | grep -Eiq 'dpkg was interrupted|dpkg --configure -a'; then
+                log "apt-get update reported interrupted dpkg state; attempting conservative dpkg repair"
+                repair_dpkg_state_if_needed
+                update_out="$(DEBIAN_FRONTEND=noninteractive apt-get update -o Acquire::Retries=6 -o Acquire::http::Timeout=20 2>&1)" && update_rc=0 || update_rc=$?
+                printf '%s\n' "${update_out}"
+        fi
+
+        return "${update_rc}"
 }
 
 apt_install_wait() {
         wait_for_apt
+        repair_dpkg_state_if_needed
         DEBIAN_FRONTEND=noninteractive
         apt-get install -y "$@"
 }
 
 apt_purge_wait() {
         wait_for_apt
+        repair_dpkg_state_if_needed
         apt-get purge -y "$@"
 }
 
@@ -2140,6 +2564,7 @@ KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
 COMPOSITOR_SERVICE="$(service_for_mode)"
 
 log "Installing base packages"
+repair_dpkg_state_if_needed
 apt_update_retry
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
@@ -2787,14 +3212,48 @@ verify_sunshine_kms_config() {
         }
 }
 
-REQUIRE_PLASMASHELL=0
+start_kde_shell_bits() {
+        [[ "${STREAM_MODE}" == "plasma" ]] || return 0
+
+        local kactivitymanagerd="/usr/lib/x86_64-linux-gnu/libexec/kactivitymanagerd"
+        if ! pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1; then
+                if [[ -x "\${kactivitymanagerd}" ]]; then
+                        echo "Starting kactivitymanagerd for Plasma shell readiness..."
+                        "\${kactivitymanagerd}" &
+                else
+                        echo "WARNING: missing required kactivitymanagerd binary: \${kactivitymanagerd}"
+                fi
+        fi
+
+        if [[ -x /usr/bin/plasmashell ]] && ! pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1; then
+                echo "Starting plasmashell for Plasma desktop layer..."
+                /usr/bin/plasmashell &
+        fi
+
+        for _ in \$(seq 1 15); do
+                pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 \
+                        && pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
+                        && return 0
+                sleep 1
+        done
+
+        pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 \
+                || echo "WARNING: kactivitymanagerd was not observed before Sunshine startup."
+        pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
+                || echo "WARNING: plasmashell was not observed before Sunshine startup; continuing so KMS/NVENC validation can decide."
+}
+
 case "${STREAM_MODE}" in
         plasma)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+                export QT_QPA_PLATFORM=wayland
+                export XDG_SESSION_TYPE=wayland
+                export XDG_CURRENT_DESKTOP=KDE
+                export KDE_FULL_SESSION=true
+                export DESKTOP_SESSION=plasmawayland
                 WAIT_PROCESS="kwin_wayland"
-                REQUIRE_PLASMASHELL=1
                 ;;
         kwin|realvt)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
@@ -2820,16 +3279,10 @@ FORCE_ATTEMPTED=0
 SESSION_MARKER_LOGGED=0
 for _ in \$(seq 1 120); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
-                if [[ "${STREAM_MODE}" == "plasma" && "\${REQUIRE_PLASMASHELL}" == "1" ]] \
-                        && ! pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1; then
-                        echo "Waiting for plasmashell before Sunshine..."
-                        sleep 1
-                        continue
-                fi
-                if [[ "${STREAM_MODE}" == "plasma" && "\${REQUIRE_PLASMASHELL}" == "1" ]] \
+                if [[ "${STREAM_MODE}" == "plasma" ]] \
                         && ! pgrep -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session' >/dev/null 2>&1; then
                         if [[ "\${SESSION_MARKER_LOGGED}" == "0" ]]; then
-                                echo "KDE session service marker not observed yet; continuing because plasmashell and KWin DBus/mode validation are authoritative."
+                                echo "KDE session service marker not observed yet; continuing because KWin DBus/mode validation is authoritative."
                                 SESSION_MARKER_LOGGED=1
                         fi
                 fi
@@ -2846,6 +3299,7 @@ for _ in \$(seq 1 120); do
                         fi
                 fi
 
+                start_kde_shell_bits
                 verify_sunshine_kms_config
                 echo "\${WAIT_PROCESS} Wayland session is ready at \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}; starting Sunshine"
                 exec "\${SUNSHINE_BIN}"
