@@ -735,11 +735,13 @@ nvidia_smi_driver_library_mismatch() {
 nvidia_dkms_installed_for_current_kernel() {
         local current_kernel
         current_kernel="$(uname -r)"
-        dkms status 2>/dev/null | grep -Eiq "nvidia.*${current_kernel}.*installed"
+        dkms status 2>/dev/null | grep -Eiq "nvidia(-srv)?/.*${current_kernel}.*installed|nvidia.*${current_kernel}.*installed"
 }
 
-nvidia_recent_boot_provider_failure_seen() {
-        dmesg -T 2>/dev/null | grep -Eiq 'Xid.*62|RmInitAdapter failed|rm_init_adapter failed'
+nvidia_server_dkms_installed_for_current_kernel() {
+        local current_kernel
+        current_kernel="$(uname -r)"
+        dkms status 2>/dev/null | grep -Eiq "nvidia-srv/.*${current_kernel}.*installed|nvidia.*${current_kernel}.*installed"
 }
 
 nvidia_target_dkms_package() {
@@ -887,21 +889,41 @@ prepare_single_kernel_for_nvidia_dkms() {
 
 nvidia_install_output_has_dkms_kernel_failure() {
         local output="$1"
-        local make_log
+        local current_kernel make_log failed_kernel
 
         if printf '%s\n' "${output}" \
                 | grep -Eiq "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}|nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}|DKMS.*failed|No rule to make target ['\`]?modules|bad return status"; then
                 return 0
         fi
 
+        current_kernel="$(uname -r)"
         while IFS= read -r make_log; do
                 if grep -Eiq "No rule to make target ['\`]?modules|bad return status|Error [0-9]+" "${make_log}" 2>/dev/null; then
-                        log "Detected NVIDIA DKMS failure marker in ${make_log}"
-                        return 0
+                        failed_kernel="$(printf '%s\n' "${make_log}" | sed -nE 's#.*kernel-([^/]+)/.*#\1#p; s#.*build/([^/]+)/.*#\1#p' | head -n1)"
+                        if [[ -z "${failed_kernel}" || "${failed_kernel}" != "${current_kernel}" ]]; then
+                                log "Detected NVIDIA DKMS failure marker in ${make_log}"
+                                return 0
+                        fi
                 fi
         done < <(find /var/lib/dkms -type f -name make.log -path '*nvidia*' 2>/dev/null || true)
 
         return 1
+}
+
+require_nvidia_recovery_package_state() {
+        local current_kernel
+        current_kernel="$(uname -r)"
+
+        if ! dpkg_package_configured_ii "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                || ! dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"; then
+                print_nvidia_driver_diagnostics
+                die "NVIDIA recovery did not leave nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server and nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server configured as ii"
+        fi
+
+        if ! nvidia_server_dkms_installed_for_current_kernel; then
+                print_nvidia_driver_diagnostics
+                die "NVIDIA recovery did not install nvidia-srv DKMS for ${current_kernel}"
+        fi
 }
 
 recover_nvidia_dkms_after_kernel_failure() {
@@ -910,6 +932,7 @@ recover_nvidia_dkms_after_kernel_failure() {
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a
         DEBIAN_FRONTEND=noninteractive apt-get -f install -y
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+        require_nvidia_recovery_package_state
 }
 
 validate_nvidia_driver_acceptance() {
@@ -942,10 +965,7 @@ validate_nvidia_driver_acceptance() {
                 die "NVIDIA driver packages and DKMS are installed, but nvidia-smi is not working"
         fi
 
-        if nvidia_recent_boot_provider_failure_seen; then
-                print_nvidia_driver_diagnostics
-                die "$(provider_gpu_failure_message)"
-        fi
+        detect_provider_gpu_init_failure
 }
 
 install_target_nvidia_driver() {
@@ -1048,12 +1068,16 @@ install_target_nvidia_driver() {
 
         if ! nvidia_driver_ready; then
                 diagnose_nvidia_init_failure
-                fail_if_nvidia_provider_init_failure_seen
+                detect_provider_gpu_init_failure
                 if nvidia_smi_driver_library_mismatch; then
                         if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "nvidia-driver" ]]; then
                                 die "nvidia-smi still reports driver/library version mismatch after continuation reboot"
                         fi
-                        schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver/userland version mismatch detected; rebooting to load the matching kernel module"
+                        if dpkg_package_configured_ii "${dkms_pkg}" \
+                                && dpkg_package_configured_ii "${driver_pkg}" \
+                                && nvidia_dkms_installed_for_current_kernel; then
+                                schedule_reboot_for_continuation "nvidia-driver" "NVIDIA driver/userland version mismatch detected; rebooting to load the matching kernel module"
+                        fi
                 fi
         fi
 
