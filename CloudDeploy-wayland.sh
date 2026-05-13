@@ -1250,14 +1250,14 @@ install_sunshine_from_fork_if_requested() {
                         [[ -d "${SUNSHINE_BUILD_DIR}/build/assets" ]] || die "Sunshine fork build assets missing: ${SUNSHINE_BUILD_DIR}/build/assets"
                         install -d -m 0755 /usr/local/assets
                         cp -a "${SUNSHINE_BUILD_DIR}/build/assets/." /usr/local/assets/
+                        install -d -m 0755 /usr/local/assets/web
+                        if [[ -d /usr/share/sunshine/web ]]; then
+                                cp -a /usr/share/sunshine/web/. /usr/local/assets/web/
+                        else
+                                log "WARNING: Packaged Sunshine web UI source missing: /usr/share/sunshine/web"
+                        fi
                         chown -R root:root /usr/local/assets
                         [[ -f /usr/local/assets/apps.json ]] || die "Sunshine runtime asset missing after install: /usr/local/assets/apps.json"
-
-                        [[ -d /usr/share/sunshine/web ]] || die "Packaged Sunshine web UI missing: /usr/share/sunshine/web"
-                        rm -rf /usr/local/assets/web
-                        install -d -m 0755 /usr/local/assets/web
-                        cp -a /usr/share/sunshine/web/. /usr/local/assets/web/
-                        chown -R root:root /usr/local/assets/web
                         [[ -f /usr/local/assets/web/index.html ]] || die "Sunshine web UI asset missing after install: /usr/local/assets/web/index.html"
                         find /usr/local/assets/web -type f \( -name '*.js' -o -name '*.css' \) 2>/dev/null | grep -q . \
                                 || die "Sunshine web UI assets missing built JS/CSS under /usr/local/assets/web"
@@ -1270,6 +1270,10 @@ install_sunshine_from_fork_if_requested() {
 
 find_nvidia_vulkan_icd() {
         find /usr/share/vulkan/icd.d -name '*nvidia*_icd.json' 2>/dev/null | head -n1 || true
+}
+
+find_nvidia_egl_vendor_json() {
+        find /usr/share/glvnd/egl_vendor.d -name '*nvidia*.json' 2>/dev/null | head -n1 || true
 }
 
 library_available_to_loader() {
@@ -1293,7 +1297,7 @@ EOF
 }
 
 ensure_nvidia_egl_vulkan_runtime_config() {
-        local nvidia_icd
+        local nvidia_egl_json nvidia_icd
 
         log "Ensuring NVIDIA EGL external platform and Vulkan runtime configuration for Sunshine"
         install -d -m 0755 /usr/share/egl/egl_external_platform.d
@@ -1314,14 +1318,18 @@ ensure_nvidia_egl_vulkan_runtime_config() {
                 log "WARNING: libnvidia-egl-wayland.so.1 was not found; Wayland external platform JSON was not written"
         fi
 
+        nvidia_egl_json="$(find_nvidia_egl_vendor_json)"
+        [[ -n "${nvidia_egl_json}" ]] || die "Could not find NVIDIA EGL vendor JSON under /usr/share/glvnd/egl_vendor.d"
+
         nvidia_icd="$(find_nvidia_vulkan_icd)"
-        nvidia_icd="${nvidia_icd:-/usr/share/vulkan/icd.d/nvidia_icd.json}"
+        [[ -n "${nvidia_icd}" ]] || die "Could not find NVIDIA Vulkan ICD JSON under /usr/share/vulkan/icd.d"
+
         install -d -m 0755 /etc/systemd/system/sunshine-headless.service.d
         cat > /etc/systemd/system/sunshine-headless.service.d/20-nvidia-vulkan-egl.conf <<EOF
 [Service]
 Environment=GBM_BACKEND=nvidia-drm
 Environment=EGL_PLATFORM=gbm
-Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=${nvidia_egl_json}
 Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 Environment=VK_ICD_FILENAMES=${nvidia_icd}
@@ -2196,10 +2204,10 @@ refresh_streaming_log_markers() {
                 | grep -Ei 'sample_all_black=false|all_black=false|sample_nonblack=([1-9][0-9]*)' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_EGL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -Ei 'EGL:.*NVIDIA|EGL vendor.*NVIDIA' \
+                | grep -Ei 'EGL.*NVIDIA|EGL vendor.*NVIDIA' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_GL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -Ei 'GL: renderer:.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
+                | grep -Ei 'GL: renderer:.*NVIDIA|GL renderer.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_FAILURE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'sample_all_black=true|llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
