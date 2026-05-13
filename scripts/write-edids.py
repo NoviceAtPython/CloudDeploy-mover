@@ -99,7 +99,9 @@ def base_block(name: str, preferred_timing: bytes) -> bytes:
 
 def cta_block(vics, hdr=False, native_vic=None) -> bytes:
     data = bytearray()
-    svds = [(0x80 | vic) if vic == native_vic else vic for vic in vics]
+    # Extended CTA VICs such as 118 are already > 0x7f. OR-ing the native
+    # bit would turn 118 into invalid VIC 246, so keep the VIC values literal.
+    svds = list(vics)
     data.extend([0x40 | len(svds), *svds])
     if hdr:
         data.extend([0x73, 0x05, 0xC0, 0x00])

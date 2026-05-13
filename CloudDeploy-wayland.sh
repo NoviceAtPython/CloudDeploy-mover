@@ -16,7 +16,7 @@ CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-cuda-toolkit}"
 FORCE_DRIVER_UPGRADE="${FORCE_DRIVER_UPGRADE:-1}"
 # Safe/stable deploys use the packaged .deb by default. Fresh VMs may still
 # need SUNSHINE_SOURCE_MODE=fork until the CloudDeploy pairing/stream fixes are upstreamed.
-SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE:-deb}"
+SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE:-fork}"
 SUNSHINE_FORK_REPO="${SUNSHINE_FORK_REPO:-https://github.com/NoviceAtPython/Sunshine.git}"
 SUNSHINE_DIAGNOSTIC_FORK_BRANCH="${SUNSHINE_DIAGNOSTIC_FORK_BRANCH:-codex/sunshine-pairing-diagnostics}"
 SUNSHINE_CLEAN_FORK_BRANCH="${SUNSHINE_CLEAN_FORK_BRANCH:-clouddeploy-clean-pairing-stream-fix}"
@@ -42,7 +42,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="17-driver-cleanup-provider-diagnostics"
+SCRIPT_VERSION="18-final-kwin-plasma-sunshine-fork"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -164,10 +164,7 @@ select_phase2_edid_file() {
 
 service_for_mode() {
         case "${STREAM_MODE}" in
-                plasma)
-                        echo "plasma-realvt.service"
-                        ;;
-                kwin|realvt)
+                plasma|kwin|realvt)
                         echo "kwin-realvt.service"
                         ;;
                 weston)
@@ -282,7 +279,7 @@ strip_clouddeploy_args_from_cmdline() {
         read -r -a tokens <<<"${cmdline}"
         for token in "${tokens[@]}"; do
                 case "${token}" in
-                        drm.edid_firmware=*edid/virtual-*.bin|video=${FORCED_CONNECTOR}:e|nvidia-drm.modeset=*|nvidia-drm.fbdev=*)
+                        drm.edid_firmware=*edid/virtual-*.bin|video=${FORCED_CONNECTOR}:e|video=DP-2:d|nvidia-drm.modeset=*|nvidia-drm.fbdev=*)
                                 ;;
                         *)
                                 kept+=("${token}")
@@ -307,13 +304,14 @@ sanitize_grub_default_cmdline() {
 write_phase2_grub_override() {
         local arg_edid="$1"
         local arg_video="$2"
-        local arg_modeset="$3"
-        local arg_fbdev="$4"
+        local arg_video_disable="$3"
+        local arg_modeset="$4"
+        local arg_fbdev="$5"
 
         install -d -m 0755 /etc/default/grub.d
 
         cat > "${GRUB_OVERRIDE_FILE}" <<EOF
-GRUB_CMDLINE_LINUX_DEFAULT="${arg_edid} ${arg_video} ${arg_modeset} ${arg_fbdev}"
+GRUB_CMDLINE_LINUX_DEFAULT="${arg_edid} ${arg_video} ${arg_video_disable} ${arg_modeset} ${arg_fbdev}"
 EOF
 }
 
@@ -321,11 +319,13 @@ cmdline_has_required_phase2_args() {
         local edid_file="$1"
         local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
         local arg_video="video=${FORCED_CONNECTOR}:e"
+        local arg_video_disable="video=DP-2:d"
         local arg_modeset="nvidia-drm.modeset=1"
         local arg_fbdev="nvidia-drm.fbdev=1"
 
         grep -qF "${arg_edid}" /proc/cmdline \
                 && grep -qF "${arg_video}" /proc/cmdline \
+                && grep -qF "${arg_video_disable}" /proc/cmdline \
                 && grep -qF "${arg_modeset}" /proc/cmdline \
                 && grep -qF "${arg_fbdev}" /proc/cmdline
 }
@@ -401,11 +401,13 @@ ensure_phase2_kernel_args() {
         local edid_file="$1"
         local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
         local arg_video="video=${FORCED_CONNECTOR}:e"
+        local arg_video_disable="video=DP-2:d"
         local arg_modeset="nvidia-drm.modeset=1"
         local arg_fbdev="nvidia-drm.fbdev=1"
 
         if grep -qF "${arg_edid}" /proc/cmdline \
                 && grep -qF "${arg_video}" /proc/cmdline \
+                && grep -qF "${arg_video_disable}" /proc/cmdline \
                 && grep -qF "${arg_modeset}" /proc/cmdline \
                 && grep -qF "${arg_fbdev}" /proc/cmdline; then
                 log "Kernel cmdline already contains required EDID and DRM args"
@@ -417,7 +419,8 @@ ensure_phase2_kernel_args() {
         fi
 
         log "Applying GRUB drop-in kernel args for ${FORCED_CONNECTOR} using ${edid_file}"
-        write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_modeset}" "${arg_fbdev}"
+        write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_video_disable}" "${arg_modeset}" "${arg_fbdev}"
+        update-initramfs -u
         update-grub
 
         write_clouddeploy_env_file
@@ -460,6 +463,11 @@ cuda_version_line() {
         elif command -v nvcc >/dev/null 2>&1; then
                 nvcc --version 2>/dev/null | grep -E 'release|Cuda compilation tools' | tail -n1 || true
         fi
+}
+
+tailscale_ipv4() {
+        command -v tailscale >/dev/null 2>&1 || return 0
+        tailscale ip -4 2>/dev/null | head -n1 || true
 }
 
 find_qdbus_bin() {
@@ -841,6 +849,8 @@ install_sunshine_from_fork_if_requested() {
                         install_sunshine_deb
                         apt_install_wait \
                                 git cmake ninja-build build-essential pkg-config python3 nodejs npm \
+                                libvulkan-dev vulkan-tools vulkan-validationlayers glslang-tools glslc \
+                                libpipewire-0.3-dev doxygen graphviz \
                                 libssl-dev libcurl4-openssl-dev libcap-dev libdrm-dev libevdev-dev libgbm-dev \
                                 libminiupnpc-dev libnotify-dev libnuma-dev libopus-dev libpulse-dev libva-dev libvdpau-dev \
                                 libwayland-dev libx11-dev libxcb1-dev libxcb-shm0-dev libxcb-xfixes0-dev libxfixes-dev \
@@ -871,6 +881,18 @@ install_sunshine_from_fork_if_requested() {
                         fi
 
                         git -C "${SUNSHINE_BUILD_DIR}" submodule update --init --recursive
+                        log "Applying Ubuntu 24.04 Doxygen compatibility patch for Sunshine fork build"
+                        local doxyconfig_file
+                        for doxyconfig_file in \
+                                "${SUNSHINE_BUILD_DIR}/third-party/doxyconfig/CMakeLists.txt" \
+                                "${SUNSHINE_BUILD_DIR}/third-party/libdisplaydevice/third-party/doxyconfig/CMakeLists.txt" \
+                                "${SUNSHINE_BUILD_DIR}/third-party/tray/third-party/doxyconfig/CMakeLists.txt"
+                        do
+                                if [[ -f "${doxyconfig_file}" ]]; then
+                                        sed -i 's/find_package(Doxygen 1[.]10 REQUIRED dot)/find_package(Doxygen 1.9 REQUIRED dot)/g' "${doxyconfig_file}"
+                                fi
+                        done
+
                         local -a cmake_cuda_args
                         cmake_cuda_args=()
                         if [[ -d /usr/local/cuda ]]; then
@@ -893,6 +915,12 @@ install_sunshine_from_fork_if_requested() {
                         if command -v setcap >/dev/null 2>&1; then
                                 setcap cap_sys_admin,cap_sys_nice+ep "${SUNSHINE_INSTALL_BIN}" || true
                         fi
+
+                        [[ -d "${SUNSHINE_BUILD_DIR}/build/assets" ]] || die "Sunshine fork build assets missing: ${SUNSHINE_BUILD_DIR}/build/assets"
+                        install -d -m 0755 /usr/local/assets
+                        cp -a "${SUNSHINE_BUILD_DIR}/build/assets/." /usr/local/assets/
+                        chown -R root:root /usr/local/assets
+                        [[ -f /usr/local/assets/apps.json ]] || die "Sunshine runtime asset missing after install: /usr/local/assets/apps.json"
                         ;;
                 *)
                         die "Unsupported SUNSHINE_SOURCE_MODE='${SUNSHINE_SOURCE_MODE}'. Supported now: deb, fork."
@@ -956,7 +984,9 @@ apt_purge_wait() {
 }
 
 write_sunshine_config() {
+        local ts_ip
         install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
+        ts_ip="$(tailscale_ipv4 || true)"
 
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<EOF
 min_log_level = debug
@@ -972,6 +1002,9 @@ stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 EOF
+        if [[ -n "${ts_ip}" ]]; then
+                printf 'csrf_allowed_origins = https://%s:47990\n' "${ts_ip}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+        fi
         chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 }
 
@@ -981,6 +1014,10 @@ install_clouddeploy_helpers() {
 set -euo pipefail
 
 ENV_FILE="/etc/clouddeploy-wayland.env"
+OVERRIDE_SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE-}"
+OVERRIDE_SUNSHINE_PASS="${SUNSHINE_PASS-}"
+OVERRIDE_TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY-}"
+OVERRIDE_SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS-}"
 OVERRIDE_INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS-}"
 
 if [[ -f "${ENV_FILE}" ]]; then
@@ -990,6 +1027,18 @@ if [[ -f "${ENV_FILE}" ]]; then
         set +a
 fi
 
+if [[ -n "${OVERRIDE_SUNSHINE_SOURCE_MODE}" ]]; then
+        export SUNSHINE_SOURCE_MODE="${OVERRIDE_SUNSHINE_SOURCE_MODE}"
+fi
+if [[ -n "${OVERRIDE_SUNSHINE_PASS}" ]]; then
+        export SUNSHINE_PASS="${OVERRIDE_SUNSHINE_PASS}"
+fi
+if [[ -n "${OVERRIDE_TAILSCALE_AUTHKEY}" ]]; then
+        export TAILSCALE_AUTHKEY="${OVERRIDE_TAILSCALE_AUTHKEY}"
+fi
+if [[ -n "${OVERRIDE_SUNSHINE_BUILD_JOBS}" ]]; then
+        export SUNSHINE_BUILD_JOBS="${OVERRIDE_SUNSHINE_BUILD_JOBS}"
+fi
 if [[ -n "${OVERRIDE_INSTALL_OPTIONAL_APPS}" ]]; then
         export INSTALL_OPTIONAL_APPS="${OVERRIDE_INSTALL_OPTIONAL_APPS}"
 fi
@@ -997,7 +1046,13 @@ fi
 REPO_DIR="${CLOUDDEPLOY_REPO_DIR:-/home/user/CloudDeploy-mover}"
 
 cd "${REPO_DIR}"
-exec bash ./CloudDeploy-wayland.sh
+exec env \
+        SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE-}" \
+        SUNSHINE_PASS="${SUNSHINE_PASS-}" \
+        TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY-}" \
+        SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS-}" \
+        INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS-}" \
+        bash ./CloudDeploy-wayland.sh
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-run
 
@@ -1059,7 +1114,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'INSTALL_CUDA_TOOLKIT=%q\n' "1"
         printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "cuda-toolkit"
         printf 'FORCE_DRIVER_UPGRADE=%q\n' "1"
-        printf 'SUNSHINE_SOURCE_MODE=%q\n' "deb"
+                        printf 'SUNSHINE_SOURCE_MODE=%q\n' "fork"
         printf 'SUNSHINE_FORK_REPO=%q\n' "https://github.com/NoviceAtPython/Sunshine.git"
         printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
         printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "clouddeploy-clean-pairing-stream-fix"
@@ -1130,11 +1185,7 @@ if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
 fi
 
 case "${STREAM_MODE}" in
-        plasma)
-                COMPOSITOR_SERVICE="plasma-realvt.service"
-                COMPOSITOR_LOG_UNIT="plasma-realvt.service"
-                ;;
-        kwin|realvt)
+        plasma|kwin|realvt)
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 COMPOSITOR_LOG_UNIT="kwin-realvt.service"
                 ;;
@@ -1154,12 +1205,16 @@ esac
 
 echo "Performing exact known-good clean reset before final validation"
 
-systemctl stop sunshine-headless.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+systemctl stop sunshine-headless.service sunshine-direct.service sunshine-manual.service sunshine-wayland-nodbus.service plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service plasma-kms-session.service gamescope-session.service 2>/dev/null || true
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
 
 rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
 
 install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine"
+TS_IP=""
+if command -v tailscale >/dev/null 2>&1; then
+        TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
+fi
 cat > "${HOME_DIR}/.config/sunshine/sunshine.conf" <<CONF
 min_log_level = debug
 encoder = ${SUNSHINE_ENCODER}
@@ -1174,16 +1229,16 @@ stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 CONF
+if [[ -n "${TS_IP}" ]]; then
+        printf 'csrf_allowed_origins = https://%s:47990\n' "${TS_IP}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+fi
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 
 systemctl reset-failed plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
 
 systemctl start "${COMPOSITOR_SERVICE}"
 
-if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
-        sleep 12
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh
-elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         sleep 8
         /usr/local/bin/clouddeploy-force-kwin-mode.sh
         systemctl restart plasma-shell-realvt.service || true
@@ -1517,10 +1572,11 @@ refresh_streaming_log_markers() {
 
         case "${STREAM_MODE}" in
                 plasma)
-                        LAST_WESTON_LOG="$(journalctl -u plasma-realvt.service -n 260 --no-pager 2>/dev/null || true)"
+                        LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
                         local support_info
                         support_info="$(kwin_support_information || true)"
                         if pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 \
+                                && pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 \
                                 && pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
                                 && [[ -S "${RUNTIME_DIR}/${KWIN_DISPLAY}" ]] \
                                 && kwin_support_reports_target_mode "${support_info}"; then
@@ -1589,6 +1645,8 @@ print_streaming_diagnostics() {
         echo "=== Compositor processes ==="
         pgrep -a -u "${HEADLESS_USER}" -x weston || true
         pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland || true
+        pgrep -a -u "${HEADLESS_USER}" -x Xwayland || true
+        pgrep -a -u "${HEADLESS_USER}" -f 'kactivitymanagerd' || true
         pgrep -a -u "${HEADLESS_USER}" -x plasmashell || true
         pgrep -a -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session|startplasma-wayland' || true
         echo
@@ -1738,8 +1796,7 @@ validate_streaming_stack_ready() {
                 die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
         fi
         case "${STREAM_MODE}" in
-                plasma) compositor_service="plasma-realvt.service" ;;
-                kwin|realvt) compositor_service="kwin-realvt.service" ;;
+                plasma|kwin|realvt) compositor_service="kwin-realvt.service" ;;
                 weston) compositor_service="weston-kms-session.service" ;;
                 *) compositor_service="$(service_for_mode)" ;;
         esac
@@ -1751,6 +1808,31 @@ validate_streaming_stack_ready() {
         if ! systemctl is-active --quiet sunshine-headless.service; then
                 print_server_validation_diagnostics
                 die "sunshine-headless.service failed to start"
+        fi
+
+        if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+                pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 || {
+                        print_server_validation_diagnostics
+                        die "kwin_wayland is not running"
+                }
+                pgrep -u "${HEADLESS_USER}" -x Xwayland >/dev/null 2>&1 || {
+                        print_server_validation_diagnostics
+                        die "Xwayland is not running under KWin"
+                }
+                pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 || {
+                        print_server_validation_diagnostics
+                        die "kactivitymanagerd is not running"
+                }
+                pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 || {
+                        print_server_validation_diagnostics
+                        die "plasmashell is not running"
+                }
+                if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
+                        pgrep -u "${HEADLESS_USER}" -f 'sunshine-clouddeploy' >/dev/null 2>&1 || {
+                                print_server_validation_diagnostics
+                                die "sunshine-clouddeploy is not running"
+                        }
+                fi
         fi
 
         if ! wait_for_streaming_log_markers; then
@@ -1790,19 +1872,34 @@ print_driver_cuda_sunshine_summary() {
 
 print_final_validation_summary() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
-        local edid_file cmdline_args
+        local edid_file cmdline_args ts_ip web_status
 
         edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
         cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
-                | grep -E "drm[.]edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}|video=${FORCED_CONNECTOR}:e|nvidia-drm[.]modeset=1|nvidia-drm[.]fbdev=1" \
+                | grep -E "drm[.]edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}|video=${FORCED_CONNECTOR}:e|video=DP-2:d|nvidia-drm[.]modeset=1|nvidia-drm[.]fbdev=1" \
                 | tr '\n' ' ' || true)"
+        ts_ip="$(tailscale_ipv4 || true)"
+        web_status="not checked"
+        if [[ -n "${ts_ip}" ]]; then
+                if curl -kfsS --connect-timeout 3 "https://${ts_ip}:47990" >/dev/null 2>&1; then
+                        web_status="reachable at https://${ts_ip}:47990"
+                else
+                        web_status="not reachable at https://${ts_ip}:47990"
+                fi
+        fi
 
         echo "EDID file active: ${edid_file:-unknown}"
         echo "Kernel cmdline EDID/NVIDIA args: ${cmdline_args:-missing expected args}"
         echo "KWin reported geometry/refresh: ${KNOWN_WESTON_MODE_LINE:-not observed}"
+        echo "Process kwin_wayland: $(pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland | head -n1 || echo not observed)"
+        echo "Process Xwayland: $(pgrep -a -u "${HEADLESS_USER}" -x Xwayland | head -n1 || echo not observed)"
+        echo "Process kactivitymanagerd: $(pgrep -a -u "${HEADLESS_USER}" -f 'kactivitymanagerd' | head -n1 || echo not observed)"
+        echo "Process plasmashell: $(pgrep -a -u "${HEADLESS_USER}" -x plasmashell | head -n1 || echo not observed)"
+        echo "Process sunshine-clouddeploy: $(pgrep -a -u "${HEADLESS_USER}" -f 'sunshine-clouddeploy' | head -n1 || echo not observed)"
         echo "Sunshine desktop resolution: ${KNOWN_SUNSHINE_RESOLUTION_LINE:-not observed}"
         echo "Sunshine KMS monitor found: ${KNOWN_SUNSHINE_KMS_LINE:-not observed}"
         echo "NVENC initialized: ${KNOWN_SUNSHINE_NVENC_LINE:-not observed}"
+        echo "Sunshine web UI over Tailscale: ${web_status}"
         echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
 
@@ -1908,8 +2005,6 @@ install_optional_apps_nonfatal() {
 # =========================
 require_root
 
-install_clouddeploy_helpers
-
 if [[ -z "${SUNSHINE_PASS}" ]]; then
         log "SUNSHINE_PASS was not provided; Sunshine credentials will be left unchanged/default."
 fi
@@ -1944,15 +2039,11 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         fi
 
         install_clouddeploy_helpers
-        if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
-                systemctl enable plasma-realvt.service sunshine-headless.service || true
-        elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+        if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
                 systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service || true
         else
                 systemctl enable weston-kms-session.service sunshine-headless.service || true
         fi
-        known_good_clean_reset_streaming_stack
-
         if command -v tailscale >/dev/null 2>&1; then
                 if ! tailscale status >/dev/null 2>&1; then
                         if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
@@ -1963,6 +2054,8 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
                         fi
                 fi
         fi
+
+        known_good_clean_reset_streaming_stack
 
         validate_streaming_stack_ready
         systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
@@ -2130,8 +2223,8 @@ esac
 
 case "${STREAM_MODE}" in
         plasma)
-                log "STREAM_MODE=plasma: full Plasma Wayland session on real VT${KWIN_VTNR}"
-                COMPOSITOR_SERVICE="plasma-realvt.service"
+                log "STREAM_MODE=plasma: reliable KWin real-VT session plus Plasma shell on forced ${FORCED_CONNECTOR}"
+                COMPOSITOR_SERVICE="kwin-realvt.service"
                 ;;
         kwin|realvt)
                 log "STREAM_MODE=${STREAM_MODE}: bare KWin Wayland DRM fallback on real VT${KWIN_VTNR}"
@@ -2440,16 +2533,31 @@ export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
 
 export XDG_SESSION_TYPE=wayland
+export XDG_SESSION_CLASS=user
 export XDG_SESSION_DESKTOP=KDE
 export XDG_CURRENT_DESKTOP=KDE
+export DESKTOP_SESSION=plasmawayland
 export KDE_FULL_SESSION=true
 
 export QT_QPA_PLATFORM=wayland
 export GDK_BACKEND=wayland,x11
 export MOZ_ENABLE_WAYLAND=1
 
+KACTIVITYMANAGERD="/usr/lib/x86_64-linux-gnu/libexec/kactivitymanagerd"
+[[ -x "\${KACTIVITYMANAGERD}" ]] || {
+        echo "Missing required kactivitymanagerd binary: \${KACTIVITYMANAGERD}" >&2
+        exit 1
+}
+
 for _ in \$(seq 1 90); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
+                if ! pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1; then
+                        "\${KACTIVITYMANAGERD}" &
+                        for __ in \$(seq 1 20); do
+                                pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 && break
+                                sleep 0.5
+                        done
+                fi
                 exec /usr/bin/plasmashell
         fi
 
@@ -2501,6 +2609,124 @@ EOF
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/weston.ini"
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/start-weston-kms.sh"
 chmod 0755 "${HOME_DIR}/.local/bin/start-weston-kms.sh"
+
+cat > /usr/local/bin/clouddeploy-wait-sunshine-session.sh <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+export HOME="${HOME_DIR}"
+export USER="${HEADLESS_USER}"
+export LOGNAME="${HEADLESS_USER}"
+
+find_qdbus_bin() {
+        local candidate
+        for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
+                if command -v "\${candidate}" >/dev/null 2>&1; then
+                        command -v "\${candidate}"
+                        return 0
+                elif [[ -x "\${candidate}" ]]; then
+                        printf '%s\n' "\${candidate}"
+                        return 0
+                fi
+        done
+        return 1
+}
+
+kwin_mode_ready() {
+        local qdbus_bin info block geometry refresh
+        qdbus_bin="\$(find_qdbus_bin || true)"
+        [[ -n "\${qdbus_bin}" ]] || return 1
+        info="\$("\${qdbus_bin}" org.kde.KWin /KWin org.kde.KWin.supportInformation 2>/dev/null || true)"
+        block="\$(printf '%s\n' "\${info}" | awk -v connector="${FORCED_CONNECTOR}" '
+                /^Name:/ {
+                        if (in_block) exit
+                        in_block = (\$0 ~ ("Name:[[:space:]]*" connector "\$"))
+                }
+                in_block { print }
+        ')"
+        geometry="\$(printf '%s\n' "\${block}" | grep -E 'Geometry:' | tail -n1 || true)"
+        refresh="\$(printf '%s\n' "\${block}" | sed -nE 's/.*Refresh Rate:[[:space:]]*([0-9.]+).*/\\1/p' | tail -n1)"
+        [[ "\${geometry}" == *"Geometry: 0,0,${TARGET_WIDTH}x${TARGET_HEIGHT}"* \
+                || "\${geometry}" == *"Geometry: 0,0 ${TARGET_WIDTH}x${TARGET_HEIGHT}"* ]] || return 1
+        [[ "\${refresh}" =~ ^(119|120) ]] || return 1
+}
+
+verify_sunshine_kms_config() {
+        local conf="${HOME_DIR}/.config/sunshine/sunshine.conf"
+        grep -Eq '^capture[[:space:]]*=[[:space:]]*kms[[:space:]]*$' "\${conf}" || {
+                echo "Sunshine config is not using capture = kms" >&2
+                exit 1
+        }
+        grep -Eq '^adapter_name[[:space:]]*=[[:space:]]*/dev/dri/card[0-9]+[[:space:]]*$' "\${conf}" || {
+                echo "Sunshine config is not using a DRM card node adapter_name" >&2
+                exit 1
+        }
+}
+
+case "${STREAM_MODE}" in
+        plasma|kwin|realvt)
+                export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
+                export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
+                export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
+                export QT_QPA_PLATFORM=wayland
+                export XDG_SESSION_TYPE=wayland
+                export XDG_CURRENT_DESKTOP=KDE
+                WAIT_PROCESS="kwin_wayland"
+                ;;
+        weston)
+                export XDG_RUNTIME_DIR="/tmp/runtime-${HEADLESS_USER}"
+                export WAYLAND_DISPLAY="${WESTON_WAYLAND_DISPLAY}"
+                WAIT_PROCESS="weston"
+                ;;
+        *)
+                echo "Unsupported STREAM_MODE for Sunshine wait: ${STREAM_MODE}" >&2
+                exit 1
+                ;;
+esac
+
+for _ in \$(seq 1 120); do
+        if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
+                break
+        fi
+        echo "Waiting for \${WAIT_PROCESS} Wayland socket \${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}..."
+        sleep 1
+done
+
+[[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] || {
+        echo "Wayland socket never became ready for Sunshine" >&2
+        exit 1
+}
+
+if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+
+        for _ in \$(seq 1 60); do
+                kwin_mode_ready && break
+                echo "Waiting for KWin to report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish..."
+                sleep 1
+        done
+        kwin_mode_ready || {
+                echo "KWin did not report target 4K120 mode before Sunshine." >&2
+                exit 1
+        }
+
+        for _ in \$(seq 1 45); do
+                pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 \
+                        && pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 \
+                        && break
+                echo "Waiting briefly for kactivitymanagerd and plasmashell..."
+                sleep 1
+        done
+
+        pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1 || echo "kactivitymanagerd not observed; continuing after bounded wait."
+        pgrep -u "${HEADLESS_USER}" -x plasmashell >/dev/null 2>&1 || echo "plasmashell not observed; continuing after bounded wait."
+fi
+
+verify_sunshine_kms_config
+echo "Wayland/KMS session is ready for Sunshine."
+EOF
+
+chmod 0755 /usr/local/bin/clouddeploy-wait-sunshine-session.sh
 
 cat > "${HOME_DIR}/.local/bin/start-sunshine-headless.sh" <<EOF
 #!/usr/bin/env bash
@@ -2734,7 +2960,7 @@ systemctl --no-pager --full status \
 
 echo
 echo "=== Processes ==="
-pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|plasmashell|startplasma-wayland|ksmserver|kded5|kded6|plasma_session|weston|sunshine' || true
+pgrep -a -u "${HEADLESS_USER}" -f 'kwin_wayland|Xwayland|kactivitymanagerd|plasmashell|startplasma-wayland|ksmserver|kded5|kded6|plasma_session|weston|sunshine|sunshine-clouddeploy' || true
 
 echo
 echo "=== KWin environment ==="
@@ -2970,9 +3196,7 @@ cat > /etc/systemd/system/sunshine-headless.service <<EOF
 [Unit]
 Description=Sunshine on CloudDeploy NVIDIA Wayland KMS
 After=${COMPOSITOR_SERVICE} network-online.target tailscaled.service
-Wants=network-online.target tailscaled.service
-Requires=${COMPOSITOR_SERVICE}
-PartOf=${COMPOSITOR_SERVICE}
+Wants=network-online.target tailscaled.service ${COMPOSITOR_SERVICE}
 
 [Service]
 User=${HEADLESS_USER}
@@ -2986,8 +3210,14 @@ Environment=LOGNAME=${HEADLESS_USER}
 Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
 Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+Environment=SUNSHINE_STREAM_DIAG_REUSE_AUDIO_PEER=1
+Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
+Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
+Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
+Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
 
-ExecStart=${HOME_DIR}/.local/bin/start-sunshine-headless.sh
+ExecStartPre=/usr/local/bin/clouddeploy-wait-sunshine-session.sh
+ExecStart=${SUNSHINE_RUNTIME_BIN} ${HOME_DIR}/.config/sunshine/sunshine.conf
 
 Restart=on-failure
 RestartSec=5
@@ -3000,6 +3230,9 @@ EOF
 
 log "Stopping old compositor/session bits"
 systemctl stop \
+        sunshine-direct.service \
+        sunshine-manual.service \
+        sunshine-wayland-nodbus.service \
         plasma-kms-session.service \
         plasma-realvt.service \
         kwin-realvt.service \
@@ -3009,11 +3242,14 @@ systemctl stop \
         2>/dev/null || true
 
 systemctl disable \
+        sunshine-direct.service \
+        sunshine-manual.service \
+        sunshine-wayland-nodbus.service \
         plasma-kms-session.service \
         plasma-realvt.service \
         2>/dev/null || true
 
-pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
+pkill -9 -u "${HEADLESS_USER}" -f 'kwin_wayland|kwin_wayland_wrapper|plasmashell|kactivitymanagerd|plasma_session|plasma_waitforname|ksmserver|ksplashqml|startplasma-wayland|kdeinit5|klauncher|kded|sunshine|weston|Xwayland' 2>/dev/null || true
 
 rm -f "${RUNTIME_DIR}"/wayland-* /tmp/runtime-"${HEADLESS_USER}"/wayland-* 2>/dev/null || true
 
@@ -3031,15 +3267,7 @@ if systemctl list-unit-files | grep -q '^tailscaled'; then
         systemctl enable tailscaled || true
 fi
 
-if [[ "${COMPOSITOR_SERVICE}" == "plasma-realvt.service" ]]; then
-        systemctl enable plasma-realvt.service sunshine-headless.service
-
-        systemctl restart plasma-realvt.service
-        sleep 12
-
-        /usr/local/bin/clouddeploy-force-kwin-mode.sh
-        systemctl restart sunshine-headless.service
-elif [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
+if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
         systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service
 
         systemctl restart kwin-realvt.service
