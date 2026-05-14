@@ -572,8 +572,14 @@ repair_initramfs_tools_config() {
 }
 
 update_initramfs_clouddeploy() {
+        repair_dpkg_state_if_needed
         repair_initramfs_tools_config
         DEBIAN_FRONTEND=noninteractive update-initramfs "$@"
+}
+
+update_grub_clouddeploy() {
+        repair_dpkg_state_if_needed
+        update-grub
 }
 
 ensure_phase2_kernel_args() {
@@ -601,7 +607,7 @@ ensure_phase2_kernel_args() {
         write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_video_disable}" "${arg_modeset}" "${arg_fbdev}"
         repair_dpkg_state_if_needed
         update_initramfs_clouddeploy -u
-        update-grub
+        update_grub_clouddeploy
 
         write_clouddeploy_env_file
         install_continuation_service
@@ -1073,7 +1079,7 @@ prepare_single_kernel_for_nvidia_dkms() {
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y || true
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
         update_initramfs_clouddeploy -u -k "${current_kernel}"
-        update-grub
+        update_grub_clouddeploy
 }
 
 nvidia_install_output_has_dkms_kernel_failure() {
@@ -1698,8 +1704,7 @@ dpkg_output_has_snapd_postinst_error() {
 
 dpkg_output_has_libblockdev_bad_state() {
         local output="$1"
-        printf '%s\n' "${output}" | grep -Eiq 'very bad inconsistent state' \
-                && printf '%s\n' "${output}" | grep -Eiq 'libblockdev-mdraid3'
+        printf '%s\n' "${output}" | grep -Eiq 'very bad inconsistent state|libblockdev-mdraid3'
 }
 
 move_corrupt_dpkg_updates_aside() {
@@ -1734,9 +1739,11 @@ purge_snapd_after_postinst_failure() {
 }
 
 repair_libblockdev_bad_state() {
+        local audit_out configure_out fix_out
         local download_rc=0
         local -a blockdev_pkgs
 
+        export DEBIAN_FRONTEND=noninteractive
         blockdev_pkgs=(
                 libblockdev-mdraid3
                 libblockdev-nvme3
@@ -1746,10 +1753,16 @@ repair_libblockdev_bad_state() {
         )
 
         log "Detected libblockdev package in a very bad inconsistent state; reinstalling libblockdev stack"
+        repair_initramfs_tools_config || true
         wait_for_apt
-        DEBIAN_FRONTEND=noninteractive apt-get update || true
+        apt-get update || true
         if DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install --reinstall -y "${blockdev_pkgs[@]}"; then
-                DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+                audit_out="$(dpkg --audit 2>&1 || true)"
+                printf '%s\n' "${audit_out}"
+                configure_out="$(dpkg --configure -a 2>&1)" || true
+                printf '%s\n' "${configure_out}"
+                fix_out="$(apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y 2>&1)" || true
+                printf '%s\n' "${fix_out}"
                 return 0
         fi
 
@@ -1765,8 +1778,16 @@ repair_libblockdev_bad_state() {
                 log "Manual libblockdev-mdraid3 download/install failed with rc=${download_rc}; apt -f will still attempt repair"
         fi
 
-        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
-        DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+        fix_out="$(apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y 2>&1)" || true
+        printf '%s\n' "${fix_out}"
+        configure_out="$(dpkg --configure -a 2>&1)" || true
+        printf '%s\n' "${configure_out}"
+        audit_out="$(dpkg --audit 2>&1 || true)"
+        printf '%s\n' "${audit_out}"
+        configure_out="$(dpkg --configure -a 2>&1)" || true
+        printf '%s\n' "${configure_out}"
+        fix_out="$(apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y 2>&1)" || true
+        printf '%s\n' "${fix_out}"
 }
 
 repair_dpkg_state_if_needed() {
@@ -1836,6 +1857,36 @@ repair_dpkg_state_if_needed() {
                         export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
                         return 0
                 fi
+        fi
+
+        fix_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y 2>&1)" && fix_rc=0 || fix_rc=$?
+        printf '%s\n' "${fix_out}"
+        if dpkg_output_has_libblockdev_bad_state "${fix_out}"; then
+                repair_libblockdev_bad_state
+                configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+                printf '%s\n' "${configure_out}"
+                if [[ "${configure_rc}" -eq 0 ]]; then
+                        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                        return 0
+                fi
+        fi
+
+        if [[ "${fix_rc}" -eq 0 ]]; then
+                configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+                printf '%s\n' "${configure_out}"
+                if [[ "${configure_rc}" -eq 0 ]]; then
+                        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                        return 0
+                fi
+        fi
+
+        if nvidia_install_output_has_dkms_kernel_failure "${fix_out}"; then
+                log "apt-get -f install is blocked by NVIDIA DKMS configuration; deferring to NVIDIA stale-kernel recovery"
+                CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                return 0
         fi
 
         if nvidia_install_output_has_dkms_kernel_failure "${configure_out}"; then
