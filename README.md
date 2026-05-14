@@ -85,3 +85,41 @@ git clone <your-repo-url>
 cd <your-repo-folder>
 chmod +x CloudDeploy.sh
 sudo bash ./CloudDeploy.sh
+```
+
+## Rootless Cloud VM Recovery Launch
+
+Some cloud images ship with the default user outside sudo, no root password,
+and no `pkexec`, while polkit still permits `systemd-run`. If `sudo` says
+`user is not in the sudoers file`, create a private env file instead of
+pasting secrets into the shell command:
+
+```bash
+mkdir -p ~/.config/clouddeploy
+chmod 700 ~/.config/clouddeploy
+install -m 0600 /dev/null ~/.config/clouddeploy/env
+editor ~/.config/clouddeploy/env
+```
+
+Example `~/.config/clouddeploy/env`:
+
+```bash
+SUNSHINE_PASS=your-sunshine-password
+TAILSCALE_AUTHKEY=your-single-line-tailscale-auth-key
+INSTALL_OPTIONAL_APPS=0
+```
+
+Then launch the deploy as a transient root service:
+
+```bash
+./clouddeploy-run-rootless-systemd.sh
+```
+
+Follow a failed transient run with:
+
+```bash
+journalctl -u clouddeploy-manual-rerun.service -n 300 --no-pager -l
+```
+
+`TAILSCALE_AUTHKEY` must be a single line. If a key was pasted with line
+breaks during debugging, rotate it before rerunning.

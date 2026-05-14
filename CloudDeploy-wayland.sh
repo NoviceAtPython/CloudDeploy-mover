@@ -9,8 +9,12 @@ if LC_ALL=C grep -q $'\r' "$0" 2>/dev/null; then
 fi
 
 set -Eeuo pipefail
-trap 'echo "Failed at line $LINENO"; exit 1' ERR
 export DEBIAN_FRONTEND=noninteractive
+
+APT_DPKG_OPTIONS=(
+        -o Dpkg::Options::=--force-confdef
+        -o Dpkg::Options::=--force-confold
+)
 
 DEFAULT_USER="${SUDO_USER:-user}"
 HEADLESS_USER="${HEADLESS_USER:-$DEFAULT_USER}"
@@ -57,6 +61,9 @@ GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
 CLOUDDEPLOY_ENV_FILE="/etc/clouddeploy-wayland.env"
 
 INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-1}"
+ENABLE_USER_NOPASSWD_SUDO="${ENABLE_USER_NOPASSWD_SUDO:-1}"
+CLOUDDEPLOY_STATE_DIR="${CLOUDDEPLOY_STATE_DIR:-/opt/clouddeploy/state}"
+CURRENT_PHASE="startup"
 
 # =========================
 # Helpers
@@ -67,7 +74,35 @@ log() {
 
 die() {
         echo "ERROR: $*" >&2
+        if declare -F clouddeploy_failure_diagnostics >/dev/null 2>&1; then
+                clouddeploy_failure_diagnostics "$*" || true
+        fi
         exit 1
+}
+
+clouddeploy_failure_trap() {
+        local line="$1"
+        local rc="$2"
+
+        echo "Failed at line ${line} during phase '${CURRENT_PHASE:-unknown}'" >&2
+        if declare -F clouddeploy_failure_diagnostics >/dev/null 2>&1; then
+                clouddeploy_failure_diagnostics "line ${line}" || true
+        fi
+        exit "${rc}"
+}
+
+trap 'clouddeploy_failure_trap "$LINENO" "$?"' ERR
+
+set_phase() {
+        CURRENT_PHASE="$1"
+        log "Phase: ${CURRENT_PHASE}"
+}
+
+mark_phase_done() {
+        local marker="$1"
+
+        install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+        touch "${CLOUDDEPLOY_STATE_DIR}/${marker}"
 }
 
 require_root() {
@@ -227,9 +262,102 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_BUILD_DIR=%q\n' "${SUNSHINE_BUILD_DIR}"
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
+                printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
 
         chmod 0600 "${CLOUDDEPLOY_ENV_FILE}"
+}
+
+validate_tailscale_authkey() {
+        local lower_key
+
+        [[ -n "${TAILSCALE_AUTHKEY}" ]] || return 0
+
+        if [[ "${TAILSCALE_AUTHKEY}" =~ [[:space:]] ]]; then
+                die "TAILSCALE_AUTHKEY must be a single-line key. Generate a fresh key; do not paste line breaks."
+        fi
+
+        lower_key="$(printf '%s' "${TAILSCALE_AUTHKEY}" | tr '[:upper:]' '[:lower:]')"
+        case "${lower_key}" in
+                your-*|*placeholder*|tailscale-key|changeme|change-me|example|example-key)
+                        die "TAILSCALE_AUTHKEY is placeholder text. Generate a fresh single-line key; do not paste line breaks."
+                        ;;
+        esac
+}
+
+ensure_headless_user_admin_access() {
+        if [[ "${ENABLE_USER_NOPASSWD_SUDO}" != "1" ]]; then
+                log "ENABLE_USER_NOPASSWD_SUDO=0; not installing nopasswd sudoers recovery file"
+                return 0
+        fi
+
+        log "Ensuring ${HEADLESS_USER} has sudo recovery access"
+        usermod -aG sudo "${HEADLESS_USER}" || true
+        install -d -m 0755 /etc/sudoers.d
+        printf '%s ALL=(ALL) NOPASSWD:ALL\n' "${HEADLESS_USER}" > /etc/sudoers.d/90-clouddeploy-user
+        chmod 0440 /etc/sudoers.d/90-clouddeploy-user
+        if command -v visudo >/dev/null 2>&1; then
+                visudo -cf /etc/sudoers.d/90-clouddeploy-user >/dev/null
+        fi
+}
+
+print_continuation_state() {
+        echo "=== CloudDeploy continuation state ==="
+        echo "CLOUDDEPLOY_CONTINUE=${CLOUDDEPLOY_CONTINUE:-0}"
+        echo "CLOUDDEPLOY_CONTINUE_REASON=${CLOUDDEPLOY_CONTINUE_REASON:-none}"
+        echo "Reboot marker: ${REBOOT_MARKER} $([[ -f "${REBOOT_MARKER}" ]] && echo present || echo absent)"
+        echo "Reboot reason: $(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo none)"
+        systemctl is-enabled clouddeploy-wayland-continue.service 2>/dev/null || true
+        systemctl is-active clouddeploy-wayland-continue.service 2>/dev/null || true
+}
+
+cleanup_stale_continuation_state_for_manual_rerun() {
+        if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+                print_continuation_state
+                return 0
+        fi
+
+        if [[ -f "${REBOOT_MARKER}" || -f "${REBOOT_REASON_FILE}" ]] \
+                || systemctl is-enabled clouddeploy-wayland-continue.service >/dev/null 2>&1; then
+                log "Detected stale CloudDeploy continuation state during manual/root rerun; disabling old continuation service"
+                print_continuation_state
+                systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
+        fi
+}
+
+clouddeploy_failure_diagnostics() {
+        local reason="${1:-unknown}"
+
+        {
+                echo
+                echo "=== CloudDeploy failure diagnostics ==="
+                echo "Reason: ${reason}"
+                echo "Failed phase: ${CURRENT_PHASE:-unknown}"
+                echo "Continuation marker exists: $([[ -f "${REBOOT_MARKER}" ]] && echo yes || echo no)"
+                echo "Continuation reason: $(cat "${REBOOT_REASON_FILE}" 2>/dev/null || echo none)"
+                echo
+                echo "Useful commands:"
+                echo "  systemctl status clouddeploy-manual-rerun.service --no-pager -l"
+                echo "  journalctl -u clouddeploy-manual-rerun.service -n 300 --no-pager -l"
+                echo "  dpkg --audit"
+                echo "  nvidia-smi || true"
+                echo "  dkms status || true"
+                echo "  systemctl cat kwin-realvt.service || true"
+                echo
+                echo "=== dpkg --audit ==="
+                dpkg --audit 2>/dev/null || true
+                echo
+                echo "=== nvidia-smi ==="
+                nvidia-smi 2>/dev/null || true
+                echo
+                echo "=== dkms status ==="
+                dkms status 2>/dev/null || true
+                echo
+                echo "=== kwin-realvt.service exists ==="
+                systemctl cat kwin-realvt.service 2>/dev/null | sed -n '1,80p' || true
+        } >&2
 }
 
 install_continuation_service() {
@@ -273,6 +401,8 @@ schedule_reboot_for_continuation() {
         install_continuation_service
         echo "${reason}" > "${REBOOT_REASON_FILE}"
         touch "${REBOOT_MARKER}"
+        install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+        touch "${CLOUDDEPLOY_STATE_DIR}/reboot-needed"
         log "${message}"
         reboot
         exit 0
@@ -405,6 +535,47 @@ validate_phase2_display_state() {
         die "Required mode ${target_mode} not exposed on ${FORCED_CONNECTOR}"
 }
 
+repair_initramfs_tools_config() {
+        local conf="/etc/initramfs-tools/initramfs.conf"
+        local compress modules
+
+        install -d -m 0755 /etc/initramfs-tools
+        touch "${conf}"
+
+        compress="$(awk -F= '/^[[:space:]]*COMPRESS[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${conf}" 2>/dev/null || true)"
+        if [[ -z "${compress}" ]]; then
+                log "Repairing initramfs-tools config: setting COMPRESS=gzip"
+                if grep -Eq '^[[:space:]]*COMPRESS[[:space:]]*=' "${conf}"; then
+                        sed -i -E 's/^[[:space:]]*COMPRESS[[:space:]]*=.*/COMPRESS=gzip/' "${conf}"
+                else
+                        printf '\nCOMPRESS=gzip\n' >> "${conf}"
+                fi
+        fi
+
+        modules="$(awk -F= '/^[[:space:]]*MODULES[[:space:]]*=/ {gsub(/[[:space:]]/, "", $2); print $2; exit}' "${conf}" 2>/dev/null || true)"
+        case "${modules}" in
+                ""|.|none|dep|most|netboot|list)
+                        if [[ -z "${modules}" || "${modules}" == "." ]]; then
+                                log "Repairing initramfs-tools config: setting MODULES=most"
+                                if grep -Eq '^[[:space:]]*MODULES[[:space:]]*=' "${conf}"; then
+                                        sed -i -E 's/^[[:space:]]*MODULES[[:space:]]*=.*/MODULES=most/' "${conf}"
+                                else
+                                        printf 'MODULES=most\n' >> "${conf}"
+                                fi
+                        fi
+                        ;;
+                *)
+                        log "Repairing unsupported initramfs-tools MODULES=${modules}; setting MODULES=most"
+                        sed -i -E 's/^[[:space:]]*MODULES[[:space:]]*=.*/MODULES=most/' "${conf}"
+                        ;;
+        esac
+}
+
+update_initramfs_clouddeploy() {
+        repair_initramfs_tools_config
+        DEBIAN_FRONTEND=noninteractive update-initramfs "$@"
+}
+
 ensure_phase2_kernel_args() {
         local edid_file="$1"
         local arg_edid="drm.edid_firmware=${FORCED_CONNECTOR}:edid/${edid_file}"
@@ -428,13 +599,16 @@ ensure_phase2_kernel_args() {
 
         log "Applying GRUB drop-in kernel args for ${FORCED_CONNECTOR} using ${edid_file}"
         write_phase2_grub_override "${arg_edid}" "${arg_video}" "${arg_video_disable}" "${arg_modeset}" "${arg_fbdev}"
-        update-initramfs -u
+        repair_dpkg_state_if_needed
+        update_initramfs_clouddeploy -u
         update-grub
 
         write_clouddeploy_env_file
         install_continuation_service
         echo "edid-kernel-args" > "${REBOOT_REASON_FILE}"
         touch "${REBOOT_MARKER}"
+        install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+        touch "${CLOUDDEPLOY_STATE_DIR}/reboot-needed"
 
         log "Rebooting to apply EDID and DRM kernel arguments"
         reboot
@@ -635,7 +809,8 @@ cleanup_conflicting_nvidia_driver_packages() {
         if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
                 log "Purging conflicting NVIDIA/CUDA driver packages: ${purge_pkgs[*]}"
                 wait_for_apt
-                apt-get purge -y "${purge_pkgs[@]}" || log "NVIDIA conflict purge had errors; continuing to target driver install"
+                DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" purge -y "${purge_pkgs[@]}" \
+                        || log "NVIDIA conflict purge had errors; continuing to target driver install"
         else
                 log "No obvious non-target NVIDIA driver branch packages found"
         fi
@@ -834,7 +1009,8 @@ prepare_single_kernel_for_nvidia_dkms() {
         log "Preparing single running kernel for NVIDIA DKMS: ${current_kernel}"
 
         wait_for_apt
-        DEBIAN_FRONTEND=noninteractive apt-get install -y build-essential dkms pkg-config "linux-headers-${current_kernel}" \
+        repair_dpkg_state_if_needed
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y build-essential dkms pkg-config "linux-headers-${current_kernel}" \
                 || log "Kernel/DKMS prerequisite install reported errors; continuing with stale-kernel cleanup and dpkg reconfigure"
 
         mapfile -t other_kernels < <(collect_non_current_kernel_versions "${current_kernel}")
@@ -877,7 +1053,7 @@ prepare_single_kernel_for_nvidia_dkms() {
         if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
                 log "Purging non-current/provider kernel packages before NVIDIA DKMS: ${purge_pkgs[*]}"
                 wait_for_apt
-                apt-get purge -y "${purge_pkgs[@]}" || log "Kernel package purge reported errors; continuing with cleanup/reconfigure"
+                DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" purge -y "${purge_pkgs[@]}" || log "Kernel package purge reported errors; continuing with cleanup/reconfigure"
         fi
 
         for other_kernel in "${other_kernels[@]}"; do
@@ -892,10 +1068,11 @@ prepare_single_kernel_for_nvidia_dkms() {
 
         rm -f "/var/crash/nvidia-kernel-source-${TARGET_NVIDIA_DRIVER_MAJOR}-server.0.crash" || true
 
+        repair_initramfs_tools_config
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-        DEBIAN_FRONTEND=noninteractive apt-get -f install -y || true
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y || true
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
-        update-initramfs -u -k "${current_kernel}"
+        update_initramfs_clouddeploy -u -k "${current_kernel}"
         update-grub
 }
 
@@ -942,7 +1119,7 @@ recover_nvidia_dkms_after_kernel_failure() {
         log "NVIDIA DKMS/package configuration failed; pruning stale provider kernels and retrying configuration"
         prepare_single_kernel_for_nvidia_dkms
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a
-        DEBIAN_FRONTEND=noninteractive apt-get -f install -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a
         require_nvidia_recovery_package_state
 }
@@ -1056,7 +1233,7 @@ install_target_nvidia_driver() {
         log "Installing NVIDIA packages: ${install_pkgs[*]}"
         wait_for_apt
         repair_dpkg_state_if_needed
-        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get install -y "${install_pkgs[@]}" 2>&1)" && install_rc=0 || install_rc=$?
+        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "${install_pkgs[@]}" 2>&1)" && install_rc=0 || install_rc=$?
         printf '%s\n' "${install_out}"
         if [[ "${install_rc}" -ne 0 ]]; then
                 if nvidia_install_output_has_dkms_kernel_failure "${install_out}"; then
@@ -1145,7 +1322,7 @@ install_sunshine_deb() {
         tmpdeb="$(mktemp /tmp/sunshine.XXXXXX.deb)"
         wget -O "${tmpdeb}" "${SUNSHINE_DEB_URL}"
         wait_for_apt
-        dpkg -i "${tmpdeb}" || apt-get -f install -y
+        dpkg -i "${tmpdeb}" || DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
         rm -f "${tmpdeb}"
 }
 
@@ -1169,6 +1346,131 @@ resolve_sunshine_fork_branch() {
         fi
 
         printf '%s\n' "${requested_branch}"
+}
+
+install_clouddeploy_systemd_units() {
+        local runtime_bin
+
+        [[ -n "${HOME_DIR:-}" ]] || die "HOME_DIR is not set before installing systemd units"
+        [[ -n "${HEADLESS_UID:-}" ]] || HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+        [[ -n "${RUNTIME_DIR:-}" ]] || RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+        [[ -n "${KWIN_DISPLAY:-}" ]] || KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
+        [[ -n "${COMPOSITOR_SERVICE:-}" ]] || COMPOSITOR_SERVICE="$(service_for_mode)"
+        runtime_bin="${SUNSHINE_RUNTIME_BIN:-$(sunshine_runtime_bin 2>/dev/null || true)}"
+        runtime_bin="${runtime_bin:-/usr/bin/sunshine}"
+
+        log "Installing CloudDeploy systemd units idempotently"
+        install_continuation_service
+
+        cat > /etc/systemd/system/kwin-realvt.service <<EOF
+[Unit]
+Description=KWin Wayland DRM session on real VT${KWIN_VTNR}
+After=systemd-logind.service systemd-user-sessions.service network-online.target
+Wants=network-online.target
+Conflicts=display-manager.service getty@tty${KWIN_VTNR}.service plasma-realvt.service weston-kms-session.service
+
+[Service]
+Type=simple
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
+PAMName=login
+WorkingDirectory=${HOME_DIR}
+TTYPath=/dev/tty${KWIN_VTNR}
+StandardInput=tty
+StandardOutput=journal
+StandardError=journal
+TTYReset=yes
+TTYVHangup=no
+TTYVTDisallocate=no
+UtmpIdentifier=tty${KWIN_VTNR}
+UtmpMode=user
+TimeoutStartSec=45
+Environment=KWIN_DRM_DEVICES=${SUNSHINE_DRM_DEVICE}
+Environment=KWIN_DRM_NO_DIRECT_SCANOUT=1
+Environment=KWIN_FORCE_SW_CURSOR=1
+Environment=KWIN_USE_OVERLAYS=0
+Environment=GBM_BACKEND=nvidia-drm
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+PermissionsStartOnly=true
+ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
+ExecStartPre=-/usr/bin/systemctl start user@${HEADLESS_UID}.service
+ExecStartPre=/usr/bin/mkdir -p ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chown ${HEADLESS_USER}:${HEADLESS_USER} ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chmod 700 ${RUNTIME_DIR}
+ExecStartPre=/usr/bin/chvt ${KWIN_VTNR}
+ExecStartPre=/usr/bin/bash -lc 'for i in \$(seq 1 30); do nvidia-smi >/dev/null 2>&1 && exit 0; sleep 2; done; exit 1'
+ExecStart=${HOME_DIR}/.local/bin/start-kwin-realvt.sh
+ExecStartPost=
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        cat > /etc/systemd/system/plasma-shell-realvt.service <<EOF
+[Unit]
+Description=Plasma shell on direct KWin Wayland VT session
+After=kwin-realvt.service
+Requires=kwin-realvt.service
+PartOf=kwin-realvt.service
+
+[Service]
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
+WorkingDirectory=${HOME_DIR}
+Environment=HOME=${HOME_DIR}
+Environment=USER=${HEADLESS_USER}
+Environment=LOGNAME=${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
+Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+ExecStart=${HOME_DIR}/.local/bin/start-plasmashell-realvt.sh
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        cat > /etc/systemd/system/sunshine-headless.service <<EOF
+[Unit]
+Description=Sunshine on CloudDeploy NVIDIA Wayland KMS
+After=${COMPOSITOR_SERVICE} network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service ${COMPOSITOR_SERVICE}
+
+[Service]
+User=${HEADLESS_USER}
+Group=${HEADLESS_USER}
+SupplementaryGroups=video render input
+WorkingDirectory=${HOME_DIR}
+Environment=HOME=${HOME_DIR}
+Environment=USER=${HEADLESS_USER}
+Environment=LOGNAME=${HEADLESS_USER}
+Environment=XDG_RUNTIME_DIR=${RUNTIME_DIR}
+Environment=WAYLAND_DISPLAY=${KWIN_DISPLAY}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=${RUNTIME_DIR}/bus
+Environment=SUNSHINE_STREAM_DIAG_REUSE_AUDIO_PEER=1
+Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
+Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
+Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
+Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
+ExecStartPre=/usr/local/bin/clouddeploy-wait-sunshine-session.sh
+ExecStart=${runtime_bin} ${HOME_DIR}/.config/sunshine/sunshine.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+        systemctl daemon-reload || true
+        mark_phase_done "systemd-units-installed.done"
 }
 
 install_sunshine_from_fork_if_requested() {
@@ -1348,7 +1650,8 @@ run_as_user() {
 wait_for_cloud_init() {
         if command -v cloud-init >/dev/null 2>&1; then
                 echo "Waiting for cloud-init..."
-                timeout 180 cloud-init status --wait || echo "cloud-init timeout; continuing"
+                timeout 180 cloud-init status --wait \
+                        || echo "cloud-init is broken or timed out on this image; continuing because package/network checks will run next."
         fi
 }
 
@@ -1393,6 +1696,12 @@ dpkg_output_has_snapd_postinst_error() {
         return 1
 }
 
+dpkg_output_has_libblockdev_bad_state() {
+        local output="$1"
+        printf '%s\n' "${output}" | grep -Eiq 'very bad inconsistent state' \
+                && printf '%s\n' "${output}" | grep -Eiq 'libblockdev-mdraid3'
+}
+
 move_corrupt_dpkg_updates_aside() {
         local backup_dir="/root/dpkg-bad-updates-backup"
         local stamp update_file moved=0
@@ -1424,6 +1733,42 @@ purge_snapd_after_postinst_failure() {
         dpkg --purge --force-all snapd || true
 }
 
+repair_libblockdev_bad_state() {
+        local download_rc=0
+        local -a blockdev_pkgs
+
+        blockdev_pkgs=(
+                libblockdev-mdraid3
+                libblockdev-nvme3
+                libblockdev-part3
+                libblockdev-swap3
+                libblockdev3
+        )
+
+        log "Detected libblockdev package in a very bad inconsistent state; reinstalling libblockdev stack"
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get update || true
+        if DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install --reinstall -y "${blockdev_pkgs[@]}"; then
+                DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+                return 0
+        fi
+
+        log "apt reinstall did not repair libblockdev-mdraid3; downloading and forcing package reinstall"
+        (
+                cd /tmp
+                rm -f libblockdev-mdraid3_*.deb
+                apt-get download libblockdev-mdraid3
+                dpkg -i --force-all ./libblockdev-mdraid3_*.deb
+        ) || download_rc=$?
+
+        if [[ "${download_rc}" -ne 0 ]]; then
+                log "Manual libblockdev-mdraid3 download/install failed with rc=${download_rc}; apt -f will still attempt repair"
+        fi
+
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
+        DEBIAN_FRONTEND=noninteractive dpkg --configure -a
+}
+
 repair_dpkg_state_if_needed() {
         if [[ "${CLOUDDEPLOY_DPKG_REPAIR_ACTIVE:-0}" == "1" ]]; then
                 return 0
@@ -1433,6 +1778,7 @@ repair_dpkg_state_if_needed() {
         export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
 
         wait_for_apt
+        repair_initramfs_tools_config
 
         local audit_out audit_rc configure_out configure_rc fix_out fix_rc
 
@@ -1451,6 +1797,17 @@ repair_dpkg_state_if_needed() {
 
         printf '%s\n' "${configure_out}"
 
+        if dpkg_output_has_libblockdev_bad_state "${configure_out}"; then
+                repair_libblockdev_bad_state
+                configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
+                printf '%s\n' "${configure_out}"
+                if [[ "${configure_rc}" -eq 0 ]]; then
+                        CLOUDDEPLOY_DPKG_REPAIR_ACTIVE=0
+                        export CLOUDDEPLOY_DPKG_REPAIR_ACTIVE
+                        return 0
+                fi
+        fi
+
         if dpkg_output_has_updates_parse_error "${configure_out}"; then
                 move_corrupt_dpkg_updates_aside
                 configure_out="$(DEBIAN_FRONTEND=noninteractive dpkg --configure -a 2>&1)" && configure_rc=0 || configure_rc=$?
@@ -1466,7 +1823,7 @@ repair_dpkg_state_if_needed() {
         if dpkg_output_has_snapd_postinst_error "${configure_out}"; then
                 purge_snapd_after_postinst_failure
 
-                fix_out="$(DEBIAN_FRONTEND=noninteractive apt-get -f install -y 2>&1)" && fix_rc=0 || fix_rc=$?
+                fix_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y 2>&1)" && fix_rc=0 || fix_rc=$?
                 printf '%s\n' "${fix_out}"
                 if [[ "${fix_rc}" -ne 0 ]]; then
                         log "apt-get -f install failed during snapd repair; rerunning dpkg --configure -a before deciding"
@@ -1516,16 +1873,25 @@ apt_update_retry() {
 }
 
 apt_install_wait() {
+        local install_out install_rc
+
         wait_for_apt
         repair_dpkg_state_if_needed
-        DEBIAN_FRONTEND=noninteractive
-        apt-get install -y "$@"
+        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+        printf '%s\n' "${install_out}"
+        if [[ "${install_rc}" -ne 0 ]]; then
+                log "apt-get install failed; attempting dpkg repair and one retry"
+                repair_dpkg_state_if_needed
+                install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+                printf '%s\n' "${install_out}"
+        fi
+        return "${install_rc}"
 }
 
 apt_purge_wait() {
         wait_for_apt
         repair_dpkg_state_if_needed
-        apt-get purge -y "$@"
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" purge -y "$@"
 }
 
 write_sunshine_config() {
@@ -1591,13 +1957,12 @@ fi
 REPO_DIR="${CLOUDDEPLOY_REPO_DIR:-/home/user/CloudDeploy-mover}"
 
 cd "${REPO_DIR}"
-exec env \
-        SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE-}" \
-        SUNSHINE_PASS="${SUNSHINE_PASS-}" \
-        TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY-}" \
-        SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS-}" \
-        INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS-}" \
-        bash ./CloudDeploy-wayland.sh
+export SUNSHINE_SOURCE_MODE="${SUNSHINE_SOURCE_MODE-}"
+export SUNSHINE_PASS="${SUNSHINE_PASS-}"
+export TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY-}"
+export SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS-}"
+export INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS-}"
+exec bash ./CloudDeploy-wayland.sh
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-run
 
@@ -1627,6 +1992,10 @@ echo
 
 if [[ -z "${SUNSHINE_PASS}" ]]; then
         echo "SUNSHINE_PASS is required." >&2
+        exit 1
+fi
+if [[ -n "${TAILSCALE_AUTHKEY}" && "${TAILSCALE_AUTHKEY}" =~ [[:space:]] ]]; then
+        echo "TAILSCALE_AUTHKEY must be a single-line key. Generate a fresh key; do not paste line breaks." >&2
         exit 1
 fi
 
@@ -1667,6 +2036,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_BUILD_DIR=%q\n' "/opt/sunshine-src"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
+        printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
 } > "${ENV_FILE}"
 chmod 0600 "${ENV_FILE}"
 echo "Wrote ${ENV_FILE} with mode 0600."
@@ -2599,8 +2969,9 @@ install_optional_apps_nonfatal() {
         apt_update_retry || log "Apt update failed before optional app installs; continuing"
 
         wait_for_apt
-        apt-get install -y flatpak wine64 winetricks || log "Optional non-Steam apt packages failed; continuing"
-        if apt-get install -y steam-installer; then
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y flatpak wine64 winetricks \
+                || log "Optional non-Steam apt packages failed; continuing"
+        if DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y steam-installer; then
                 steam_status="installed"
         else
                 steam_status="failed"
@@ -2622,7 +2993,7 @@ install_optional_apps_nonfatal() {
         tmpchrome="/tmp/google-chrome-stable_current_amd64.deb"
         if wget -O "${tmpchrome}" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
                 wait_for_apt
-                if apt-get install -y "${tmpchrome}"; then
+                if DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "${tmpchrome}"; then
                         chrome_status="installed"
                 else
                         chrome_status="failed"
@@ -2650,6 +3021,13 @@ install_optional_apps_nonfatal() {
 # =========================
 require_root
 
+cleanup_stale_continuation_state_for_manual_rerun
+validate_tailscale_authkey
+if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+        set_phase "continuation-dpkg-repair"
+        repair_dpkg_state_if_needed
+fi
+
 if [[ -z "${SUNSHINE_PASS}" ]]; then
         log "SUNSHINE_PASS was not provided; Sunshine credentials will be left unchanged/default."
 fi
@@ -2676,6 +3054,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         COMPOSITOR_SERVICE="$(service_for_mode)"
         write_clouddeploy_env_file
         ensure_nvidia_egl_vulkan_runtime_config
+        install_clouddeploy_systemd_units
 
         systemctl daemon-reload || true
         systemctl disable plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service >/dev/null 2>&1 || true
@@ -2707,6 +3086,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
         systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
         rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
+        rm -f "${CLOUDDEPLOY_STATE_DIR}/reboot-needed" || true
         systemctl enable --now clouddeploy-watch-streaming.timer >/dev/null 2>&1 || true
 
         log "Final validation markers"
@@ -2778,6 +3158,7 @@ HOME_DIR="$(user_home "${HEADLESS_USER}")"
 [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
 
 usermod -aG sudo,video,input,render "${HEADLESS_USER}" || true
+ensure_headless_user_admin_access
 loginctl enable-linger "${HEADLESS_USER}" 2>/dev/null || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
 HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
@@ -2785,27 +3166,34 @@ RUNTIME_DIR="/run/user/${HEADLESS_UID}"
 KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
 COMPOSITOR_SERVICE="$(service_for_mode)"
 
-log "Installing base packages"
+set_phase "base-packages"
 repair_dpkg_state_if_needed
 apt_update_retry
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
         dbus-user-session dbus-x11 \
-        kde-plasma-desktop plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 kde-spectacle weston xwayland seatd \
+        plasma-desktop plasma-workspace plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 kde-spectacle weston xwayland seatd \
         pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
         grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
+mark_phase_done "base-packages.done"
+mark_phase_done "kde-installed.done"
 
+set_phase "nvidia-repository"
+repair_dpkg_state_if_needed
 log "Ensuring CUDA/NVIDIA apt repository is available"
 ensure_cuda_ubuntu_repo
 
-log "Checking NVIDIA driver target"
+set_phase "nvidia-driver"
 log "CUDA toolkit install is deferred until nvidia-smi works."
 install_target_nvidia_driver
+mark_phase_done "nvidia-driver.done"
 
+set_phase "cuda-toolkit"
 log "NVIDIA driver is active; proceeding to CUDA toolkit."
 log "Handling CUDA toolkit install"
+repair_dpkg_state_if_needed
 install_cuda_toolkit_if_requested
 
 log "Removing pieces that fought the working setup"
@@ -2814,13 +3202,19 @@ apt_purge_wait xserver-xorg-video-dummy 2>/dev/null || true
 rm -f /etc/sddm.conf.d/autologin.conf
 rm -f /etc/sddm.conf.d/zz-autologin.conf
 
+set_phase "sunshine-build"
+repair_dpkg_state_if_needed
 log "Installing Sunshine"
 install_sunshine_from_fork_if_requested
+mark_phase_done "sunshine-built.done"
 SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
 [[ -x "${SUNSHINE_RUNTIME_BIN}" ]] || die "Sunshine runtime binary is not executable: ${SUNSHINE_RUNTIME_BIN}"
 log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
 ensure_nvidia_egl_vulkan_runtime_config
+set_phase "systemd-units"
+install_clouddeploy_systemd_units
 
+set_phase "tailscale"
 log "Installing Tailscale if requested"
 if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
         if ! command -v tailscale >/dev/null 2>&1; then
@@ -2832,6 +3226,7 @@ if [[ -n "${TAILSCALE_AUTHKEY}" ]]; then
         tailscale up --authkey="${TAILSCALE_AUTHKEY}" --ssh || log "tailscale up failed; continuing"
 fi
 
+set_phase "display-detection"
 log "Detecting NVIDIA BusID"
 NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
@@ -2847,9 +3242,11 @@ log "Using NVIDIA KMS/DRM device: ${SUNSHINE_DRM_DEVICE}"
 log "Using Weston DRM device basename: ${WESTON_DRM_DEVICE}"
 write_clouddeploy_env_file
 
+set_phase "edid"
+repair_dpkg_state_if_needed
 log "Writing Phase 2 EDID profiles"
 write_phase2_edids
-update-initramfs -u -k all
+update_initramfs_clouddeploy -u -k all
 
 SELECTED_EDID_FILE="$(select_phase2_edid_file)"
 [[ -n "${SELECTED_EDID_FILE}" ]] || die "Could not determine EDID profile file"
@@ -2857,6 +3254,7 @@ log "Selected EDID profile: ${SELECTED_EDID_FILE} on ${FORCED_CONNECTOR}"
 
 ensure_phase2_kernel_args "${SELECTED_EDID_FILE}"
 validate_phase2_display_state "${SELECTED_EDID_FILE}"
+mark_phase_done "edid-installed.done"
 
 case "${SESSION_BACKEND}" in
         kwin|plasma|realvt|weston)
@@ -3670,6 +4068,8 @@ chmod 0755 "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
 
 log "Writing Sunshine config"
 write_sunshine_config
+set_phase "systemd-units"
+install_clouddeploy_systemd_units
 
 log "Removing stale Sunshine state to avoid broken pre-pairing"
 if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
@@ -3916,6 +4316,7 @@ StandardError=journal
 WantedBy=multi-user.target
 EOF
 
+set_phase "streaming-services"
 log "Stopping old compositor/session bits"
 KWIN_ALREADY_HEALTHY=0
 if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]] \
@@ -4026,6 +4427,7 @@ echo "$SCRIPT_VERSION" > "$SENTINEL"
 systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
 rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" || true
+rm -f "${CLOUDDEPLOY_STATE_DIR}/reboot-needed" || true
 systemctl enable --now clouddeploy-watch-streaming.timer >/dev/null 2>&1 || true
 
 install_optional_apps_nonfatal
