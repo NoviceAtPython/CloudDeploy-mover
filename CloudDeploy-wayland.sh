@@ -157,9 +157,25 @@ detect_nvidia_drm_card() {
 nvidia_modules_present_for_running_kernel() {
         local kernel
         kernel="$(uname -r)"
+        [[ -d "/lib/modules/${kernel}" ]] || return 1
         find "/lib/modules/${kernel}" -type f \
                 \( -name 'nvidia*.ko' -o -name 'nvidia*.ko.xz' -o -name 'nvidia*.ko.zst' \) \
                 2>/dev/null | grep -q .
+}
+
+safe_kernel_cleanup_candidate() {
+        local candidate="$1"
+        local running
+
+        running="$(uname -r)"
+
+        [[ -n "${candidate:-}" ]] || return 1
+        [[ "${candidate}" != "${running}" ]] || return 1
+        [[ "${candidate}" != *"/"* ]] || return 1
+        [[ "${candidate}" != "." ]] || return 1
+        [[ "${candidate}" != ".." ]] || return 1
+        [[ "${candidate}" =~ ^[A-Za-z0-9._:+-]+$ ]] || return 1
+        return 0
 }
 
 write_phase2_edids() {
@@ -1010,7 +1026,7 @@ collect_non_current_kernel_versions() {
                 [[ -e "${path}" ]] || continue
                 kernel="$(basename "${path}")"
                 kernel="${kernel#vmlinuz-}"
-                [[ "${kernel}" == "${current_kernel}" ]] && continue
+                safe_kernel_cleanup_candidate "${kernel}" || continue
                 [[ "${kernel}" =~ ^[0-9].* ]] || continue
                 seen["${kernel}"]=1
         done
@@ -1023,25 +1039,28 @@ collect_non_current_kernel_versions() {
                                 kernel="${kernel#linux-modules-}"
                                 kernel="${kernel#linux-modules-extra-}"
                                 kernel="${kernel#linux-tools-}"
-                                [[ "${kernel}" == "${current_kernel}" ]] && continue
+                                safe_kernel_cleanup_candidate "${kernel}" || continue
                                 [[ "${kernel}" =~ ^[0-9].* ]] || continue
                                 seen["${kernel}"]=1
                                 ;;
                         linux-headers-[0-9]*)
                                 kernel="${pkg#linux-headers-}"
                                 [[ "${kernel}" == "${current_kernel}" || "${kernel}" == "${current_kernel%-*}" ]] && continue
+                                safe_kernel_cleanup_candidate "${kernel}" || continue
                                 [[ "${kernel}" =~ ^[0-9].* ]] || continue
                                 seen["${kernel}"]=1
                                 ;;
                 esac
         done < <(dpkg-query -W -f='${binary:Package}\n' 2>/dev/null || true)
 
-        printf '%s\n' "${!seen[@]}" | sort -V
+        if [[ "${#seen[@]}" -gt 0 ]]; then
+                printf '%s\n' "${!seen[@]}" | sort -V
+        fi
 }
 
 prepare_single_kernel_for_nvidia_dkms() {
-        local current_kernel current_base other_kernel other_base pkg
-        local -a other_kernels purge_candidates purge_pkgs
+        local current_kernel current_base other_kernel other_base pkg modules_dir
+        local -a other_kernels filtered_other_kernels purge_candidates purge_pkgs
         local -A seen_pkg seen_base
 
         current_kernel="$(uname -r)"
@@ -1055,16 +1074,26 @@ prepare_single_kernel_for_nvidia_dkms() {
                 || log "Kernel/DKMS prerequisite install reported errors; continuing with stale-kernel cleanup and dpkg reconfigure"
 
         mapfile -t other_kernels < <(collect_non_current_kernel_versions "${current_kernel}")
+        filtered_other_kernels=()
+        for other_kernel in "${other_kernels[@]}"; do
+                if safe_kernel_cleanup_candidate "${other_kernel}"; then
+                        filtered_other_kernels+=("${other_kernel}")
+                fi
+        done
+        other_kernels=("${filtered_other_kernels[@]}")
         if [[ "${#other_kernels[@]}" -gt 0 ]]; then
                 log "Non-running kernels to remove before NVIDIA DKMS: ${other_kernels[*]}"
         else
-                log "No non-running kernel versions found before NVIDIA DKMS"
+                log "No stale non-current kernel detected; skipping kernel cleanup"
+                return 0
         fi
 
         purge_candidates=(linux-virtual linux-image-virtual linux-headers-virtual linux-headers-generic)
         for other_kernel in "${other_kernels[@]}"; do
-                [[ -n "${other_kernel:-}" ]] || continue
-                [[ "${other_kernel}" == "${current_kernel}" ]] && continue
+                if ! safe_kernel_cleanup_candidate "${other_kernel}"; then
+                        [[ -n "${other_kernel:-}" ]] || log "No stale non-current kernel detected; skipping kernel cleanup"
+                        continue
+                fi
                 other_base="${other_kernel%-*}"
                 [[ -n "${other_base:-}" ]] || continue
                 purge_candidates+=(
@@ -1075,7 +1104,8 @@ prepare_single_kernel_for_nvidia_dkms() {
                         "linux-tools-${other_kernel}"
                 )
 
-                if [[ "${other_base}" != "${current_base}" && -z "${seen_base[${other_base}]:-}" ]]; then
+                [[ -n "${other_base:-}" ]] || continue
+                if [[ "${other_base}" != "${current_base}" && -z "${seen_base["${other_base}"]:-}" ]]; then
                         purge_candidates+=(
                                 "linux-headers-${other_base}"
                                 "linux-tools-${other_base}"
@@ -1086,7 +1116,11 @@ prepare_single_kernel_for_nvidia_dkms() {
 
         purge_pkgs=()
         for pkg in "${purge_candidates[@]}"; do
-                [[ -n "${seen_pkg[${pkg}]:-}" ]] && continue
+                [[ -n "${pkg:-}" ]] || continue
+                if [[ "${pkg}" == *"${current_kernel}"* || "${pkg}" == "linux-headers-${current_base}" ]]; then
+                        die "Refusing to purge package '${pkg}' because it matches running kernel ${current_kernel}"
+                fi
+                [[ -n "${seen_pkg["${pkg}"]:-}" ]] && continue
                 seen_pkg["${pkg}"]=1
                 if installed_dpkg_package "${pkg}"; then
                         purge_pkgs+=("${pkg}")
@@ -1095,15 +1129,30 @@ prepare_single_kernel_for_nvidia_dkms() {
 
         if [[ "${#purge_pkgs[@]}" -gt 0 ]]; then
                 log "Purging non-current/provider kernel packages before NVIDIA DKMS: ${purge_pkgs[*]}"
+                for pkg in "${purge_pkgs[@]}"; do
+                        if [[ "${pkg}" == *"${current_kernel}"* || "${pkg}" == "linux-headers-${current_base}" ]]; then
+                                die "Refusing to purge package '${pkg}' because it matches running kernel ${current_kernel}"
+                        fi
+                done
                 wait_for_apt
                 DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" purge -y "${purge_pkgs[@]}" || log "Kernel package purge reported errors; continuing with cleanup/reconfigure"
+        else
+                log "No stale non-current kernel packages to purge before NVIDIA DKMS"
         fi
 
         for other_kernel in "${other_kernels[@]}"; do
-                [[ "${other_kernel}" == "${current_kernel}" ]] && continue
+                if ! safe_kernel_cleanup_candidate "${other_kernel}"; then
+                        [[ -n "${other_kernel:-}" ]] || log "No stale non-current kernel detected; skipping kernel cleanup"
+                        continue
+                fi
+                modules_dir="/lib/modules/${other_kernel}"
+                [[ "${modules_dir}" == "/lib/modules/${other_kernel}" ]] \
+                        || die "Refusing unsafe stale kernel modules path: ${modules_dir}"
+                [[ "${modules_dir}" != "/lib/modules/${current_kernel}" ]] \
+                        || die "Refusing to remove running kernel modules directory /lib/modules/${current_kernel}"
                 log "Removing stale non-current kernel leftovers for ${other_kernel}"
-                rm -rf "/lib/modules/${other_kernel}" \
-                        "/boot/vmlinuz-${other_kernel}" \
+                rm -rf -- "${modules_dir}" || true
+                rm -f -- "/boot/vmlinuz-${other_kernel}" \
                         "/boot/initrd.img-${other_kernel}" \
                         "/boot/System.map-${other_kernel}" \
                         "/boot/config-${other_kernel}" || true
@@ -1115,6 +1164,8 @@ prepare_single_kernel_for_nvidia_dkms() {
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y || true
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a || true
+        [[ -d "/lib/modules/${current_kernel}" ]] \
+                || die "Running kernel modules directory disappeared during stale-kernel cleanup: /lib/modules/${current_kernel}"
         update_initramfs_clouddeploy -u -k "${current_kernel}"
         update_grub_clouddeploy
 }
@@ -1158,6 +1209,27 @@ require_nvidia_recovery_package_state() {
         fi
 }
 
+require_nvidia_running_kernel_modules_intact() {
+        local current_kernel dkms_out
+
+        current_kernel="$(uname -r)"
+        if [[ ! -d "/lib/modules/${current_kernel}" ]]; then
+                print_nvidia_driver_diagnostics
+                die "Running kernel modules directory is missing: /lib/modules/${current_kernel}"
+        fi
+
+        if ! nvidia_modules_present_for_running_kernel; then
+                print_nvidia_driver_diagnostics
+                die "No nvidia*.ko module was found under /lib/modules/${current_kernel}; refusing to continue/reboot with broken DKMS state"
+        fi
+
+        dkms_out="$(dkms status 2>/dev/null || true)"
+        if printf '%s\n' "${dkms_out}" | grep -Fq "Built modules are missing"; then
+                print_nvidia_driver_diagnostics
+                die "DKMS reports built NVIDIA modules are missing for the running kernel"
+        fi
+}
+
 recover_nvidia_dkms_after_kernel_failure() {
         log "NVIDIA DKMS/package configuration failed; pruning stale provider kernels and retrying configuration"
         prepare_single_kernel_for_nvidia_dkms
@@ -1165,6 +1237,7 @@ recover_nvidia_dkms_after_kernel_failure() {
         DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" -f install -y
         DEBIAN_FRONTEND=noninteractive dpkg --configure -a
         require_nvidia_recovery_package_state
+        require_nvidia_running_kernel_modules_intact
 }
 
 validate_nvidia_driver_acceptance() {
@@ -1182,6 +1255,8 @@ validate_nvidia_driver_acceptance() {
                 print_nvidia_driver_diagnostics
                 die "DKMS does not show an installed NVIDIA module for running kernel $(uname -r)"
         fi
+
+        require_nvidia_running_kernel_modules_intact
 
         if nvidia_smi_driver_library_mismatch; then
                 print_nvidia_driver_diagnostics
@@ -1222,6 +1297,13 @@ install_target_nvidia_driver() {
                 log "NVIDIA driver ${current_version:-unknown} is working; FORCE_DRIVER_UPGRADE=0 so not forcing target ${TARGET_NVIDIA_DRIVER_MAJOR}"
                 detect_provider_gpu_init_failure
                 return 0
+        fi
+
+        if [[ "${FORCE_DRIVER_UPGRADE}" != "1" ]] && command -v nvidia-smi >/dev/null 2>&1; then
+                log "FORCE_DRIVER_UPGRADE=0 and nvidia-smi exists but is not healthy; refusing NVIDIA package/kernel cleanup or reinstall"
+                diagnose_nvidia_init_failure
+                detect_provider_gpu_init_failure
+                die "NVIDIA driver is not healthy, but FORCE_DRIVER_UPGRADE=0 prevents automated repair. Set FORCE_DRIVER_UPGRADE=1 to allow driver/kernel cleanup, or repair the provider/GPU state manually."
         fi
 
         log "Installing NVIDIA driver target major ${TARGET_NVIDIA_DRIVER_MAJOR}"
@@ -1287,6 +1369,7 @@ install_target_nvidia_driver() {
         fi
 
         dkms_pkg="$(nvidia_target_dkms_package)"
+        require_nvidia_running_kernel_modules_intact
 
         modprobe nvidia 2>/dev/null || true
         modprobe nvidia_modeset 2>/dev/null || true
