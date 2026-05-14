@@ -1011,7 +1011,8 @@ prepare_single_kernel_for_nvidia_dkms() {
         local -A seen_pkg seen_base
 
         current_kernel="$(uname -r)"
-        current_base="${current_kernel%-*}"
+        current_base="${current_kernel%-generic}"
+        [[ -n "${current_base:-}" ]] || die "Could not derive current kernel base from uname -r=${current_kernel}"
         log "Preparing single running kernel for NVIDIA DKMS: ${current_kernel}"
 
         wait_for_apt
@@ -1028,8 +1029,10 @@ prepare_single_kernel_for_nvidia_dkms() {
 
         purge_candidates=(linux-virtual linux-image-virtual linux-headers-virtual linux-headers-generic)
         for other_kernel in "${other_kernels[@]}"; do
+                [[ -n "${other_kernel:-}" ]] || continue
                 [[ "${other_kernel}" == "${current_kernel}" ]] && continue
                 other_base="${other_kernel%-*}"
+                [[ -n "${other_base:-}" ]] || continue
                 purge_candidates+=(
                         "linux-image-${other_kernel}"
                         "linux-modules-${other_kernel}"
@@ -1043,7 +1046,7 @@ prepare_single_kernel_for_nvidia_dkms() {
                                 "linux-headers-${other_base}"
                                 "linux-tools-${other_base}"
                         )
-                        seen_base["${other_base}"]=1
+                        [[ -n "${other_base:-}" ]] && seen_base["${other_base}"]=1
                 fi
         done
 
