@@ -2962,16 +2962,16 @@ refresh_streaming_log_markers() {
         LAST_SUNSHINE_LOG="$(sunshine_journal_since "${sunshine_since}")"
 
         KNOWN_SUNSHINE_RESOLUTION_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -F "Desktop resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}" \
+                | grep -Ei "Desktop resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}|Resolution: ${TARGET_WIDTH}x${TARGET_HEIGHT}|Logical size: ${TARGET_WIDTH}x${TARGET_HEIGHT}|width=${TARGET_WIDTH}.*height=${TARGET_HEIGHT}|${TARGET_WIDTH}x${TARGET_HEIGHT}" \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_MONITOR_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -F "Monitor 0 is ${FORCED_CONNECTOR}" \
+                | grep -Ei "Monitor 0 is ${FORCED_CONNECTOR}|Name: ${FORCED_CONNECTOR}|connector=${FORCED_CONNECTOR}|Found monitor:|${FORCED_CONNECTOR}.*primary plane" \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_KMS_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -F "Found monitor for DRM screencasting" \
+                | grep -Ei "Found monitor for DRM screencasting|Screencasting with KMS|STREAM_DIAG.*kms plane selected|kms plane selected|drm_device=.*connector=${FORCED_CONNECTOR}" \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_NVENC_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -Ei 'Nvenc initialized successfully|Found H[.]264 encoder: h264_nvenc|h264_nvenc' \
+                | grep -Ei 'Nvenc initialized successfully|Found H[.]264 encoder: h264_nvenc|Found HEVC encoder: hevc_nvenc|Found AV1 encoder: av1_nvenc|h264_nvenc|hevc_nvenc|av1_nvenc|Creating encoder.*nvenc|encoder.*nvenc' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_H264_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'Found H[.]264 encoder: h264_nvenc|h264_nvenc' \
@@ -2983,7 +2983,7 @@ refresh_streaming_log_markers() {
                 | grep -Ei 'Found AV1 encoder: av1_nvenc|av1_nvenc' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_SAMPLE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -Ei 'sample_all_black=false|all_black=false|sample_nonblack=([1-9][0-9]*)' \
+                | grep -Ei 'sample_all_black=false|all_black=false|sample_nonblack=([1-9][0-9]*)|nonblack=([1-9][0-9]*)|sample_avg_rgb=([1-9][0-9]*|[0-9]+,[1-9][0-9]*|[0-9]+,[0-9]+,[1-9][0-9]*)' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_EGL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'EGL.*NVIDIA|EGL vendor.*NVIDIA' \
@@ -2992,7 +2992,7 @@ refresh_streaming_log_markers() {
                 | grep -Ei 'GL: renderer:.*NVIDIA|GL renderer.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_FAILURE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
-                | grep -Ei 'sample_all_black=true|llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
+                | grep -Ei 'llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
                 | tail -n1 || true)"
 }
 
@@ -3002,12 +3002,7 @@ streaming_log_markers_ready() {
                 && [[ -n "${KNOWN_SUNSHINE_MONITOR_LINE}" ]] \
                 && [[ -n "${KNOWN_SUNSHINE_KMS_LINE}" ]] \
                 && [[ -n "${KNOWN_SUNSHINE_NVENC_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_H264_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_HEVC_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_AV1_LINE}" ]] \
                 && [[ -n "${KNOWN_SUNSHINE_SAMPLE_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_EGL_LINE}" ]] \
-                && [[ -n "${KNOWN_SUNSHINE_GL_LINE}" ]] \
                 && [[ -z "${KNOWN_SUNSHINE_FAILURE_LINE}" ]]
 }
 
