@@ -54,7 +54,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="18-final-kwin-plasma-sunshine-fork"
+SCRIPT_VERSION="19-protect-running-kernel-abi-cleanup"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -166,11 +166,21 @@ nvidia_modules_present_for_running_kernel() {
 safe_kernel_cleanup_candidate() {
         local candidate="$1"
         local running
+        local running_abi
+        local running_generic_base
 
         running="$(uname -r)"
+        running_abi="${running%-*}"
+        running_generic_base="${running%-generic}"
 
         [[ -n "${candidate:-}" ]] || return 1
-        [[ "${candidate}" != "${running}" ]] || return 1
+
+        case "${candidate}" in
+                "${running}"|"${running_abi}"|"${running_generic_base}")
+                        return 1
+                        ;;
+        esac
+
         [[ "${candidate}" != *"/"* ]] || return 1
         [[ "${candidate}" != "." ]] || return 1
         [[ "${candidate}" != ".." ]] || return 1
