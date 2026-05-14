@@ -70,7 +70,11 @@ TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
 ENABLE_HDR="${ENABLE_HDR:-0}"
 EDID_PROFILE="${EDID_PROFILE:-auto}"
+ENABLE_PLASMA6="${ENABLE_PLASMA6:-0}"
 STREAM_MODE="${STREAM_MODE:-plasma}"
+if [[ "${ENABLE_PLASMA6}" == "1" && "${STREAM_MODE}" == "plasma" ]]; then
+        STREAM_MODE="plasma6"
+fi
 SESSION_BACKEND="${SESSION_BACKEND:-$STREAM_MODE}"
 PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 KWIN_VTNR="${KWIN_VTNR:-7}"
@@ -82,7 +86,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="20-real-user-runtime-and-force-mode-guard"
+SCRIPT_VERSION="21-plasma6-hdr-experiment"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -184,7 +188,7 @@ normalize_clouddeploy_users() {
         fi
 
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt)
+                plasma|plasma6|kwin|realvt)
                         if user_is_root_identity "${HEADLESS_USER}" && [[ "${ALLOW_ROOT_SESSION}" != "1" ]]; then
                                 die "STREAM_MODE=${STREAM_MODE} must not run KWin/Plasma as root. Set HEADLESS_USER to a real UID>=1000 user."
                         fi
@@ -337,7 +341,7 @@ select_phase2_edid_file() {
 
 service_for_mode() {
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt)
+                plasma|plasma6|kwin|realvt)
                         echo "kwin-realvt.service"
                         ;;
                 weston)
@@ -347,9 +351,73 @@ service_for_mode() {
                         die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                         ;;
                 *)
-                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston."
+                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston."
                         ;;
         esac
+}
+
+plasma6_mode_active() {
+        [[ "${STREAM_MODE}" == "plasma6" || "${ENABLE_PLASMA6}" == "1" ]]
+}
+
+package_candidate_version() {
+        local pkg="$1"
+        apt-cache policy "${pkg}" 2>/dev/null \
+                | awk -F': ' '/^[[:space:]]*Candidate:/ { print $2; exit }'
+}
+
+version_major() {
+        local version="$1"
+        version="${version#*:}"
+        printf '%s\n' "${version}" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p'
+}
+
+installed_plasma_version() {
+        if command -v plasmashell >/dev/null 2>&1; then
+                plasmashell --version 2>/dev/null | head -n1 || true
+        elif dpkg-query -W -f='plasma-workspace ${Version}\n' plasma-workspace 2>/dev/null; then
+                return 0
+        fi
+}
+
+installed_kwin_version() {
+        if command -v kwin_wayland >/dev/null 2>&1; then
+                kwin_wayland --version 2>/dev/null | head -n1 || true
+        elif dpkg-query -W -f='kwin-wayland ${Version}\n' kwin-wayland 2>/dev/null; then
+                return 0
+        fi
+}
+
+plasma6_packages_available_from_native_repos() {
+        local pkg candidate major
+        for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+                candidate="$(package_candidate_version "${pkg}")"
+                [[ -n "${candidate}" && "${candidate}" != "(none)" ]] || return 1
+                major="$(version_major "${candidate}")"
+                [[ "${major}" == "6" ]] || return 1
+        done
+}
+
+require_plasma6_available_from_native_repos() {
+        local pkg candidate
+
+        plasma6_mode_active || return 0
+
+        log "STREAM_MODE=plasma6 / ENABLE_PLASMA6=1 requested; checking native distro Plasma 6 availability"
+        if plasma6_packages_available_from_native_repos; then
+                for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+                        candidate="$(package_candidate_version "${pkg}")"
+                        log "Native Plasma 6 candidate: ${pkg}=${candidate}"
+                done
+                return 0
+        fi
+
+        echo "Plasma 6/KWin 6 package candidates from current apt repositories:" >&2
+        for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+                candidate="$(package_candidate_version "${pkg}")"
+                echo "  ${pkg}: ${candidate:-missing}" >&2
+        done
+        die "STREAM_MODE=plasma6 requires Plasma 6/KWin 6 packages from the current distro repositories. They are unavailable on this base image; use a newer base image/distro. CloudDeploy will not add KDE Neon repos to Ubuntu 24.04."
 }
 
 write_clouddeploy_env_file() {
@@ -367,6 +435,7 @@ write_clouddeploy_env_file() {
                 printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
                 printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
                 printf 'ENABLE_HDR=%q\n' "${ENABLE_HDR}"
+                printf 'ENABLE_PLASMA6=%q\n' "${ENABLE_PLASMA6}"
                 printf 'EDID_PROFILE=%q\n' "${EDID_PROFILE}"
                 printf 'KWIN_VTNR=%q\n' "${KWIN_VTNR}"
                 printf 'KWIN_WAYLAND_DISPLAY=%q\n' "${KWIN_WAYLAND_DISPLAY}"
@@ -898,6 +967,35 @@ kwin_support_reports_target_mode() {
         [[ "${geometry}" == *"Geometry: 0,0,${TARGET_WIDTH}x${TARGET_HEIGHT}"* \
                 || "${geometry}" == *"Geometry: 0,0 ${TARGET_WIDTH}x${TARGET_HEIGHT}"* ]] || return 1
         [[ "${refresh}" =~ ^(119|120) ]] || return 1
+}
+
+kscreen_connector_summary() {
+        command -v kscreen-doctor >/dev/null 2>&1 || return 0
+
+        run_as_user "${HEADLESS_USER}" env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                kscreen-doctor -o 2>/dev/null \
+                | grep -Ei "${FORCED_CONNECTOR}|Geometry:|Scale:|Refresh Rate:|${TARGET_WIDTH}x${TARGET_HEIGHT}.*(119|120).*[*]" \
+                || true
+}
+
+live_edid_hdr_markers() {
+        local edid_path
+
+        command -v edid-decode >/dev/null 2>&1 || return 0
+
+        for edid_path in /sys/class/drm/card*-"${FORCED_CONNECTOR}"/edid; do
+                [[ -s "${edid_path}" ]] || continue
+                edid-decode "${edid_path}" 2>/dev/null \
+                        | grep -Ei 'HDR|EOTF|PQ|HLG|BT[.]2020|Static Metadata|SMPTE ST 2084' \
+                        || true
+        done | head -n 40
 }
 
 wait_for_kwin_target_mode() {
@@ -2413,6 +2511,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TARGET_HEIGHT=%q\n' "2160"
         printf 'TARGET_FPS=%q\n' "120"
         printf 'ENABLE_HDR=%q\n' "0"
+        printf 'ENABLE_PLASMA6=%q\n' "0"
         printf 'EDID_PROFILE=%q\n' "auto"
         printf 'KWIN_VTNR=%q\n' "7"
         printf 'KWIN_WAYLAND_DISPLAY=%q\n' "wayland-0"
@@ -2469,6 +2568,10 @@ if [[ "${HEADLESS_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
         [[ -n "${HEADLESS_USER}" ]] || { echo "HEADLESS_USER resolved to root and no real UID>=1000 user was found" >&2; exit 1; }
 fi
 STREAM_MODE="${STREAM_MODE:-plasma}"
+ENABLE_PLASMA6="${ENABLE_PLASMA6:-0}"
+if [[ "${ENABLE_PLASMA6}" == "1" && "${STREAM_MODE}" == "plasma" ]]; then
+        STREAM_MODE="plasma6"
+fi
 PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
@@ -2511,8 +2614,8 @@ if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
         exit 1
 fi
 
-case "${STREAM_MODE}" in
-        plasma|kwin|realvt)
+        case "${STREAM_MODE}" in
+        plasma|plasma6|kwin|realvt)
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 COMPOSITOR_LOG_UNIT="kwin-realvt.service"
                 ;;
@@ -2525,7 +2628,7 @@ case "${STREAM_MODE}" in
                 exit 1
                 ;;
         *)
-                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston." >&2
+                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston." >&2
                 exit 1
                 ;;
 esac
@@ -2896,6 +2999,9 @@ KNOWN_SUNSHINE_SAMPLE_LINE=""
 KNOWN_SUNSHINE_EGL_LINE=""
 KNOWN_SUNSHINE_GL_LINE=""
 KNOWN_SUNSHINE_FAILURE_LINE=""
+KNOWN_SUNSHINE_PIXEL_FORMAT_LINE=""
+KNOWN_SUNSHINE_COLOR_DEPTH_LINE=""
+KNOWN_SUNSHINE_HDR_FORMAT_LINE=""
 LAST_WESTON_LOG=""
 LAST_SUNSHINE_LOG=""
 LAST_SUNSHINE_START_SINCE=""
@@ -2923,7 +3029,7 @@ refresh_streaming_log_markers() {
         local sunshine_since="${1:-}"
 
         case "${STREAM_MODE}" in
-                plasma)
+                plasma|plasma6)
                         LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
                         local support_info
                         support_info="$(kwin_support_information || true)"
@@ -2990,6 +3096,15 @@ refresh_streaming_log_markers() {
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_GL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'GL: renderer:.*NVIDIA|GL renderer.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_PIXEL_FORMAT_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'pixel_format=|pixel format|DRM_FORMAT|fourcc=|format=(XR24|AR24|AB30|XB30|P010|P012|XB4H|AR30|XR30)' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_COLOR_DEPTH_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Color depth:|10-bit|Main10|P010|P012|hevc_nvenc|av1_nvenc' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_HDR_FORMAT_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'pixel_format=(AB30|XB30|P010|P012|XB4H|AR30|XR30)|format=(AB30|XB30|P010|P012|XB4H|AR30|XR30)|DRM_FORMAT_(ARGB2101010|XRGB2101010|P010|P012)' \
                 | tail -n1 || true)"
         KNOWN_SUNSHINE_FAILURE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
@@ -3147,6 +3262,7 @@ known_good_clean_reset_streaming_stack() {
         env \
                 HEADLESS_USER="${HEADLESS_USER}" \
                 STREAM_MODE="${STREAM_MODE}" \
+                ENABLE_PLASMA6="${ENABLE_PLASMA6}" \
                 FORCED_CONNECTOR="${FORCED_CONNECTOR}" \
                 TARGET_WIDTH="${TARGET_WIDTH}" \
                 TARGET_HEIGHT="${TARGET_HEIGHT}" \
@@ -3200,7 +3316,7 @@ validate_streaming_stack_ready() {
                 die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
         fi
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt) compositor_service="kwin-realvt.service" ;;
+                plasma|plasma6|kwin|realvt) compositor_service="kwin-realvt.service" ;;
                 weston) compositor_service="weston-kms-session.service" ;;
                 *) compositor_service="$(service_for_mode)" ;;
         esac
@@ -3220,7 +3336,7 @@ validate_streaming_stack_ready() {
                 die "More than one clouddeploy-force-kwin-mode.sh helper is running (${force_count})"
         fi
 
-        if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+        if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
                 pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 || {
                         print_server_validation_diagnostics
                         die "kwin_wayland is not running"
@@ -3322,6 +3438,7 @@ print_final_validation_summary() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
         local edid_file cmdline_args ts_ip web_status local_serverinfo_status tailscale_serverinfo_status
         local web_code local_serverinfo_code tailscale_serverinfo_code force_count
+        local plasma_version kwin_version plasma6_active kscreen_summary hdr_markers
 
         edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
         cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
@@ -3347,17 +3464,36 @@ print_final_validation_summary() {
         fi
 
         force_count="$(force_mode_helper_count)"
+        plasma_version="$(installed_plasma_version || true)"
+        kwin_version="$(installed_kwin_version || true)"
+        if plasma6_mode_active; then
+                plasma6_active="yes"
+        else
+                plasma6_active="no"
+        fi
+        kscreen_summary="$(kscreen_connector_summary || true)"
+        hdr_markers="$(live_edid_hdr_markers || true)"
         echo "Selected HEADLESS_USER: ${HEADLESS_USER}"
         echo "Selected HEADLESS_UID: ${HEADLESS_UID:-unknown}"
         echo "Selected HOME_DIR: ${HOME_DIR:-unknown}"
         echo "Selected RUNTIME_DIR: ${RUNTIME_DIR:-unknown}"
         echo "clouddeploy-force-kwin-mode.sh process count: ${force_count}"
+        echo "Plasma version: ${plasma_version:-not detected}"
+        echo "KWin version: ${kwin_version:-not detected}"
+        echo "Plasma 6 experimental mode active: ${plasma6_active}"
         echo "Service kwin-realvt: $(systemctl is-active kwin-realvt.service 2>/dev/null || echo unknown)"
         echo "Service plasma-shell-realvt: $(systemctl is-active plasma-shell-realvt.service 2>/dev/null || echo unknown)"
         echo "Service sunshine-headless: $(systemctl is-active sunshine-headless.service 2>/dev/null || echo unknown)"
         echo "EDID file active: ${edid_file:-unknown}"
         echo "Kernel cmdline EDID/NVIDIA args: ${cmdline_args:-missing expected args}"
         echo "KWin reported geometry/refresh: ${KNOWN_WESTON_MODE_LINE:-not observed}"
+        echo "KScreen ${FORCED_CONNECTOR} mode/scale: ${kscreen_summary:-not observed}"
+        echo "Live EDID HDR markers:"
+        if [[ -n "${hdr_markers}" ]]; then
+                printf '%s\n' "${hdr_markers}"
+        else
+                echo "not observed"
+        fi
         echo "Process kwin_wayland: $(pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland | head -n1 || echo not observed)"
         echo "Process Xwayland: $(pgrep -a -u "${HEADLESS_USER}" -x Xwayland | head -n1 || echo not observed)"
         echo "Process kactivitymanagerd: $(pgrep -a -u "${HEADLESS_USER}" -f 'kactivitymanagerd' | head -n1 || echo not observed)"
@@ -3369,13 +3505,22 @@ print_final_validation_summary() {
         echo "Sunshine non-black KMS sample: ${KNOWN_SUNSHINE_SAMPLE_LINE:-not observed}"
         echo "Sunshine EGL NVIDIA marker: ${KNOWN_SUNSHINE_EGL_LINE:-not observed}"
         echo "Sunshine GL NVIDIA marker: ${KNOWN_SUNSHINE_GL_LINE:-not observed}"
+        echo "Sunshine KMS framebuffer pixel format: ${KNOWN_SUNSHINE_PIXEL_FORMAT_LINE:-not observed}"
+        echo "Sunshine encoder/color depth: ${KNOWN_SUNSHINE_COLOR_DEPTH_LINE:-not observed}"
+        if [[ -n "${KNOWN_SUNSHINE_HDR_FORMAT_LINE}" ]]; then
+                echo "HDR-capable KMS framebuffer observed: ${KNOWN_SUNSHINE_HDR_FORMAT_LINE}"
+        elif [[ -n "${hdr_markers}" ]] \
+                && printf '%s\n' "${KNOWN_SUNSHINE_COLOR_DEPTH_LINE}" | grep -Eiq '10-bit|Main10|P010|P012' \
+                && printf '%s\n' "${KNOWN_SUNSHINE_PIXEL_FORMAT_LINE}" | grep -Eiq 'pixel_format=AR24|format=AR24|AR24'; then
+                echo "HDR EDID and 10-bit encoder available, but compositor framebuffer is still AR24/SDR."
+        fi
         echo "Sunshine H.264 encoder: ${KNOWN_SUNSHINE_H264_LINE:-not observed}"
         echo "Sunshine HEVC encoder: ${KNOWN_SUNSHINE_HEVC_LINE:-not observed}"
         echo "Sunshine AV1 encoder: ${KNOWN_SUNSHINE_AV1_LINE:-not observed}"
         echo "Sunshine web UI over Tailscale: ${web_status}"
         echo "Sunshine Moonlight serverinfo local: ${local_serverinfo_status}"
         echo "Sunshine Moonlight serverinfo over Tailscale: ${tailscale_serverinfo_status}"
-        echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
+        echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR $(if [[ "${ENABLE_HDR}" == "1" ]]; then echo on; else echo off; fi), AV1 preferred"
 }
 
 print_known_good_checklist() {
@@ -3625,6 +3770,7 @@ chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
 set_phase "base-packages"
 repair_dpkg_state_if_needed
 apt_update_retry
+require_plasma6_available_from_native_repos
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
@@ -3713,19 +3859,24 @@ validate_phase2_display_state "${SELECTED_EDID_FILE}"
 mark_phase_done "edid-installed.done"
 
 case "${SESSION_BACKEND}" in
-        kwin|plasma|realvt|weston)
+        kwin|plasma|plasma6|realvt|weston)
                 ;;
         gamescope)
                 die "SESSION_BACKEND=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: plasma, kwin, weston."
+                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: plasma, plasma6, kwin, weston."
                 ;;
 esac
 
 case "${STREAM_MODE}" in
         plasma)
                 log "STREAM_MODE=plasma: reliable KWin real-VT session plus Plasma shell on forced ${FORCED_CONNECTOR}"
+                COMPOSITOR_SERVICE="kwin-realvt.service"
+                ;;
+        plasma6)
+                log "STREAM_MODE=plasma6: experimental native Plasma 6/KWin 6 HDR probe on real VT${KWIN_VTNR}"
+                require_plasma6_available_from_native_repos
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 ;;
         kwin|realvt)
@@ -3740,7 +3891,7 @@ case "${STREAM_MODE}" in
                 die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: plasma, kwin, weston."
+                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston."
                 ;;
 esac
 
@@ -4187,7 +4338,7 @@ verify_sunshine_kms_config() {
 }
 
 case "${STREAM_MODE}" in
-        plasma|kwin|realvt)
+        plasma|plasma6|kwin|realvt)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
@@ -4220,7 +4371,7 @@ done
         exit 1
 }
 
-if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
         /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
 
         for _ in \$(seq 1 60); do
@@ -4311,7 +4462,7 @@ verify_sunshine_kms_config() {
 }
 
 start_kde_shell_bits() {
-        [[ "${STREAM_MODE}" == "plasma" ]] || return 0
+        [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" ]] || return 0
 
         local kactivitymanagerd="/usr/lib/x86_64-linux-gnu/libexec/kactivitymanagerd"
         if ! pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1; then
@@ -4342,7 +4493,7 @@ start_kde_shell_bits() {
 }
 
 case "${STREAM_MODE}" in
-        plasma)
+        plasma|plasma6)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
@@ -4377,7 +4528,7 @@ FORCE_ATTEMPTED=0
 SESSION_MARKER_LOGGED=0
 for _ in \$(seq 1 120); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
-                if [[ "${STREAM_MODE}" == "plasma" ]] \
+                if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" ]] \
                         && ! pgrep -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session' >/dev/null 2>&1; then
                         if [[ "\${SESSION_MARKER_LOGGED}" == "0" ]]; then
                                 echo "KDE session service marker not observed yet; continuing because KWin DBus/mode validation is authoritative."
@@ -4385,7 +4536,7 @@ for _ in \$(seq 1 120); do
                         fi
                 fi
 
-                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
+                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "realvt" ]]; then
                         if [[ "\${FORCE_ATTEMPTED}" == "0" ]]; then
                                 /usr/local/bin/clouddeploy-force-kwin-mode.sh || echo "WARNING: clouddeploy-force-kwin-mode failed; waiting for KWin mode validation."
                                 FORCE_ATTEMPTED=1
@@ -4430,6 +4581,20 @@ echo "=== nvidia-smi ==="
 nvidia-smi || true
 
 echo
+echo "=== Plasma/KWin versions ==="
+if command -v plasmashell >/dev/null 2>&1; then
+        plasmashell --version || true
+else
+        dpkg-query -W -f='plasma-workspace \${Version}\n' plasma-workspace 2>/dev/null || true
+fi
+if command -v kwin_wayland >/dev/null 2>&1; then
+        kwin_wayland --version || true
+else
+        dpkg-query -W -f='kwin-wayland \${Version}\n' kwin-wayland 2>/dev/null || true
+fi
+echo "Plasma 6 experimental mode active: $(if [[ "${STREAM_MODE}" == "plasma6" || "${ENABLE_PLASMA6}" == "1" ]]; then echo yes; else echo no; fi)"
+
+echo
 echo "=== /dev/dri ==="
 ls -l /dev/dri || true
 
@@ -4466,6 +4631,18 @@ cat /sys/class/drm/card*-${FORCED_CONNECTOR}/status 2>/dev/null || true
 echo
 echo "=== Connector modes (${FORCED_CONNECTOR}) ==="
 cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
+
+echo
+echo "=== Live EDID HDR markers (${FORCED_CONNECTOR}) ==="
+if command -v edid-decode >/dev/null 2>&1; then
+        for edid_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/edid; do
+                [[ -s "\${edid_path}" ]] || continue
+                edid-decode "\${edid_path}" 2>/dev/null \
+                        | grep -Ei 'HDR|EOTF|PQ|HLG|BT[.]2020|Static Metadata|SMPTE ST 2084' || true
+        done
+else
+        echo "edid-decode not found"
+fi
 
 echo
 echo "=== KScreen output ==="
@@ -4537,7 +4714,7 @@ fi
 echo
 echo "=== Sunshine journal markers ==="
 journalctl -u sunshine-headless.service -n 220 --no-pager \
-        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|Nvenc initialized|Found H[.]264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Mismatch|pair|pin|error|fatal' || true
+        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|pixel_format|format=(XR24|AR24|AB30|XB30|P010|P012|XB4H|AR30|XR30)|Color depth|10-bit|Nvenc initialized|Found H[.]264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Mismatch|pair|pin|error|fatal' || true
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
