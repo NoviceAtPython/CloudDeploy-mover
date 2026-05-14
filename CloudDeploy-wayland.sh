@@ -1745,7 +1745,7 @@ find_nvidia_vulkan_icd() {
 }
 
 find_nvidia_egl_vendor_json() {
-        find /usr/share/glvnd/egl_vendor.d -name '*nvidia*.json' 2>/dev/null | head -n1 || true
+        grep -Rls 'libEGL_nvidia[.]so' /usr/share/glvnd/egl_vendor.d/*.json 2>/dev/null | head -n1 || true
 }
 
 library_available_to_loader() {
@@ -1768,10 +1768,53 @@ write_egl_external_platform_json() {
 EOF
 }
 
+install_optional_apt_package_if_available() {
+        local pkg="$1"
+
+        if apt-cache show "${pkg}" >/dev/null 2>&1; then
+                log "Installing optional package if needed: ${pkg}"
+                DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "${pkg}" \
+                        || log "WARNING: Optional package install failed: ${pkg}"
+        else
+                log "Optional package is not available from configured apt sources: ${pkg}"
+        fi
+}
+
+ensure_nvidia_egl_helper_packages() {
+        install_optional_apt_package_if_available "libnvidia-egl-wayland1"
+        install_optional_apt_package_if_available "libnvidia-egl-gbm1"
+}
+
+ensure_nvidia_egl_vendor_json() {
+        install -d -m 0755 /usr/share/glvnd/egl_vendor.d
+
+        if ! library_available_to_loader "libEGL_nvidia.so.0"; then
+                die "libEGL_nvidia.so.0 is missing even after NVIDIA GL package install"
+        fi
+
+        if ! grep -Rqs 'libEGL_nvidia[.]so' /usr/share/glvnd/egl_vendor.d/*.json 2>/dev/null; then
+                log "NVIDIA EGL vendor JSON missing; writing /usr/share/glvnd/egl_vendor.d/10_nvidia.json"
+
+                cat > /usr/share/glvnd/egl_vendor.d/10_nvidia.json <<'EOF'
+{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "libEGL_nvidia.so.0"
+    }
+}
+EOF
+
+                chmod 0644 /usr/share/glvnd/egl_vendor.d/10_nvidia.json
+                ldconfig
+        fi
+}
+
 ensure_nvidia_egl_vulkan_runtime_config() {
         local nvidia_egl_json nvidia_icd
 
         log "Ensuring NVIDIA EGL external platform and Vulkan runtime configuration for Sunshine"
+        ensure_nvidia_egl_helper_packages
+        ensure_nvidia_egl_vendor_json
         install -d -m 0755 /usr/share/egl/egl_external_platform.d
 
         if library_available_to_loader "libnvidia-egl-gbm.so.1"; then
@@ -1791,7 +1834,13 @@ ensure_nvidia_egl_vulkan_runtime_config() {
         fi
 
         nvidia_egl_json="$(find_nvidia_egl_vendor_json)"
-        [[ -n "${nvidia_egl_json}" ]] || die "Could not find NVIDIA EGL vendor JSON under /usr/share/glvnd/egl_vendor.d"
+        [[ -n "${nvidia_egl_json}" ]] || die "Could not find or create NVIDIA EGL vendor JSON under /usr/share/glvnd/egl_vendor.d"
+        library_available_to_loader "libEGL_nvidia.so.0" \
+                || die "libEGL_nvidia.so.0 is missing from the dynamic loader cache/search path"
+        library_available_to_loader "libnvidia-egl-wayland.so.1" \
+                || log "WARNING: libnvidia-egl-wayland.so.1 is missing from the dynamic loader cache/search path"
+        library_available_to_loader "libnvidia-egl-gbm.so.1" \
+                || log "WARNING: libnvidia-egl-gbm.so.1 is missing from the dynamic loader cache/search path"
 
         nvidia_icd="$(find_nvidia_vulkan_icd)"
         [[ -n "${nvidia_icd}" ]] || die "Could not find NVIDIA Vulkan ICD JSON under /usr/share/vulkan/icd.d"
