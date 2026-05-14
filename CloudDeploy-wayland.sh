@@ -362,8 +362,12 @@ plasma6_mode_active() {
 
 package_candidate_version() {
         local pkg="$1"
-        apt-cache policy "${pkg}" 2>/dev/null \
-                | awk -F': ' '/^[[:space:]]*Candidate:/ { print $2; exit }'
+        local policy_out
+
+        policy_out="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
+        printf '%s\n' "${policy_out}" \
+                | awk -F': ' '/^[[:space:]]*Candidate:/ { print $2; exit }' \
+                || true
 }
 
 version_major() {
