@@ -53,6 +53,11 @@ SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/rel
 TARGET_NVIDIA_DRIVER_MAJOR="${TARGET_NVIDIA_DRIVER_MAJOR:-580}"
 INSTALL_CUDA_TOOLKIT="${INSTALL_CUDA_TOOLKIT:-1}"
 CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-cuda-toolkit}"
+CUDA_INSTALL_METHOD="${CUDA_INSTALL_METHOD:-auto}"
+REQUIRE_CUDA_TOOLKIT="${REQUIRE_CUDA_TOOLKIT:-${INSTALL_CUDA_TOOLKIT}}"
+CUDA_RUNFILE_VERSION="${CUDA_RUNFILE_VERSION:-13.0.2}"
+CUDA_RUNFILE_DRIVER_VERSION="${CUDA_RUNFILE_DRIVER_VERSION:-580.95.05}"
+CUDA_RUNFILE_URL="${CUDA_RUNFILE_URL:-https://developer.download.nvidia.com/compute/cuda/${CUDA_RUNFILE_VERSION}/local_installers/cuda_${CUDA_RUNFILE_VERSION}_${CUDA_RUNFILE_DRIVER_VERSION}_linux.run}"
 FORCE_DRIVER_UPGRADE="${FORCE_DRIVER_UPGRADE:-1}"
 # Safe/stable deploys use the packaged .deb by default. Fresh VMs may still
 # need SUNSHINE_SOURCE_MODE=fork until the CloudDeploy pairing/stream fixes are upstreamed.
@@ -96,6 +101,13 @@ INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-1}"
 ENABLE_USER_NOPASSWD_SUDO="${ENABLE_USER_NOPASSWD_SUDO:-1}"
 CLOUDDEPLOY_STATE_DIR="${CLOUDDEPLOY_STATE_DIR:-/opt/clouddeploy/state}"
 CURRENT_PHASE="startup"
+CUDA_REPO_ENABLED=0
+CUDA_REPO_DISTRO=""
+CUDA_TOOLKIT_SOURCE="not selected"
+NVIDIA_DRIVER_SOURCE="not selected"
+NVIDIA_DRIVER_PACKAGE_FAMILY="unknown"
+NVIDIA_DRIVER_PACKAGE=""
+NVIDIA_DKMS_PACKAGE=""
 
 # =========================
 # Helpers
@@ -370,6 +382,38 @@ package_candidate_version() {
                 || true
 }
 
+ubuntu_version_id() {
+        local version_id=""
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                version_id="${VERSION_ID:-}"
+        fi
+        printf '%s\n' "${version_id}"
+}
+
+ubuntu_codename() {
+        local codename=""
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        fi
+        printf '%s\n' "${codename}"
+}
+
+ubuntu_os_summary() {
+        local pretty="" version codename
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                pretty="${PRETTY_NAME:-}"
+        fi
+        version="$(ubuntu_version_id)"
+        codename="$(ubuntu_codename)"
+        printf '%s\n' "${pretty:-ubuntu ${version:-unknown} ${codename:-unknown}}"
+}
+
 version_major() {
         local version="$1"
         version="${version#*:}"
@@ -531,6 +575,11 @@ write_clouddeploy_env_file() {
                 printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "${TARGET_NVIDIA_DRIVER_MAJOR}"
                 printf 'INSTALL_CUDA_TOOLKIT=%q\n' "${INSTALL_CUDA_TOOLKIT}"
                 printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "${CUDA_TOOLKIT_PACKAGE}"
+                printf 'CUDA_INSTALL_METHOD=%q\n' "${CUDA_INSTALL_METHOD}"
+                printf 'REQUIRE_CUDA_TOOLKIT=%q\n' "${REQUIRE_CUDA_TOOLKIT}"
+                printf 'CUDA_RUNFILE_VERSION=%q\n' "${CUDA_RUNFILE_VERSION}"
+                printf 'CUDA_RUNFILE_DRIVER_VERSION=%q\n' "${CUDA_RUNFILE_DRIVER_VERSION}"
+                printf 'CUDA_RUNFILE_URL=%q\n' "${CUDA_RUNFILE_URL}"
                 printf 'FORCE_DRIVER_UPGRADE=%q\n' "${FORCE_DRIVER_UPGRADE}"
                 printf 'SUNSHINE_SOURCE_MODE=%q\n' "${SUNSHINE_SOURCE_MODE}"
                 printf 'SUNSHINE_FORK_REPO=%q\n' "${SUNSHINE_FORK_REPO}"
@@ -1095,12 +1144,39 @@ apt_package_available() {
         local pkg="$1"
         local candidate
 
-        candidate="$(apt-cache policy "${pkg}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+        candidate="$(package_candidate_version "${pkg}")"
         [[ -n "${candidate}" && "${candidate}" != "(none)" ]]
 }
 
-ensure_cuda_ubuntu_repo() {
-        local os_id="" version_id=""
+cuda_repo_distro_for_ubuntu_version() {
+        local version="$1"
+
+        case "${version}" in
+                22.04) printf '%s\n' "ubuntu2204" ;;
+                24.04) printf '%s\n' "ubuntu2404" ;;
+                25.10) printf '%s\n' "ubuntu2510" ;;
+                26.04) printf '%s\n' "ubuntu2604" ;;
+                *) printf '%s\n' "ubuntu${version//./}" ;;
+        esac
+}
+
+cuda_keyring_url_for_distro() {
+        local distro="$1"
+        printf 'https://developer.download.nvidia.com/compute/cuda/repos/%s/x86_64/cuda-keyring_1.1-1_all.deb\n' "${distro}"
+}
+
+cuda_repo_available_for_distro() {
+        local distro="$1"
+        local url
+
+        [[ -n "${distro}" ]] || return 1
+        url="$(cuda_keyring_url_for_distro "${distro}")"
+        wget --spider -q --timeout=10 --tries=2 "${url}" >/dev/null 2>&1
+}
+
+detect_cuda_repo_distro() {
+        local os_id="" version_id="" distro
+
         if [[ -r /etc/os-release ]]; then
                 # shellcheck disable=SC1091
                 . /etc/os-release
@@ -1108,19 +1184,52 @@ ensure_cuda_ubuntu_repo() {
                 version_id="${VERSION_ID:-}"
         fi
 
-        [[ "${os_id}" == "ubuntu" && "${version_id}" == "24.04" ]] \
-                || die "CUDA/NVIDIA repo setup currently supports Ubuntu 24.04 only; detected ${os_id:-unknown} ${version_id:-unknown}"
+        [[ "${os_id}" == "ubuntu" && -n "${version_id}" ]] || return 1
+
+        distro="$(cuda_repo_distro_for_ubuntu_version "${version_id}")"
+        if cuda_repo_available_for_distro "${distro}"; then
+                printf '%s\n' "${distro}"
+                return 0
+        fi
+
+        return 1
+}
+
+ensure_cuda_ubuntu_repo() {
+        local os_id="" version_id="" distro tmpdeb url
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                os_id="${ID:-}"
+                version_id="${VERSION_ID:-}"
+        fi
+
+        [[ "${os_id}" == "ubuntu" ]] \
+                || die "CUDA/NVIDIA apt repository setup supports Ubuntu only; detected ${os_id:-unknown} ${version_id:-unknown}"
+
+        distro="$(detect_cuda_repo_distro || true)"
+        if [[ -z "${distro}" ]]; then
+                CUDA_REPO_ENABLED=0
+                CUDA_REPO_DISTRO=""
+                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                log "No official NVIDIA CUDA apt repo detected for $(ubuntu_os_summary); using native Ubuntu NVIDIA packages and CUDA runfile fallback if needed."
+                return 0
+        fi
+
+        CUDA_REPO_ENABLED=1
+        CUDA_REPO_DISTRO="${distro}"
+        NVIDIA_DRIVER_SOURCE="CUDA repo"
 
         if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
-                log "CUDA apt keyring already installed"
+                log "CUDA apt keyring already installed for detected repo ${CUDA_REPO_DISTRO}"
                 apt_update_retry
                 return 0
         fi
 
-        log "Installing NVIDIA CUDA apt keyring for Ubuntu 24.04"
-        local tmpdeb
+        log "Installing NVIDIA CUDA apt keyring for ${CUDA_REPO_DISTRO}"
         tmpdeb="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
-        wget -O "${tmpdeb}" "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+        url="$(cuda_keyring_url_for_distro "${CUDA_REPO_DISTRO}")"
+        wget -O "${tmpdeb}" "${url}"
         wait_for_apt
         dpkg -i "${tmpdeb}"
         rm -f "${tmpdeb}"
@@ -1293,7 +1402,17 @@ nvidia_target_dkms_package() {
                 "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
                 "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}"
         do
-                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                if installed_dpkg_package "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        for candidate in \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if apt_package_available "${candidate}"; then
                         printf '%s\n' "${candidate}"
                         return 0
                 fi
@@ -1308,12 +1427,89 @@ nvidia_target_driver_package() {
                 "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
                 "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
         do
-                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                if installed_dpkg_package "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        for candidate in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if apt_package_available "${candidate}"; then
                         printf '%s\n' "${candidate}"
                         return 0
                 fi
         done
         printf '%s\n' "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+}
+
+print_nvidia_target_package_policy() {
+        local pkg
+
+        echo "=== apt-cache policy for NVIDIA target ${TARGET_NVIDIA_DRIVER_MAJOR} packages ===" >&2
+        for pkg in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-utils-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "libnvidia-encode-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "libnvidia-fbc1-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-utils-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "libnvidia-encode-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "libnvidia-fbc1-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                echo "--- ${pkg} ---" >&2
+                apt-cache policy "${pkg}" >&2 2>/dev/null || true
+        done
+}
+
+select_nvidia_driver_package_family() {
+        local family suffix driver_pkg dkms_pkg
+
+        for family in server non-server; do
+                if [[ "${family}" == "server" ]]; then
+                        suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+                else
+                        suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
+                fi
+
+                driver_pkg="nvidia-driver-${suffix}"
+                dkms_pkg="nvidia-dkms-${suffix}"
+                if apt_package_available "${driver_pkg}" && apt_package_available "${dkms_pkg}"; then
+                        NVIDIA_DRIVER_PACKAGE_FAMILY="${family}"
+                        NVIDIA_DRIVER_PACKAGE="${driver_pkg}"
+                        NVIDIA_DKMS_PACKAGE="${dkms_pkg}"
+                        if [[ "${CUDA_REPO_ENABLED}" == "1" ]]; then
+                                NVIDIA_DRIVER_SOURCE="CUDA repo"
+                        else
+                                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                        fi
+                        log "Selected NVIDIA driver source: ${NVIDIA_DRIVER_SOURCE}"
+                        log "Selected NVIDIA driver package family: ${NVIDIA_DRIVER_PACKAGE_FAMILY}"
+                        log "Selected NVIDIA driver packages: ${NVIDIA_DRIVER_PACKAGE}, ${NVIDIA_DKMS_PACKAGE}"
+                        return 0
+                fi
+        done
+
+        print_nvidia_target_package_policy
+        die "Could not find a consistent NVIDIA ${TARGET_NVIDIA_DRIVER_MAJOR} server or non-server package family in apt for $(ubuntu_os_summary)"
+}
+
+installed_nvidia_driver_package_family() {
+        if dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"; then
+                printf '%s\n' "server"
+        elif dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}"; then
+                printf '%s\n' "non-server"
+        elif dpkg_package_configured_ii "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"; then
+                printf '%s\n' "open"
+        else
+                printf '%s\n' "unknown"
+        fi
 }
 
 collect_non_current_kernel_versions() {
@@ -1494,18 +1690,20 @@ nvidia_install_output_has_dkms_kernel_failure() {
 }
 
 require_nvidia_recovery_package_state() {
-        local current_kernel
+        local current_kernel dkms_pkg driver_pkg
         current_kernel="$(uname -r)"
+        dkms_pkg="${NVIDIA_DKMS_PACKAGE:-$(nvidia_target_dkms_package)}"
+        driver_pkg="${NVIDIA_DRIVER_PACKAGE:-$(nvidia_target_driver_package)}"
 
-        if ! dpkg_package_configured_ii "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
-                || ! dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"; then
+        if ! dpkg_package_configured_ii "${dkms_pkg}" \
+                || ! dpkg_package_configured_ii "${driver_pkg}"; then
                 print_nvidia_driver_diagnostics
-                die "NVIDIA recovery did not leave nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server and nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server configured as ii"
+                die "NVIDIA recovery did not leave ${dkms_pkg} and ${driver_pkg} configured as ii"
         fi
 
-        if ! nvidia_server_dkms_installed_for_current_kernel; then
+        if ! nvidia_dkms_installed_for_current_kernel; then
                 print_nvidia_driver_diagnostics
-                die "NVIDIA recovery did not install nvidia-srv DKMS for ${current_kernel}"
+                die "NVIDIA recovery did not install NVIDIA DKMS for ${current_kernel}"
         fi
 }
 
@@ -1611,7 +1809,12 @@ install_target_nvidia_driver() {
 
         repair_dpkg_state_if_needed
         prepare_single_kernel_for_nvidia_dkms
-        ensure_cuda_ubuntu_repo
+        if [[ "$(ubuntu_version_id)" == "24.04" ]]; then
+                ensure_cuda_ubuntu_repo
+        else
+                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                log "Ubuntu $(ubuntu_version_id) detected; preferring native Ubuntu NVIDIA driver packages and deferring any CUDA repo setup until toolkit install"
+        fi
 
         if dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
                 | grep -Eq '^(cuda-drivers|cuda-drivers-|nvidia-|libnvidia-|linux-modules-nvidia-|linux-objects-nvidia-|linux-signatures-nvidia-)'; then
@@ -1623,28 +1826,20 @@ install_target_nvidia_driver() {
                 cleanup_conflicting_nvidia_driver_packages
         fi
 
-        local driver_pkg=""
-        local candidate
-        for candidate in \
-                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
-                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
-                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
-        do
-                if apt_package_available "${candidate}"; then
-                        driver_pkg="${candidate}"
-                        break
-                fi
-        done
+        select_nvidia_driver_package_family
 
-        [[ -n "${driver_pkg}" ]] || die "Could not find an installable NVIDIA ${TARGET_NVIDIA_DRIVER_MAJOR} driver package"
-
+        local driver_pkg="${NVIDIA_DRIVER_PACKAGE}"
         local pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
-        if [[ "${driver_pkg}" == "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" ]]; then
-                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
-        fi
+        local candidate
 
         local -a install_pkgs
-        install_pkgs=("${driver_pkg}")
+        if [[ "${NVIDIA_DRIVER_PACKAGE_FAMILY}" == "server" ]]; then
+                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+        else
+                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
+        fi
+
+        install_pkgs=("${driver_pkg}" "${NVIDIA_DKMS_PACKAGE}")
         for candidate in \
                 "nvidia-utils-${pkg_suffix}" \
                 "libnvidia-encode-${pkg_suffix}" \
@@ -1668,7 +1863,7 @@ install_target_nvidia_driver() {
                 fi
         fi
 
-        dkms_pkg="$(nvidia_target_dkms_package)"
+        dkms_pkg="${NVIDIA_DKMS_PACKAGE:-$(nvidia_target_dkms_package)}"
         require_nvidia_running_kernel_modules_intact
 
         modprobe nvidia 2>/dev/null || true
@@ -1718,23 +1913,113 @@ install_target_nvidia_driver() {
         log "NVIDIA driver acceptance gate passed for ${TARGET_NVIDIA_DRIVER_MAJOR} on kernel $(uname -r)"
 }
 
-install_cuda_toolkit_if_requested() {
-        if [[ "${INSTALL_CUDA_TOOLKIT}" == "0" ]]; then
-                log "INSTALL_CUDA_TOOLKIT=0; skipping CUDA toolkit install"
+cuda_toolkit_ready() {
+        local nvcc_bin=""
+
+        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                nvcc_bin="/usr/local/cuda/bin/nvcc"
+        elif command -v nvcc >/dev/null 2>&1; then
+                nvcc_bin="$(command -v nvcc)"
+        fi
+
+        [[ -n "${nvcc_bin}" ]] || return 1
+        [[ -d /usr/local/cuda/include ]] || return 1
+        [[ -d /usr/local/cuda/lib64 ]] || return 1
+}
+
+verify_cuda_toolkit_or_fail() {
+        if cuda_toolkit_ready; then
+                export PATH="/usr/local/cuda/bin:${PATH}"
+                export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                        /usr/local/cuda/bin/nvcc --version || true
+                else
+                        nvcc --version || true
+                fi
                 return 0
         fi
 
-        log "Installing CUDA toolkit package: ${CUDA_TOOLKIT_PACKAGE}"
-        ensure_cuda_ubuntu_repo
-        apt_install_wait "${CUDA_TOOLKIT_PACKAGE}"
-
-        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
-                /usr/local/cuda/bin/nvcc --version || true
-        elif command -v nvcc >/dev/null 2>&1; then
-                nvcc --version || true
-        else
-                log "CUDA toolkit installed, but nvcc was not found on PATH"
+        if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                die "CUDA toolkit was requested but nvcc, /usr/local/cuda/include, or /usr/local/cuda/lib64 is missing"
         fi
+
+        log "CUDA toolkit verification failed, but REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}; continuing"
+        return 0
+}
+
+install_cuda_toolkit_from_runfile() {
+        local runfile
+
+        CUDA_TOOLKIT_SOURCE="runfile"
+        log "Installing CUDA toolkit using toolkit-only NVIDIA runfile"
+        log "CUDA runfile URL: ${CUDA_RUNFILE_URL}"
+
+        runfile="$(mktemp /tmp/cuda-toolkit.XXXXXX.run)"
+        wget -O "${runfile}" "${CUDA_RUNFILE_URL}"
+        chmod 0755 "${runfile}"
+
+        if ! sh "${runfile}" --silent --toolkit --override; then
+                rm -f "${runfile}"
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit-only runfile install failed from ${CUDA_RUNFILE_URL}"
+                fi
+                log "CUDA toolkit-only runfile install failed; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+        rm -f "${runfile}"
+
+        verify_cuda_toolkit_or_fail
+}
+
+install_cuda_toolkit_if_requested() {
+        local method="${CUDA_INSTALL_METHOD}"
+
+        if [[ "${INSTALL_CUDA_TOOLKIT}" == "0" || "${method}" == "none" ]]; then
+                log "CUDA toolkit install disabled: INSTALL_CUDA_TOOLKIT=${INSTALL_CUDA_TOOLKIT}, CUDA_INSTALL_METHOD=${method}"
+                return 0
+        fi
+
+        if cuda_toolkit_ready; then
+                CUDA_TOOLKIT_SOURCE="already installed"
+                log "CUDA toolkit already present under /usr/local/cuda"
+                verify_cuda_toolkit_or_fail
+                return 0
+        fi
+
+        case "${method}" in
+                auto)
+                        if [[ -n "$(detect_cuda_repo_distro || true)" ]]; then
+                                method="apt"
+                        else
+                                method="runfile"
+                        fi
+                        ;;
+                apt|runfile)
+                        ;;
+                *)
+                        die "Unsupported CUDA_INSTALL_METHOD='${CUDA_INSTALL_METHOD}'. Supported: auto, apt, runfile, none."
+                        ;;
+        esac
+
+        case "${method}" in
+                apt)
+                        ensure_cuda_ubuntu_repo
+                        if [[ "${CUDA_REPO_ENABLED}" != "1" ]]; then
+                                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                                        die "CUDA_INSTALL_METHOD=apt requested, but no official CUDA apt repo is available for $(ubuntu_os_summary)"
+                                fi
+                                log "CUDA apt repo unavailable; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                                return 0
+                        fi
+                        CUDA_TOOLKIT_SOURCE="apt repo ${CUDA_REPO_DISTRO}"
+                        log "Installing CUDA toolkit package from ${CUDA_REPO_DISTRO}: ${CUDA_TOOLKIT_PACKAGE}"
+                        apt_install_wait "${CUDA_TOOLKIT_PACKAGE}"
+                        verify_cuda_toolkit_or_fail
+                        ;;
+                runfile)
+                        install_cuda_toolkit_from_runfile
+                        ;;
+        esac
 }
 
 install_sunshine_deb() {
@@ -2606,8 +2891,13 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "580"
         printf 'INSTALL_CUDA_TOOLKIT=%q\n' "1"
         printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "cuda-toolkit"
+        printf 'CUDA_INSTALL_METHOD=%q\n' "auto"
+        printf 'REQUIRE_CUDA_TOOLKIT=%q\n' "1"
+        printf 'CUDA_RUNFILE_VERSION=%q\n' "13.0.2"
+        printf 'CUDA_RUNFILE_DRIVER_VERSION=%q\n' "580.95.05"
+        printf 'CUDA_RUNFILE_URL=%q\n' "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run"
         printf 'FORCE_DRIVER_UPGRADE=%q\n' "1"
-                        printf 'SUNSHINE_SOURCE_MODE=%q\n' "fork"
+        printf 'SUNSHINE_SOURCE_MODE=%q\n' "fork"
         printf 'SUNSHINE_FORK_REPO=%q\n' "https://github.com/NoviceAtPython/Sunshine.git"
         printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
         printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "clouddeploy-clean-pairing-stream-fix"
@@ -3485,19 +3775,36 @@ validate_streaming_stack_ready() {
 
 print_driver_cuda_sunshine_summary() {
         local actual_driver packaged_sunshine cuda_version runtime_kind
+        local driver_family driver_source cuda_source
 
         actual_driver="$(current_nvidia_driver_version || true)"
         packaged_sunshine="$(command -v sunshine 2>/dev/null || true)"
         cuda_version="$(cuda_version_line || true)"
+        driver_family="${NVIDIA_DRIVER_PACKAGE_FAMILY}"
+        [[ "${driver_family}" != "unknown" ]] || driver_family="$(installed_nvidia_driver_package_family)"
+        driver_source="${NVIDIA_DRIVER_SOURCE}"
+        if [[ "${driver_source}" == "not selected" ]]; then
+                if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
+                        driver_source="CUDA repo"
+                else
+                        driver_source="native Ubuntu"
+                fi
+        fi
+        cuda_source="${CUDA_TOOLKIT_SOURCE}"
         if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
                 runtime_kind="clouddeploy fork binary"
         else
                 runtime_kind="packaged .deb Sunshine"
         fi
 
+        echo "Ubuntu version: $(ubuntu_os_summary)"
         echo "NVIDIA driver target: ${TARGET_NVIDIA_DRIVER_MAJOR}"
         echo "NVIDIA driver actual: ${actual_driver:-unknown}"
+        echo "NVIDIA driver source: ${driver_source}"
+        echo "NVIDIA driver package family: ${driver_family}"
         echo "CUDA toolkit requested: ${INSTALL_CUDA_TOOLKIT}"
+        echo "CUDA toolkit install method: ${CUDA_INSTALL_METHOD}"
+        echo "CUDA toolkit source: ${cuda_source}"
         echo "CUDA version: ${cuda_version:-not detected}"
         echo "Sunshine source mode: ${SUNSHINE_SOURCE_MODE}"
         echo "Sunshine runtime type: ${runtime_kind}"
@@ -3864,8 +4171,13 @@ mark_phase_done "kde-installed.done"
 
 set_phase "nvidia-repository"
 repair_dpkg_state_if_needed
-log "Ensuring CUDA/NVIDIA apt repository is available"
-ensure_cuda_ubuntu_repo
+log "Detecting CUDA/NVIDIA apt repository support for $(ubuntu_os_summary)"
+if [[ "$(ubuntu_version_id)" == "24.04" ]]; then
+        ensure_cuda_ubuntu_repo
+else
+        NVIDIA_DRIVER_SOURCE="native Ubuntu"
+        log "Ubuntu $(ubuntu_version_id) detected; CUDA repo setup is deferred until CUDA toolkit phase so native NVIDIA driver packages are preferred."
+fi
 
 set_phase "nvidia-driver"
 log "CUDA toolkit install is deferred until nvidia-smi works."
