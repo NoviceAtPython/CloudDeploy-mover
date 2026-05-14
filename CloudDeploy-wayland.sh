@@ -16,9 +16,37 @@ APT_DPKG_OPTIONS=(
         -o Dpkg::Options::=--force-confold
 )
 
-DEFAULT_USER="${SUDO_USER:-user}"
+clouddeploy_default_real_user() {
+        local candidate
+
+        candidate="${SUDO_USER:-}"
+        if [[ -n "${candidate}" && "${candidate}" != "root" ]] \
+                && [[ "$(id -u "${candidate}" 2>/dev/null || echo 0)" -ge 1000 ]]; then
+                printf '%s\n' "${candidate}"
+                return 0
+        fi
+
+        if [[ "$(id -u user 2>/dev/null || echo 0)" -ge 1000 ]]; then
+                printf '%s\n' "user"
+                return 0
+        fi
+
+        candidate="$(getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" && $7 !~ /(nologin|false)$/ { print $1; exit }')"
+        if [[ -n "${candidate}" ]]; then
+                printf '%s\n' "${candidate}"
+                return 0
+        fi
+
+        printf '%s\n' "user"
+}
+
+ALLOW_ROOT_SESSION="${ALLOW_ROOT_SESSION:-0}"
+DEFAULT_USER="${DEFAULT_USER:-$(clouddeploy_default_real_user)}"
+if [[ "${DEFAULT_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+        DEFAULT_USER="$(clouddeploy_default_real_user)"
+fi
 HEADLESS_USER="${HEADLESS_USER:-$DEFAULT_USER}"
-SUNSHINE_USER="${SUNSHINE_USER:-$DEFAULT_USER}"
+SUNSHINE_USER="${SUNSHINE_USER:-$HEADLESS_USER}"
 SUNSHINE_PASS="${SUNSHINE_PASS:-}"
 TAILSCALE_AUTHKEY="${TAILSCALE_AUTHKEY:-}"
 SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb}"
@@ -54,7 +82,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="19-protect-running-kernel-abi-cleanup"
+SCRIPT_VERSION="20-real-user-runtime-and-force-mode-guard"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -77,6 +105,12 @@ die() {
         if declare -F clouddeploy_failure_diagnostics >/dev/null 2>&1; then
                 clouddeploy_failure_diagnostics "$*" || true
         fi
+        if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+                systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" 2>/dev/null || true
+                rm -f "${CLOUDDEPLOY_STATE_DIR}/reboot-needed" 2>/dev/null || true
+        fi
         exit 1
 }
 
@@ -87,6 +121,12 @@ clouddeploy_failure_trap() {
         echo "Failed at line ${line} during phase '${CURRENT_PHASE:-unknown}'" >&2
         if declare -F clouddeploy_failure_diagnostics >/dev/null 2>&1; then
                 clouddeploy_failure_diagnostics "line ${line}" || true
+        fi
+        if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+                systemctl disable clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                systemctl reset-failed clouddeploy-wayland-continue.service >/dev/null 2>&1 || true
+                rm -f "${REBOOT_MARKER}" "${REBOOT_REASON_FILE}" 2>/dev/null || true
+                rm -f "${CLOUDDEPLOY_STATE_DIR}/reboot-needed" 2>/dev/null || true
         fi
         exit "${rc}"
 }
@@ -111,6 +151,70 @@ require_root() {
 
 user_home() {
         getent passwd "$1" | cut -d: -f6
+}
+
+user_is_root_identity() {
+        local user="$1"
+
+        [[ "${user}" == "root" ]] && return 0
+        [[ "$(id -u "${user}" 2>/dev/null || echo -1)" == "0" ]]
+}
+
+normalize_clouddeploy_users() {
+        local fallback
+
+        fallback="$(clouddeploy_default_real_user)"
+
+        if user_is_root_identity "${HEADLESS_USER}"; then
+                if [[ "${ALLOW_ROOT_SESSION}" == "1" ]]; then
+                        log "ALLOW_ROOT_SESSION=1; allowing HEADLESS_USER=${HEADLESS_USER}"
+                else
+                        log "HEADLESS_USER resolved to root in this context; using real user '${fallback}' instead"
+                        HEADLESS_USER="${fallback}"
+                fi
+        fi
+
+        if user_is_root_identity "${SUNSHINE_USER}"; then
+                if [[ "${ALLOW_ROOT_SESSION}" == "1" ]]; then
+                        log "ALLOW_ROOT_SESSION=1; allowing SUNSHINE_USER=${SUNSHINE_USER}"
+                else
+                        log "SUNSHINE_USER resolved to root in this context; using HEADLESS_USER='${HEADLESS_USER}' instead"
+                        SUNSHINE_USER="${HEADLESS_USER}"
+                fi
+        fi
+
+        case "${STREAM_MODE}" in
+                plasma|kwin|realvt)
+                        if user_is_root_identity "${HEADLESS_USER}" && [[ "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+                                die "STREAM_MODE=${STREAM_MODE} must not run KWin/Plasma as root. Set HEADLESS_USER to a real UID>=1000 user."
+                        fi
+                        ;;
+        esac
+}
+
+ensure_headless_user_context() {
+        normalize_clouddeploy_users
+
+        if ! id "${HEADLESS_USER}" >/dev/null 2>&1; then
+                if [[ "${HEADLESS_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+                        die "Refusing to create/use root as HEADLESS_USER"
+                fi
+                useradd -m -s /bin/bash "${HEADLESS_USER}"
+        fi
+
+        HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
+        if [[ "${HEADLESS_UID}" == "0" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+                die "HEADLESS_USER=${HEADLESS_USER} has UID 0; refusing to run Wayland/KWin session as root"
+        fi
+
+        HOME_DIR="$(user_home "${HEADLESS_USER}")"
+        [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
+        RUNTIME_DIR="/run/user/${HEADLESS_UID}"
+        if [[ "${RUNTIME_DIR}" == "/run/user/0" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+                die "Refusing RUNTIME_DIR=/run/user/0 for non-root CloudDeploy session"
+        fi
+        KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
+        COMPOSITOR_SERVICE="$(service_for_mode)"
 }
 
 detect_nvidia_busid() {
@@ -249,6 +353,7 @@ service_for_mode() {
 }
 
 write_clouddeploy_env_file() {
+        ensure_headless_user_context
         install -m 0600 /dev/null "${CLOUDDEPLOY_ENV_FILE}"
 
         {
@@ -289,6 +394,7 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
+                printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
 
         chmod 0600 "${CLOUDDEPLOY_ENV_FILE}"
@@ -423,6 +529,8 @@ schedule_reboot_for_continuation() {
         local reason="$1"
         local message="$2"
 
+        ensure_headless_user_context
+        ensure_headless_user_admin_access
         write_clouddeploy_env_file
         install_continuation_service
         echo "${reason}" > "${REBOOT_REASON_FILE}"
@@ -635,6 +743,8 @@ ensure_phase2_kernel_args() {
         update_initramfs_clouddeploy -u
         update_grub_clouddeploy
 
+        ensure_headless_user_context
+        ensure_headless_user_admin_access
         write_clouddeploy_env_file
         install_continuation_service
         echo "edid-kernel-args" > "${REBOOT_REASON_FILE}"
@@ -716,6 +826,10 @@ sunshine_serverinfo_status_is_reachable() {
                         return 1
                         ;;
         esac
+}
+
+force_mode_helper_count() {
+        ps -eo args 2>/dev/null | awk '/clouddeploy-force-kwin-mode[.]sh/ { count++ } END { print count + 0 }'
 }
 
 find_qdbus_bin() {
@@ -2266,6 +2380,13 @@ prompt_default() {
 
 HEADLESS_USER="$(prompt_default HEADLESS_USER "${HEADLESS_USER:-user}")"
 SUNSHINE_USER="$(prompt_default SUNSHINE_USER "${SUNSHINE_USER:-${HEADLESS_USER}}")"
+if [[ "${HEADLESS_USER}" == "root" ]]; then
+        echo "HEADLESS_USER=root is refused by default; use a real UID>=1000 user." >&2
+        exit 1
+fi
+if [[ "${SUNSHINE_USER}" == "root" ]]; then
+        SUNSHINE_USER="${HEADLESS_USER}"
+fi
 read -s -r -p "SUNSHINE_PASS: " SUNSHINE_PASS
 echo
 read -s -r -p "TAILSCALE_AUTHKEY (blank to skip): " TAILSCALE_AUTHKEY
@@ -2318,6 +2439,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
+        printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
 chmod 0600 "${ENV_FILE}"
 echo "Wrote ${ENV_FILE} with mode 0600."
@@ -2337,6 +2459,15 @@ if [[ -f "${ENV_FILE}" ]]; then
 fi
 
 HEADLESS_USER="${HEADLESS_USER:-user}"
+ALLOW_ROOT_SESSION="${ALLOW_ROOT_SESSION:-0}"
+if [[ "${HEADLESS_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+        if [[ "$(id -u user 2>/dev/null || echo 0)" -ge 1000 ]]; then
+                HEADLESS_USER="user"
+        else
+                HEADLESS_USER="$(getent passwd | awk -F: '$3 >= 1000 && $1 != "nobody" && $7 !~ /(nologin|false)$/ { print $1; exit }')"
+        fi
+        [[ -n "${HEADLESS_USER}" ]] || { echo "HEADLESS_USER resolved to root and no real UID>=1000 user was found" >&2; exit 1; }
+fi
 STREAM_MODE="${STREAM_MODE:-plasma}"
 PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
@@ -2885,6 +3016,13 @@ sunshine_started_with_zero_resolution() {
 }
 
 print_streaming_diagnostics() {
+        echo "=== CloudDeploy selected user/runtime ==="
+        echo "HEADLESS_USER=${HEADLESS_USER}"
+        echo "HEADLESS_UID=${HEADLESS_UID:-unknown}"
+        echo "HOME_DIR=${HOME_DIR:-unknown}"
+        echo "RUNTIME_DIR=${RUNTIME_DIR:-unknown}"
+        echo "clouddeploy-force-kwin-mode.sh count=$(force_mode_helper_count)"
+        echo
         echo "=== KWin Wayland socket ==="
         ls -lah "${RUNTIME_DIR}/${KWIN_DISPLAY}" "${RUNTIME_DIR}/${KWIN_DISPLAY}.lock" 2>/dev/null || true
         echo
@@ -3033,6 +3171,7 @@ validate_streaming_stack_ready() {
         local compositor_service
         local edid_file ts_ip
         local web_code local_serverinfo_code tailscale_serverinfo_code
+        local force_count
 
         if ! nvidia_driver_ready; then
                 print_server_validation_diagnostics
@@ -3078,6 +3217,12 @@ validate_streaming_stack_ready() {
         if ! systemctl is-active --quiet sunshine-headless.service; then
                 print_server_validation_diagnostics
                 die "sunshine-headless.service failed to start"
+        fi
+
+        force_count="$(force_mode_helper_count)"
+        if [[ "${force_count}" =~ ^[0-9]+$ ]] && (( force_count > 1 )); then
+                print_server_validation_diagnostics
+                die "More than one clouddeploy-force-kwin-mode.sh helper is running (${force_count})"
         fi
 
         if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
@@ -3181,7 +3326,7 @@ print_driver_cuda_sunshine_summary() {
 print_final_validation_summary() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
         local edid_file cmdline_args ts_ip web_status local_serverinfo_status tailscale_serverinfo_status
-        local web_code local_serverinfo_code tailscale_serverinfo_code
+        local web_code local_serverinfo_code tailscale_serverinfo_code force_count
 
         edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
         cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
@@ -3206,6 +3351,15 @@ print_final_validation_summary() {
                 tailscale_serverinfo_status="not checked"
         fi
 
+        force_count="$(force_mode_helper_count)"
+        echo "Selected HEADLESS_USER: ${HEADLESS_USER}"
+        echo "Selected HEADLESS_UID: ${HEADLESS_UID:-unknown}"
+        echo "Selected HOME_DIR: ${HOME_DIR:-unknown}"
+        echo "Selected RUNTIME_DIR: ${RUNTIME_DIR:-unknown}"
+        echo "clouddeploy-force-kwin-mode.sh process count: ${force_count}"
+        echo "Service kwin-realvt: $(systemctl is-active kwin-realvt.service 2>/dev/null || echo unknown)"
+        echo "Service plasma-shell-realvt: $(systemctl is-active plasma-shell-realvt.service 2>/dev/null || echo unknown)"
+        echo "Service sunshine-headless: $(systemctl is-active sunshine-headless.service 2>/dev/null || echo unknown)"
         echo "EDID file active: ${edid_file:-unknown}"
         echo "Kernel cmdline EDID/NVIDIA args: ${cmdline_args:-missing expected args}"
         echo "KWin reported geometry/refresh: ${KNOWN_WESTON_MODE_LINE:-not observed}"
@@ -3334,6 +3488,8 @@ install_optional_apps_nonfatal() {
 # Start
 # =========================
 require_root
+ensure_headless_user_context
+ensure_headless_user_admin_access
 
 cleanup_stale_continuation_state_for_manual_rerun
 validate_tailscale_authkey
@@ -3464,21 +3620,12 @@ else
 fi
 
 log "Ensuring user exists"
-if ! id "${HEADLESS_USER}" >/dev/null 2>&1; then
-        useradd -m -s /bin/bash "${HEADLESS_USER}"
-fi
-
-HOME_DIR="$(user_home "${HEADLESS_USER}")"
-[[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
+ensure_headless_user_context
 
 usermod -aG sudo,video,input,render "${HEADLESS_USER}" || true
 ensure_headless_user_admin_access
 loginctl enable-linger "${HEADLESS_USER}" 2>/dev/null || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
-HEADLESS_UID="$(id -u "${HEADLESS_USER}")"
-RUNTIME_DIR="/run/user/${HEADLESS_UID}"
-KWIN_DISPLAY="${KWIN_WAYLAND_DISPLAY}"
-COMPOSITOR_SERVICE="$(service_for_mode)"
 
 set_phase "base-packages"
 repair_dpkg_state_if_needed
@@ -3775,8 +3922,15 @@ cat > /usr/local/bin/clouddeploy-force-kwin-mode.sh <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
+LOCK_FILE="/run/clouddeploy-force-kwin-mode.lock"
+
 if [[ "\$(id -u)" == "0" ]]; then
-        exec runuser -u "${HEADLESS_USER}" -- env \
+        install -m 0666 /dev/null "\${LOCK_FILE}" 2>/dev/null || true
+        if [[ "${HEADLESS_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
+                echo "Refusing to run clouddeploy-force-kwin-mode as root session user" >&2
+                exit 1
+        fi
+        exec timeout 30s runuser -u "${HEADLESS_USER}" -- env \
                 HOME="${HOME_DIR}" \
                 USER="${HEADLESS_USER}" \
                 LOGNAME="${HEADLESS_USER}" \
@@ -3788,6 +3942,9 @@ if [[ "\$(id -u)" == "0" ]]; then
                 XDG_SESSION_TYPE=wayland \
                 "\$0" "\$@"
 fi
+
+exec 9>"\${LOCK_FILE}" 2>/dev/null || exec 9>/tmp/clouddeploy-force-kwin-mode.lock
+flock -n 9 || exit 0
 
 export HOME="${HOME_DIR}"
 export USER="${HEADLESS_USER}"
@@ -3841,7 +3998,7 @@ kwin_mode_ready() {
         [[ "\${refresh}" =~ ^(119|120) ]] || return 1
 }
 
-for _ in \$(seq 1 90); do
+for _ in \$(seq 1 20); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
                 break
         fi
