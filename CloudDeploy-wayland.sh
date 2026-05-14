@@ -69,6 +69,11 @@ SUNSHINE_FORK_BRANCH="${SUNSHINE_FORK_BRANCH:-$SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
 SUNSHINE_BUILD_DIR="${SUNSHINE_BUILD_DIR:-/opt/sunshine-src}"
 SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS:-2}"
 SUNSHINE_INSTALL_BIN="${SUNSHINE_INSTALL_BIN:-/usr/local/bin/sunshine-clouddeploy}"
+# Sunshine's optional CUDA/NvFBC module fails to compile against CUDA 13 headers
+# combined with newer glibc on Ubuntu 25.10 / 26.04 (rsqrt/rsqrtf conflict).
+# The KMS/DRM/Wayland/NVENC streaming path does not need it, so auto-disable it
+# on those releases. Set to "on" to force it on, or "off" to always disable.
+SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
@@ -589,6 +594,7 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_BUILD_DIR=%q\n' "${SUNSHINE_BUILD_DIR}"
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
+                printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "${SUNSHINE_ENABLE_CUDA_MODULE}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
                 printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
@@ -1927,6 +1933,49 @@ cuda_toolkit_ready() {
         [[ -d /usr/local/cuda/lib64 ]] || return 1
 }
 
+expected_cuda_major() {
+        # Derive the expected nvcc release major (e.g. "13") from either
+        # CUDA_TOOLKIT_PACKAGE (cuda-toolkit-13-0 -> 13) or CUDA_RUNFILE_VERSION
+        # (13.0.2 -> 13). Returns empty when neither pins a specific version.
+        local pkg="${CUDA_TOOLKIT_PACKAGE:-}"
+        if [[ "${pkg}" =~ ^cuda-toolkit-([0-9]+)(-[0-9]+)?$ ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+                return 0
+        fi
+        if [[ -n "${CUDA_RUNFILE_VERSION:-}" ]]; then
+                printf '%s\n' "${CUDA_RUNFILE_VERSION%%.*}"
+                return 0
+        fi
+        printf '\n'
+}
+
+verify_cuda_toolkit_version_matches() {
+        local expected_major
+        expected_major="$(expected_cuda_major)"
+        [[ -n "${expected_major}" ]] || return 0
+        [[ -x /usr/local/cuda/bin/nvcc ]] || return 0
+
+        local actual_major
+        actual_major="$(/usr/local/cuda/bin/nvcc --version 2>/dev/null \
+                | sed -nE 's/.*release ([0-9]+)\.[0-9]+.*/\1/p' | head -n1)"
+        if [[ -z "${actual_major}" ]]; then
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit version check: could not parse nvcc release from /usr/local/cuda/bin/nvcc --version"
+                fi
+                log "WARNING: CUDA toolkit version check: could not parse nvcc release; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+
+        if [[ "${actual_major}" != "${expected_major}" ]]; then
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit version mismatch: expected major ${expected_major}.x (CUDA_TOOLKIT_PACKAGE=${CUDA_TOOLKIT_PACKAGE}, CUDA_RUNFILE_VERSION=${CUDA_RUNFILE_VERSION}), but nvcc reports release ${actual_major}.x. Refusing to accept Ubuntu's nvidia-cuda-toolkit (12.4) when CUDA ${expected_major} is required."
+                fi
+                log "WARNING: CUDA toolkit version mismatch: expected ${expected_major}.x, got ${actual_major}.x; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+        else
+                log "CUDA toolkit version check OK: nvcc release ${actual_major}.x matches expected ${expected_major}.x"
+        fi
+}
+
 verify_cuda_toolkit_or_fail() {
         if cuda_toolkit_ready; then
                 export PATH="/usr/local/cuda/bin:${PATH}"
@@ -1936,6 +1985,7 @@ verify_cuda_toolkit_or_fail() {
                 else
                         nvcc --version || true
                 fi
+                verify_cuda_toolkit_version_matches
                 return 0
         fi
 
@@ -1948,15 +1998,49 @@ verify_cuda_toolkit_or_fail() {
 }
 
 install_cuda_toolkit_from_runfile() {
-        local runfile
+        local runfile runfile_size
 
         CUDA_TOOLKIT_SOURCE="runfile"
         log "Installing CUDA toolkit using toolkit-only NVIDIA runfile"
         log "CUDA runfile URL: ${CUDA_RUNFILE_URL}"
 
         runfile="$(mktemp /tmp/cuda-toolkit.XXXXXX.run)"
-        wget -O "${runfile}" "${CUDA_RUNFILE_URL}"
+        if ! wget -O "${runfile}" "${CUDA_RUNFILE_URL}"; then
+                rm -f "${runfile}"
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit runfile download failed from ${CUDA_RUNFILE_URL}"
+                fi
+                log "CUDA toolkit runfile download failed; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+
+        # The real CUDA 13 toolkit-only runfile is ~4 GiB. Anything dramatically
+        # smaller is almost certainly an HTML error page (404, redirect, captive
+        # portal) saved as the target file. Refuse to execute it.
+        runfile_size="$(stat -c '%s' "${runfile}" 2>/dev/null || echo 0)"
+        if (( runfile_size < 1073741824 )); then
+                log "CUDA runfile from ${CUDA_RUNFILE_URL} is suspiciously small (${runfile_size} bytes); refusing to execute it."
+                rm -f "${runfile}"
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA runfile integrity check failed: file is only ${runfile_size} bytes (expected >1 GiB)"
+                fi
+                log "Skipping runfile install because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+
         chmod 0755 "${runfile}"
+
+        # NVIDIA runfiles support --check to validate the embedded MD5 sum.
+        if ! sh "${runfile}" --check >/tmp/cuda-runfile-check.log 2>&1; then
+                log "CUDA runfile --check failed; tail of /tmp/cuda-runfile-check.log:"
+                tail -n 20 /tmp/cuda-runfile-check.log 2>/dev/null || true
+                rm -f "${runfile}"
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA runfile integrity check (--check) failed for ${CUDA_RUNFILE_URL}"
+                fi
+                log "Skipping runfile install because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
 
         if ! sh "${runfile}" --silent --toolkit --override; then
                 rm -f "${runfile}"
@@ -2209,6 +2293,36 @@ EOF
         mark_phase_done "systemd-units-installed.done"
 }
 
+resolve_sunshine_cuda_module() {
+        # Returns "on" or "off" based on SUNSHINE_ENABLE_CUDA_MODULE and Ubuntu release.
+        # auto: enable on Ubuntu 24.04 and earlier; disable on 25.10 / 26.04 because
+        # CUDA 13 headers conflict with newer glibc (rsqrt/rsqrtf), which breaks
+        # Sunshine's optional CUDA/NvFBC module during nvcc compiler detection.
+        local mode="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
+        case "${mode}" in
+                on|off)
+                        printf '%s\n' "${mode}"
+                        return 0
+                        ;;
+                auto)
+                        ;;
+                *)
+                        log "WARNING: Unknown SUNSHINE_ENABLE_CUDA_MODULE='${mode}'; treating as auto"
+                        ;;
+        esac
+
+        local ver
+        ver="$(ubuntu_version_id)"
+        case "${ver}" in
+                25.10|26.04|26.10)
+                        printf 'off\n'
+                        ;;
+                *)
+                        printf 'on\n'
+                        ;;
+        esac
+}
+
 install_sunshine_from_fork_if_requested() {
         case "${SUNSHINE_SOURCE_MODE}" in
                 deb)
@@ -2267,21 +2381,78 @@ install_sunshine_from_fork_if_requested() {
                                 fi
                         done
 
+                        local sunshine_cuda_module
+                        sunshine_cuda_module="$(resolve_sunshine_cuda_module)"
+                        log "Sunshine fork build: SUNSHINE_ENABLE_CUDA_MODULE=${SUNSHINE_ENABLE_CUDA_MODULE} (resolved=${sunshine_cuda_module}) on $(ubuntu_os_summary)"
+
                         local -a cmake_cuda_args
                         cmake_cuda_args=()
                         if [[ -d /usr/local/cuda ]]; then
+                                export CUDA_HOME=/usr/local/cuda
+                                export CUDA_PATH=/usr/local/cuda
+                                export CUDAToolkit_ROOT=/usr/local/cuda
                                 export PATH="/usr/local/cuda/bin:${PATH}"
                                 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
                                 cmake_cuda_args+=("-DCUDAToolkit_ROOT=/usr/local/cuda" "-DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda")
+                                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                                        local nvcc_release
+                                        nvcc_release="$(/usr/local/cuda/bin/nvcc --version 2>/dev/null | sed -nE 's/.*release ([0-9.]+).*/\1/p' | head -n1)"
+                                        log "Sunshine fork build: nvcc release ${nvcc_release:-unknown} from /usr/local/cuda/bin/nvcc"
+                                fi
+                        else
+                                log "Sunshine fork build: /usr/local/cuda is missing; CUDA env exports skipped"
                         fi
+
+                        local -a cmake_sunshine_cuda_args
+                        case "${sunshine_cuda_module}" in
+                                off)
+                                        cmake_sunshine_cuda_args=("-DSUNSHINE_ENABLE_CUDA=OFF" "-DCUDA_FAIL_ON_MISSING=OFF")
+                                        log "Sunshine fork build: CUDA/NvFBC module disabled. DRM/KMS/Wayland + NVENC streaming path remains enabled."
+                                        ;;
+                                on)
+                                        cmake_sunshine_cuda_args=("-DSUNSHINE_ENABLE_CUDA=ON" "-DCUDA_FAIL_ON_MISSING=ON")
+                                        log "Sunshine fork build: CUDA/NvFBC module forced on; configure will fail if nvcc detection or compile fails."
+                                        ;;
+                                *)
+                                        cmake_sunshine_cuda_args=()
+                                        ;;
+                        esac
+
+                        local sunshine_build_subdir="${SUNSHINE_BUILD_DIR}/build"
+                        local cuda_mode_marker="${sunshine_build_subdir}/.clouddeploy-cuda-mode"
+                        local cuda_configure_pending="${sunshine_build_subdir}/.clouddeploy-configure-pending"
+                        local previous_cuda_mode=""
+                        if [[ -f "${cuda_mode_marker}" ]]; then
+                                previous_cuda_mode="$(<"${cuda_mode_marker}")"
+                        fi
+                        if [[ -d "${sunshine_build_subdir}" ]] \
+                                && { [[ -f "${cuda_configure_pending}" ]] \
+                                        || { [[ -n "${previous_cuda_mode}" ]] && [[ "${previous_cuda_mode}" != "${sunshine_cuda_module}" ]]; }; }; then
+                                if [[ -f "${cuda_configure_pending}" ]]; then
+                                        log "Sunshine fork build: previous configure did not complete; wiping ${sunshine_build_subdir}"
+                                else
+                                        log "Sunshine fork build: CUDA module changed (${previous_cuda_mode} -> ${sunshine_cuda_module}); wiping ${sunshine_build_subdir}"
+                                fi
+                                rm -rf "${sunshine_build_subdir}"
+                        fi
+
                         configure_git_safe_directories
+                        install -d -m 0755 "${sunshine_build_subdir}"
+                        : > "${cuda_configure_pending}"
                         (
                                 cd "${SUNSHINE_BUILD_DIR}"
                                 cmake -S . -B build -G Ninja \
                                         -DCMAKE_BUILD_TYPE=Release \
                                         -DBUILD_TESTS=OFF \
                                         -DSUNSHINE_BUILD_TESTS=OFF \
+                                        "${cmake_sunshine_cuda_args[@]}" \
                                         "${cmake_cuda_args[@]}"
+                        )
+                        rm -f "${cuda_configure_pending}"
+                        printf '%s\n' "${sunshine_cuda_module}" > "${cuda_mode_marker}"
+                        log "Sunshine fork build: configure complete (CUDA module=${sunshine_cuda_module}); DRM/KMS/Wayland/NVENC streaming path enabled."
+                        (
+                                cd "${SUNSHINE_BUILD_DIR}"
                                 cmake --build build --target sunshine -j "${SUNSHINE_BUILD_JOBS}"
                         )
 
@@ -2355,8 +2526,27 @@ install_optional_apt_package_if_available() {
         fi
 }
 
+libnvidia_egl_gbm_already_provided_by_gl_server() {
+        # On Ubuntu 25.10 the libnvidia-gl-${TARGET_NVIDIA_DRIVER_MAJOR}-server package
+        # ships /usr/lib/x86_64-linux-gnu/libnvidia-egl-gbm.so.1.x.y itself. Installing
+        # the standalone libnvidia-egl-gbm1 package then fails with a dpkg file-overwrite
+        # conflict. Detect that case and skip the standalone install.
+        local pkg
+        for pkg in $(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'libnvidia-gl-*-server' 2>/dev/null \
+                | awk '$1 == "ii" { print $2 }'); do
+                if dpkg -L "${pkg}" 2>/dev/null | grep -qE '/libnvidia-egl-gbm[.]so'; then
+                        log "libnvidia-egl-gbm.so is already provided by ${pkg}; skipping libnvidia-egl-gbm1 install to avoid dpkg file conflict."
+                        return 0
+                fi
+        done
+        return 1
+}
+
 ensure_nvidia_egl_helper_packages() {
         install_optional_apt_package_if_available "libnvidia-egl-wayland1"
+        if libnvidia_egl_gbm_already_provided_by_gl_server; then
+                return 0
+        fi
         install_optional_apt_package_if_available "libnvidia-egl-gbm1"
 }
 
@@ -2905,6 +3095,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_BUILD_DIR=%q\n' "/opt/sunshine-src"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
+        printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "auto"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
         printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
@@ -4536,6 +4727,69 @@ kwin_mode_ready() {
         [[ "\${refresh}" =~ ^(119|120) ]] || return 1
 }
 
+# Apply mode + scale.1 (+ optional position.0,0). Plasma 6 sometimes rejects
+# the position argument on virtual/headless outputs even though everything else
+# is fine; if that happens, retry without it. The scale.1 piece is the part
+# that actually unblocks Sunshine preflight (KWin must report Geometry as the
+# full ${TARGET_WIDTH}x${TARGET_HEIGHT}, not a scaled-down logical size).
+apply_kscreen_mode() {
+        local sel="\$1"
+        if kscreen-doctor "\${sel}.enable" "\${sel}.mode.\${MODE_ID}" "\${sel}.scale.1" "\${sel}.position.0,0"; then
+                return 0
+        fi
+        echo "kscreen-doctor rejected position.0,0 for \${sel}; retrying without position argument."
+        kscreen-doctor "\${sel}.enable" "\${sel}.mode.\${MODE_ID}" "\${sel}.scale.1"
+}
+
+# If ENABLE_HDR=1, attempt to turn on HDR + Wide Color Gamut after the
+# ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} scale.1 mode is set. KWin may reject HDR on the headless
+# DRM virtual output ("the driver rejected the output configuration"); in that
+# case we log HDR_REJECTED_BY_DRIVER and continue as SDR.
+maybe_apply_hdr() {
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        local sel
+        if [[ -n "\${OUTPUT_ID:-}" ]]; then
+                sel="output.\${OUTPUT_ID}"
+        else
+                sel="output.${FORCED_CONNECTOR}"
+        fi
+
+        echo "HDR_PROBE: ENABLE_HDR=1; attempting hdr.enable + wcg.enable + sdr-brightness.300 on \${sel}"
+        local hdr_attempt
+        hdr_attempt="\$(kscreen-doctor "\${sel}.hdr.enable" "\${sel}.wcg.enable" "\${sel}.sdr-brightness.300" 2>&1)" || true
+        printf '%s\n' "\${hdr_attempt}"
+
+        if printf '%s\n' "\${hdr_attempt}" | grep -qi 'the driver rejected the output configuration'; then
+                echo "HDR_REJECTED_BY_DRIVER: KWin rejected HDR output config; continuing as ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} SDR."
+                return 0
+        fi
+
+        sleep 1
+        local outinfo hdr_state wcg_state
+        outinfo="\$(kscreen-doctor -o 2>&1 || true)"
+        printf '%s\n' "\${outinfo}"
+        hdr_state="\$(printf '%s\n' "\${outinfo}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = (\$0 ~ conn) ? 1 : 0 }
+                in_block && /HDR:/ { print; exit }
+        ')"
+        wcg_state="\$(printf '%s\n' "\${outinfo}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = (\$0 ~ conn) ? 1 : 0 }
+                in_block && /Wide Color Gamut:/ { print; exit }
+        ')"
+
+        if [[ "\${hdr_state}" == *"enabled"* && "\${wcg_state}" == *"enabled"* ]]; then
+                echo "HDR_ENABLED: kscreen-doctor reports HDR + Wide Color Gamut enabled on ${FORCED_CONNECTOR}."
+        else
+                echo "HDR_NOT_CONFIRMED: HDR/WCG did not report as enabled; continuing as ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} SDR (hdr=\"\${hdr_state:-unknown}\", wcg=\"\${wcg_state:-unknown}\")."
+        fi
+}
+
+finalize_success() {
+        maybe_apply_hdr || true
+        exit 0
+}
+
 for _ in \$(seq 1 20); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
                 break
@@ -4552,7 +4806,7 @@ done
 
 if kwin_mode_ready; then
         echo "KWin already reports ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
-        exit 0
+        finalize_success
 fi
 
 OUT="\$(kscreen-doctor -o 2>&1 || true)"
@@ -4566,8 +4820,8 @@ MODE_ID="\$(printf '%s\n' "\${OUT}" | grep -oE '[0-9]+:${TARGET_WIDTH}x${TARGET_
 
 echo "Forcing ${FORCED_CONNECTOR} to ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} using output.\${OUTPUT_ID}.mode.\${MODE_ID}"
 
-if ! kscreen-doctor "output.\${OUTPUT_ID}.enable" "output.\${OUTPUT_ID}.mode.\${MODE_ID}" "output.\${OUTPUT_ID}.scale.1" "output.\${OUTPUT_ID}.position.0,0"; then
-        kscreen-doctor "output.${FORCED_CONNECTOR}.enable" "output.${FORCED_CONNECTOR}.mode.\${MODE_ID}" "output.${FORCED_CONNECTOR}.scale.1" "output.${FORCED_CONNECTOR}.position.0,0" || true
+if ! apply_kscreen_mode "output.\${OUTPUT_ID}"; then
+        apply_kscreen_mode "output.${FORCED_CONNECTOR}" || true
 fi
 
 sleep 2
@@ -4576,7 +4830,7 @@ if ! kscreen-doctor -o; then
 fi
 if kwin_mode_ready; then
         echo "KWin supportInformation confirms ${FORCED_CONNECTOR} ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
-        exit 0
+        finalize_success
 fi
 {
         echo "KWin did not report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish after force-mode." >&2
