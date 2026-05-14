@@ -390,7 +390,7 @@ installed_kwin_version() {
 
 plasma6_packages_available_from_native_repos() {
         local pkg candidate major
-        for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+        for pkg in plasma-workspace kwin-wayland plasma-desktop; do
                 candidate="$(package_candidate_version "${pkg}")"
                 [[ -n "${candidate}" && "${candidate}" != "(none)" ]] || return 1
                 major="$(version_major "${candidate}")"
@@ -405,19 +405,93 @@ require_plasma6_available_from_native_repos() {
 
         log "STREAM_MODE=plasma6 / ENABLE_PLASMA6=1 requested; checking native distro Plasma 6 availability"
         if plasma6_packages_available_from_native_repos; then
-                for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+                for pkg in plasma-workspace kwin-wayland plasma-desktop; do
                         candidate="$(package_candidate_version "${pkg}")"
                         log "Native Plasma 6 candidate: ${pkg}=${candidate}"
                 done
+                candidate="$(package_candidate_version plasma-workspace-wayland)"
+                if [[ -n "${candidate}" && "${candidate}" != "(none)" ]]; then
+                        log "Optional Plasma Wayland package available: plasma-workspace-wayland=${candidate}"
+                else
+                        log "Optional Plasma Wayland package absent: plasma-workspace-wayland; skipping on this distro"
+                fi
                 return 0
         fi
 
         echo "Plasma 6/KWin 6 package candidates from current apt repositories:" >&2
-        for pkg in plasma-workspace plasma-workspace-wayland kwin-wayland plasma-desktop; do
+        for pkg in plasma-workspace kwin-wayland plasma-desktop plasma-workspace-wayland; do
                 candidate="$(package_candidate_version "${pkg}")"
                 echo "  ${pkg}: ${candidate:-missing}" >&2
         done
         die "STREAM_MODE=plasma6 requires Plasma 6/KWin 6 packages from the current distro repositories. They are unavailable on this base image; use a newer base image/distro. CloudDeploy will not add KDE Neon repos to Ubuntu 24.04."
+}
+
+kde_plasma_package_list() {
+        local pkg candidate
+        local required_packages=(
+                plasma-workspace
+                kwin-wayland
+                plasma-desktop
+                kscreen
+                weston
+                xwayland
+                seatd
+                xdg-desktop-portal
+                xdg-desktop-portal-kde
+        )
+        local optional_packages=(
+                plasma-workspace-wayland
+                qdbus-qt5
+                qdbus6
+                qt6-tools-dev-tools
+                qttools5-dev-tools
+                kde-spectacle
+        )
+
+        for pkg in "${required_packages[@]}"; do
+                printf '%s\n' "${pkg}"
+        done
+
+        for pkg in "${optional_packages[@]}"; do
+                candidate="$(package_candidate_version "${pkg}")"
+                if [[ -n "${candidate}" && "${candidate}" != "(none)" ]]; then
+                        printf 'Optional KDE/Plasma package available: %s=%s\n' "${pkg}" "${candidate}" >&2
+                        printf '%s\n' "${pkg}"
+                else
+                        printf 'Optional KDE/Plasma package absent; skipping: %s\n' "${pkg}" >&2
+                fi
+        done
+}
+
+validate_plasma6_runtime_commands() {
+        local missing=()
+        local cmd
+
+        plasma6_mode_active || return 0
+
+        for cmd in kwin_wayland plasmashell startplasma-wayland kscreen-doctor; do
+                command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
+        done
+
+        if ! find_qdbus_bin >/dev/null 2>&1; then
+                missing+=("qdbus/qdbus-qt5/qdbus6")
+        fi
+
+        if (( ${#missing[@]} > 0 )); then
+                echo "Plasma/KWin command diagnostics:" >&2
+                for cmd in kwin_wayland plasmashell startplasma-wayland kscreen-doctor qdbus qdbus-qt5 qdbus6 /usr/lib/qt5/bin/qdbus /usr/lib/qt6/bin/qdbus; do
+                        if command -v "${cmd}" >/dev/null 2>&1; then
+                                echo "  ${cmd}: $(command -v "${cmd}")" >&2
+                        elif [[ -x "${cmd}" ]]; then
+                                echo "  ${cmd}: present" >&2
+                        else
+                                echo "  ${cmd}: missing" >&2
+                        fi
+                done
+                die "STREAM_MODE=plasma6 is missing required Plasma runtime command(s): ${missing[*]}"
+        fi
+
+        log "Plasma 6 runtime commands found: kwin_wayland, plasmashell, startplasma-wayland, kscreen-doctor, $(find_qdbus_bin)"
 }
 
 write_clouddeploy_env_file() {
@@ -3771,14 +3845,16 @@ set_phase "base-packages"
 repair_dpkg_state_if_needed
 apt_update_retry
 require_plasma6_available_from_native_repos
+mapfile -t KDE_PLASMA_PACKAGES < <(kde_plasma_package_list)
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
         dbus-user-session dbus-x11 \
-        plasma-desktop plasma-workspace plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 kde-spectacle weston xwayland seatd \
-        pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
+        "${KDE_PLASMA_PACKAGES[@]}" \
+        pipewire wireplumber \
         grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
+validate_plasma6_runtime_commands
 mark_phase_done "base-packages.done"
 mark_phase_done "kde-installed.done"
 
