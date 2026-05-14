@@ -1,3 +1,6 @@
+import re
+import shutil
+import subprocess
 from pathlib import Path
 
 OUTDIR = Path('/lib/firmware/edid')
@@ -104,8 +107,13 @@ def cta_block(vics, hdr=False, native_vic=None) -> bytes:
     svds = list(vics)
     data.extend([0x40 | len(svds), *svds])
     if hdr:
-        data.extend([0x73, 0x05, 0xC0, 0x00])
-        data.extend([0x76, 0x06, 0x0D, 0x01, 100, 80, 1])
+        # CTA-861 extended Colorimetry Data Block:
+        # ext tag 0x05, advertise BT.2020 cYCC/YCC/RGB support.
+        data.extend([0xE3, 0x05, 0xE0, 0x00])
+        # CTA-861 extended HDR Static Metadata Data Block:
+        # ext tag 0x06, EOTF bits 0..3 = SDR, Traditional HDR, PQ/ST 2084, HLG;
+        # static metadata descriptor bit 0 = Type 1.
+        data.extend([0xE6, 0x06, 0x0F, 0x01, 100, 80, 1])
 
     ext = bytearray(128)
     ext[0] = 0x02
@@ -121,7 +129,32 @@ def write_profile(filename: str, name: str, vics, preferred_timing: bytes, hdr=F
     (OUTDIR / filename).write_bytes(blob)
 
 
+def validate_hdr_profile(filename: str):
+    path = OUTDIR / filename
+    pattern = re.compile(r'HDR|EOTF|PQ|HLG|BT[.]2020|Static Metadata|SMPTE ST 2084', re.IGNORECASE)
+
+    # Local validation command:
+    # edid-decode /lib/firmware/edid/virtual-4k120-hdr.bin \
+    #   | grep -Ei 'HDR|EOTF|PQ|HLG|BT.2020|Static Metadata'
+    if not shutil.which('edid-decode'):
+        print(f"edid-decode not found; validate HDR metadata with: edid-decode {path} | grep -Ei 'HDR|EOTF|PQ|HLG|BT.2020|Static Metadata'")
+        return
+
+    decoded = subprocess.run(
+        ['edid-decode', str(path)],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    ).stdout
+    matches = [line for line in decoded.splitlines() if pattern.search(line)]
+    if not matches:
+        raise SystemExit(f"{path} did not decode with HDR/BT.2020 CTA metadata")
+    print('\n'.join(matches))
+
+
 write_profile('virtual-1080p-sdr.bin', 'CloudDeploy 1080p', [16], DTD_1080P60, hdr=False)
 write_profile('virtual-4k60-sdr.bin', 'CloudDeploy 4K60', [97], DTD_4K60, hdr=False, native_vic=97)
 write_profile('virtual-4k120-sdr.bin', 'CloudDeploy 4K120', [118, 97], DTD_4K60, hdr=False, native_vic=118)
 write_profile('virtual-4k120-hdr.bin', 'CloudDeploy 4K120 HDR', [118, 97], DTD_4K60, hdr=True, native_vic=118)
+validate_hdr_profile('virtual-4k120-hdr.bin')
