@@ -658,6 +658,40 @@ tailscale_ipv4() {
         tailscale ip -4 2>/dev/null | head -n1 || true
 }
 
+http_status_code() {
+        local url="$1"
+        local code
+
+        code="$(curl -ksS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 "${url}" 2>/dev/null || true)"
+        if [[ "${code}" =~ ^[0-9][0-9][0-9]$ ]]; then
+                printf '%s\n' "${code}"
+        else
+                printf '000\n'
+        fi
+}
+
+sunshine_web_status_is_reachable() {
+        case "$1" in
+                200|301|302|401|403)
+                        return 0
+                        ;;
+                *)
+                        return 1
+                        ;;
+        esac
+}
+
+sunshine_serverinfo_status_is_reachable() {
+        case "$1" in
+                200|301|302)
+                        return 0
+                        ;;
+                *)
+                        return 1
+                        ;;
+        esac
+}
+
 find_qdbus_bin() {
         local candidate
         for candidate in qdbus qdbus-qt5 /usr/lib/qt5/bin/qdbus qdbus6 /usr/lib/qt6/bin/qdbus; do
@@ -1357,6 +1391,31 @@ resolve_sunshine_fork_branch() {
         printf '%s\n' "${requested_branch}"
 }
 
+git_safe_directory_add() {
+        local dir="$1"
+        local resolved_dir
+
+        command -v git >/dev/null 2>&1 || return 0
+        [[ -n "${dir:-}" ]] || return 0
+
+        resolved_dir="$(readlink -f "${dir}" 2>/dev/null || printf '%s\n' "${dir}")"
+        [[ -n "${resolved_dir:-}" ]] || return 0
+
+        if ! git config --global --get-all safe.directory 2>/dev/null | grep -Fxq "${resolved_dir}"; then
+                git config --global --add safe.directory "${resolved_dir}" || true
+        fi
+}
+
+configure_git_safe_directories() {
+        local script_dir
+
+        command -v git >/dev/null 2>&1 || return 0
+        script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        git_safe_directory_add "${script_dir}"
+        git_safe_directory_add "${SUNSHINE_BUILD_DIR}"
+        git_safe_directory_add "/home/user/CloudDeploy-mover"
+}
+
 install_clouddeploy_systemd_units() {
         local runtime_bin
 
@@ -1500,6 +1559,8 @@ install_sunshine_from_fork_if_requested() {
                                 libavcodec-dev libavdevice-dev libavfilter-dev libavformat-dev libavutil-dev libswscale-dev libswresample-dev \
                                 libboost-filesystem-dev libboost-log-dev libboost-program-options-dev libboost-system-dev libboost-thread-dev
 
+                        configure_git_safe_directories
+
                         local resolved_branch
                         resolved_branch="$(resolve_sunshine_fork_branch)"
                         SUNSHINE_FORK_BRANCH="${resolved_branch}"
@@ -1522,6 +1583,9 @@ install_sunshine_from_fork_if_requested() {
                                 git clone --recursive --branch "${SUNSHINE_FORK_BRANCH}" "${SUNSHINE_FORK_REPO}" "${SUNSHINE_BUILD_DIR}"
                         fi
 
+                        configure_git_safe_directories
+                        [[ -d "${SUNSHINE_BUILD_DIR}/.git" ]] || die "${SUNSHINE_BUILD_DIR} is missing .git after checkout"
+                        git -C "${SUNSHINE_BUILD_DIR}" rev-parse --show-toplevel >/dev/null
                         git -C "${SUNSHINE_BUILD_DIR}" submodule update --init --recursive
                         log "Applying Ubuntu 24.04 Doxygen compatibility patch for Sunshine fork build"
                         local doxyconfig_file
@@ -1542,12 +1606,16 @@ install_sunshine_from_fork_if_requested() {
                                 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
                                 cmake_cuda_args+=("-DCUDAToolkit_ROOT=/usr/local/cuda" "-DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda")
                         fi
-                        cmake -S "${SUNSHINE_BUILD_DIR}" -B "${SUNSHINE_BUILD_DIR}/build" -G Ninja \
-                                -DCMAKE_BUILD_TYPE=Release \
-                                -DBUILD_TESTS=OFF \
-                                -DSUNSHINE_BUILD_TESTS=OFF \
-                                "${cmake_cuda_args[@]}"
-                        cmake --build "${SUNSHINE_BUILD_DIR}/build" --target sunshine -j "${SUNSHINE_BUILD_JOBS}"
+                        configure_git_safe_directories
+                        (
+                                cd "${SUNSHINE_BUILD_DIR}"
+                                cmake -S . -B build -G Ninja \
+                                        -DCMAKE_BUILD_TYPE=Release \
+                                        -DBUILD_TESTS=OFF \
+                                        -DSUNSHINE_BUILD_TESTS=OFF \
+                                        "${cmake_cuda_args[@]}"
+                                cmake --build build --target sunshine -j "${SUNSHINE_BUILD_JOBS}"
+                        )
 
                         local built_bin
                         built_bin="$(find "${SUNSHINE_BUILD_DIR}/build" -type f -name sunshine -perm -111 2>/dev/null | head -n1)"
@@ -1657,10 +1725,27 @@ run_as_user() {
 }
 
 wait_for_cloud_init() {
+        local timeout_seconds
+
         if command -v cloud-init >/dev/null 2>&1; then
-                echo "Waiting for cloud-init..."
-                timeout 180 cloud-init status --wait \
-                        || echo "cloud-init is broken or timed out on this image; continuing because package/network checks will run next."
+                install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}" 2>/dev/null || true
+                if [[ -f "${CLOUDDEPLOY_STATE_DIR}/cloud-init-broken" ]]; then
+                        echo "cloud-init was previously marked broken on this image; skipping cloud-init wait."
+                        return 0
+                fi
+
+                timeout_seconds=180
+                if [[ "${CLOUDDEPLOY_CONTINUE:-0}" == "1" ]]; then
+                        timeout_seconds="${CLOUDDEPLOY_CONTINUE_CLOUD_INIT_TIMEOUT:-20}"
+                fi
+
+                echo "Waiting for cloud-init for up to ${timeout_seconds}s..."
+                if timeout "${timeout_seconds}" cloud-init status --wait; then
+                        return 0
+                fi
+
+                echo "cloud-init is broken or timed out on this image; continuing because package/network checks will run next."
+                touch "${CLOUDDEPLOY_STATE_DIR}/cloud-init-broken" 2>/dev/null || true
         fi
 }
 
@@ -2805,6 +2890,7 @@ validate_streaming_stack_ready() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
         local compositor_service
         local edid_file ts_ip
+        local web_code local_serverinfo_code tailscale_serverinfo_code
 
         if ! nvidia_driver_ready; then
                 print_server_validation_diagnostics
@@ -2884,10 +2970,30 @@ validate_streaming_stack_ready() {
                         || die "Sunshine web UI assets are missing built JS/CSS under /usr/local/assets/web"
         fi
 
-        ts_ip="$(tailscale_ipv4 || true)"
-        if [[ -n "${ts_ip}" ]] && ! curl -kfsS --connect-timeout 3 "https://${ts_ip}:47990" >/dev/null 2>&1; then
+        local_serverinfo_code="$(http_status_code "http://127.0.0.1:47989/serverinfo")"
+        log "Sunshine Moonlight serverinfo local HTTP status: ${local_serverinfo_code}"
+        if ! sunshine_serverinfo_status_is_reachable "${local_serverinfo_code}"; then
                 print_server_validation_diagnostics
-                die "Sunshine web UI is not reachable at https://${ts_ip}:47990"
+                die "Sunshine Moonlight serverinfo is not reachable at http://127.0.0.1:47989/serverinfo (HTTP ${local_serverinfo_code})"
+        fi
+
+        ts_ip="$(tailscale_ipv4 || true)"
+        if [[ -n "${ts_ip}" ]]; then
+                web_code="$(http_status_code "https://${ts_ip}:47990")"
+                log "Sunshine web UI over Tailscale HTTP status: ${web_code}"
+                if [[ "${web_code}" == "000" ]]; then
+                        print_server_validation_diagnostics
+                        die "Sunshine web UI connection failed at https://${ts_ip}:47990 (HTTP ${web_code})"
+                elif ! sunshine_web_status_is_reachable "${web_code}"; then
+                        log "WARNING: Sunshine web UI responded at https://${ts_ip}:47990 with unexpected HTTP ${web_code}; treating the web socket as reachable."
+                fi
+
+                tailscale_serverinfo_code="$(http_status_code "http://${ts_ip}:47989/serverinfo")"
+                log "Sunshine Moonlight serverinfo over Tailscale HTTP status: ${tailscale_serverinfo_code}"
+                if ! sunshine_serverinfo_status_is_reachable "${tailscale_serverinfo_code}"; then
+                        print_server_validation_diagnostics
+                        die "Sunshine Moonlight serverinfo is not reachable at http://${ts_ip}:47989/serverinfo (HTTP ${tailscale_serverinfo_code})"
+                fi
         fi
 
         if ! wait_for_streaming_log_markers; then
@@ -2932,7 +3038,8 @@ print_driver_cuda_sunshine_summary() {
 
 print_final_validation_summary() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
-        local edid_file cmdline_args ts_ip web_status
+        local edid_file cmdline_args ts_ip web_status local_serverinfo_status tailscale_serverinfo_status
+        local web_code local_serverinfo_code tailscale_serverinfo_code
 
         edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
         cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
@@ -2940,12 +3047,21 @@ print_final_validation_summary() {
                 | tr '\n' ' ' || true)"
         ts_ip="$(tailscale_ipv4 || true)"
         web_status="not checked"
+        local_serverinfo_code="$(http_status_code "http://127.0.0.1:47989/serverinfo")"
+        local_serverinfo_status="HTTP ${local_serverinfo_code}"
         if [[ -n "${ts_ip}" ]]; then
-                if curl -kfsS --connect-timeout 3 "https://${ts_ip}:47990" >/dev/null 2>&1; then
-                        web_status="reachable at https://${ts_ip}:47990"
+                web_code="$(http_status_code "https://${ts_ip}:47990")"
+                if sunshine_web_status_is_reachable "${web_code}"; then
+                        web_status="reachable at https://${ts_ip}:47990 (HTTP ${web_code})"
+                elif [[ "${web_code}" == "000" ]]; then
+                        web_status="connection failed at https://${ts_ip}:47990 (HTTP ${web_code})"
                 else
-                        web_status="not reachable at https://${ts_ip}:47990"
+                        web_status="responded with unexpected HTTP ${web_code} at https://${ts_ip}:47990"
                 fi
+                tailscale_serverinfo_code="$(http_status_code "http://${ts_ip}:47989/serverinfo")"
+                tailscale_serverinfo_status="HTTP ${tailscale_serverinfo_code}"
+        else
+                tailscale_serverinfo_status="not checked"
         fi
 
         echo "EDID file active: ${edid_file:-unknown}"
@@ -2966,6 +3082,8 @@ print_final_validation_summary() {
         echo "Sunshine HEVC encoder: ${KNOWN_SUNSHINE_HEVC_LINE:-not observed}"
         echo "Sunshine AV1 encoder: ${KNOWN_SUNSHINE_AV1_LINE:-not observed}"
         echo "Sunshine web UI over Tailscale: ${web_status}"
+        echo "Sunshine Moonlight serverinfo local: ${local_serverinfo_status}"
+        echo "Sunshine Moonlight serverinfo over Tailscale: ${tailscale_serverinfo_status}"
         echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
 }
 
@@ -3595,6 +3713,11 @@ done
         exit 1
 }
 
+if kwin_mode_ready; then
+        echo "KWin already reports ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
+        exit 0
+fi
+
 OUT="\$(kscreen-doctor -o 2>&1 || true)"
 echo "\${OUT}"
 
@@ -3611,8 +3734,14 @@ if ! kscreen-doctor "output.\${OUTPUT_ID}.enable" "output.\${OUTPUT_ID}.mode.\${
 fi
 
 sleep 2
-kscreen-doctor -o || true
-kwin_mode_ready || {
+if ! kscreen-doctor -o; then
+        echo "WARNING: kscreen-doctor -o failed after mode set attempt; checking KWin supportInformation before failing."
+fi
+if kwin_mode_ready; then
+        echo "KWin supportInformation confirms ${FORCED_CONNECTOR} ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
+        exit 0
+fi
+{
         echo "KWin did not report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish after force-mode." >&2
         exit 1
 }
