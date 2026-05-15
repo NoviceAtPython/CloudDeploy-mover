@@ -9,7 +9,56 @@ if LC_ALL=C grep -q $'\r' "$0" 2>/dev/null; then
 fi
 
 set -Eeuo pipefail
+
+# Non-interactive defaults applied globally to every apt / dpkg / debconf
+# child. NEEDRESTART_MODE=a tells needrestart to auto-restart services
+# instead of prompting (which would hang an unattended deploy); _SUSPEND=1
+# tells it to skip its own kernel/services check entirely during package
+# operations. DEBIAN_PRIORITY=critical suppresses lower-severity prompts.
 export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_PRIORITY=critical
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+# Source a root-owned, mode-600 user env file BEFORE any default is
+# evaluated, so secrets (SUNSHINE_PASS, TAILSCALE_AUTHKEY) and feature
+# toggles (ENABLE_HDR, CLOUDDEPLOY_AUTO_DIST_UPGRADE, etc.) can be set
+# without exposing them in `ps` via sudo env VAR=... command-line args.
+# Search order:
+#   1. ${CLOUDDEPLOY_USER_ENV_FILE} (explicit override)
+#   2. /root/clouddeploy-v2.env
+#   3. /root/.config/clouddeploy/env
+# Each candidate is rejected unless owned by root and mode 0600 or 0400.
+_cd_env_file=""
+for _cd_env_candidate in \
+                "${CLOUDDEPLOY_USER_ENV_FILE:-}" \
+                "/root/clouddeploy-v2.env" \
+                "/root/.config/clouddeploy/env"; do
+        [[ -n "${_cd_env_candidate}" && -f "${_cd_env_candidate}" ]] || continue
+        _cd_env_uid="$(stat -c '%u' "${_cd_env_candidate}" 2>/dev/null || echo -1)"
+        _cd_env_mode="$(stat -c '%a' "${_cd_env_candidate}" 2>/dev/null || echo "")"
+        if [[ "${_cd_env_uid}" != "0" ]]; then
+                echo "WARNING: ${_cd_env_candidate} is not owned by root (uid=${_cd_env_uid}); skipping for safety." >&2
+                continue
+        fi
+        case "${_cd_env_mode}" in
+                600|400)
+                        _cd_env_file="${_cd_env_candidate}"
+                        break
+                        ;;
+                *)
+                        echo "WARNING: ${_cd_env_candidate} has mode ${_cd_env_mode:-unknown}; expected 600 or 400. Skipping for safety." >&2
+                        ;;
+        esac
+done
+if [[ -n "${_cd_env_file}" ]]; then
+        echo "Sourcing CloudDeploy user env file: ${_cd_env_file}" >&2
+        set -a
+        # shellcheck disable=SC1090
+        . "${_cd_env_file}"
+        set +a
+fi
+unset _cd_env_file _cd_env_candidate _cd_env_uid _cd_env_mode
 
 APT_DPKG_OPTIONS=(
         -o Dpkg::Options::=--force-confdef
@@ -84,6 +133,15 @@ SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
 CLOUDDEPLOY_AUTO_DIST_UPGRADE="${CLOUDDEPLOY_AUTO_DIST_UPGRADE:-0}"
 CLOUDDEPLOY_TARGET_UBUNTU_VERSION="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION:-25.10}"
 CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QUESTING:-0}}"
+# do-release-upgrade -d from 24.04 LTS to 25.10 fails with "Upgrades to the
+# development release are only available from the latest supported release"
+# because 25.10 has already shipped (it's not the development release any
+# more) but the LTS path only offers the next LTS. Direct apt codename
+# rewrite (noble -> questing) is the path that actually works for that hop.
+# auto = enable the direct path only for the specific known-failing hop;
+# 1 = always prefer direct codename rewrite; 0 = never (require
+# do-release-upgrade to succeed on its own).
+CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE="${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE:-auto}"
 # Experimental: opt-in to NVIDIA DKMS HDR metadata patches. The metadata path
 # never reliably produced NV_HDR_STATIC_METADATA != blob 0 + working Moonlight
 # HDR before the live VM was deleted (see docs/HDR-NVIDIA-PRIVATE.md). No DKMS
@@ -125,6 +183,13 @@ CLOUDDEPLOY_REPO_BRANCH="${CLOUDDEPLOY_REPO_BRANCH:-v2}"
 # preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
 # differs between forced DP and forced HDMI; otherwise DP-1 is preferred.
 FORCE_CONNECTOR_AUTO="${FORCE_CONNECTOR_AUTO:-0}"
+# Virtual-* DRM connectors (virtio-gpu / KVM emulated outputs) are NOT the
+# NVIDIA modeset path we need for the documented HDR good state. By default
+# auto-detect refuses to land on Virtual-* even when nothing else is
+# enumerable yet - we'd rather keep the FORCED_CONNECTOR default and
+# re-resolve after the NVIDIA driver loads. Set to 1 only when you
+# explicitly want CloudDeploy to drive a Virtual-* output (no HDR).
+CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR="${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
@@ -216,6 +281,38 @@ mark_phase_done() {
 
         install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
         touch "${CLOUDDEPLOY_STATE_DIR}/${marker}"
+}
+
+acquire_clouddeploy_lock() {
+        # Take an exclusive flock on /run/clouddeploy-wayland.lock so two
+        # CloudDeploy runs cannot trample each other's apt/dpkg state. The
+        # FD is held open for the lifetime of the script - flock releases
+        # automatically on exit, and /run is tmpfs so the lock cleans up on
+        # reboot too (continuation-resume runs get a fresh lock).
+        local lock_file="${CLOUDDEPLOY_LOCK_FILE:-/run/clouddeploy-wayland.lock}"
+        install -d -m 0755 "$(dirname "${lock_file}")"
+
+        # FD 200 is reserved for the lifetime of this process.
+        exec 200>"${lock_file}" || die "Could not open lock file ${lock_file} (am I root?)"
+        if ! flock -n 200; then
+                local other_pid="" other_cmd=""
+                # lsof and fuser are the most reliable ways to identify the
+                # other holder; both are best-effort.
+                if command -v lsof >/dev/null 2>&1; then
+                        other_pid="$(lsof -t "${lock_file}" 2>/dev/null | grep -v "^$$\$" | head -n1 || true)"
+                fi
+                if [[ -z "${other_pid}" ]] && command -v fuser >/dev/null 2>&1; then
+                        other_pid="$(fuser "${lock_file}" 2>/dev/null | tr -s '[:space:]' '\n' | grep -v "^$$\$" | head -n1 || true)"
+                fi
+                if [[ -n "${other_pid}" ]]; then
+                        other_cmd="$(ps -o cmd= -p "${other_pid}" 2>/dev/null || true)"
+                        die "Another CloudDeploy-wayland.sh run is already in progress (PID ${other_pid}: ${other_cmd:-unknown}). Refusing to start a duplicate - duplicate runs corrupt apt/dpkg state. Wait for it to finish, attach to its journal (journalctl -u clouddeploy-manual-rerun -f), or kill it explicitly before re-running."
+                fi
+                die "Another process holds ${lock_file}; refusing to start a duplicate CloudDeploy run. Wait for it to finish or remove the lock file if you are certain no other run is in progress."
+        fi
+        # Record our identity inside the lock so the next run gets a useful
+        # diagnostic. Not used for locking - flock is the real lock.
+        printf 'pid=%s started=%s cmd=%s\n' "$$" "$(date -Iseconds 2>/dev/null || date -u +%FT%TZ)" "$0 $*" >&200 || true
 }
 
 require_root() {
@@ -372,21 +469,27 @@ drm_connector_status() {
 
 resolve_force_connector_auto() {
         # Returns one connector name on stdout, or exits with non-zero status
-        # when nothing usable is enumerable. Preference order:
+        # when no acceptable connector is enumerable yet. Preference order:
         #   ENABLE_HDR=1: HDMI-A-* first (HDR metadata/InfoFrame behaviour
         #     varies between forced DP and HDMI; HDMI-A-* has been the
         #     better experimental surface). Within HDMI, lower index first.
         #   ENABLE_HDR=0: DP-1, then any DP-*, then HDMI-A-*.
         # Within each class, prefer connectors that report status=connected
         # over status=disconnected (both can be EDID-forced via kernel cmdline).
+        # Virtual-* (virtio-gpu emulated) connectors are NEVER selected
+        # unless CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1; otherwise the caller
+        # keeps the existing FORCED_CONNECTOR default and re-resolves once
+        # the NVIDIA driver loads.
         local enable_hdr="${ENABLE_HDR:-0}"
+        local allow_virtual="${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}"
         local connector
-        local -a hdmi dp others
+        local -a hdmi dp virtual others
         while read -r connector; do
                 [[ -n "${connector}" ]] || continue
                 case "${connector}" in
                         HDMI-A-*) hdmi+=("${connector}") ;;
                         DP-*) dp+=("${connector}") ;;
+                        Virtual*|virtual*) virtual+=("${connector}") ;;
                         *) others+=("${connector}") ;;
                 esac
         done < <(list_drm_connectors)
@@ -405,6 +508,9 @@ resolve_force_connector_auto() {
                 done
                 [[ -n "${dp_first}" ]] && preferred+=("${dp_first}")
                 preferred+=("${rest[@]}" "${hdmi[@]}" "${others[@]}")
+        fi
+        if [[ "${allow_virtual}" == "1" ]]; then
+                preferred+=("${virtual[@]}")
         fi
 
         [[ "${#preferred[@]}" -gt 0 ]] || return 1
@@ -432,12 +538,20 @@ maybe_resolve_force_connector() {
                         log "FORCE_CONNECTOR_AUTO: confirmed FORCED_CONNECTOR=${picked} (ENABLE_HDR=${ENABLE_HDR})"
                 fi
                 FORCED_CONNECTOR="${picked}"
-        else
-                if [[ "${FORCED_CONNECTOR}" == "auto" ]]; then
-                        FORCED_CONNECTOR="DP-1"
-                fi
-                log "WARNING: FORCE_CONNECTOR_AUTO found no enumerable DRM connectors yet; keeping FORCED_CONNECTOR=${FORCED_CONNECTOR}"
+                return 0
         fi
+
+        # No acceptable connector enumerable yet. This is the normal state
+        # on a fresh VM before the NVIDIA driver has loaded: /sys/class/drm
+        # only exposes Virtual-1 from virtio-gpu, which we refuse to drive
+        # (the documented HDR good state requires a real NVIDIA DRM
+        # connector). Don't permanently rewrite FORCED_CONNECTOR to a virtio
+        # output - the display-detection phase re-runs this resolver after
+        # nvidia-drm.modeset=1 + the EDID kernel args have taken effect.
+        if [[ "${FORCED_CONNECTOR}" == "auto" ]]; then
+                FORCED_CONNECTOR="DP-1"
+        fi
+        log "FORCE_CONNECTOR_AUTO: deferring connector autodetect until NVIDIA DRM connectors exist; keeping FORCED_CONNECTOR=${FORCED_CONNECTOR}. (CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}; Virtual-* outputs are not eligible for HDR.)"
 }
 
 nvidia_modules_present_for_running_kernel() {
@@ -587,6 +701,145 @@ ubuntu_version_is_lts() {
         [[ "${ver}" =~ ^(1[68]|2[0246])\.04$ ]]
 }
 
+ubuntu_codename_for_version() {
+        # Map a VERSION_ID (e.g. 25.10) to the matching VERSION_CODENAME
+        # (e.g. questing) that appears in Ubuntu's apt sources Suites: line.
+        case "$1" in
+                22.04) printf 'jammy\n' ;;
+                22.10) printf 'kinetic\n' ;;
+                23.04) printf 'lunar\n' ;;
+                23.10) printf 'mantic\n' ;;
+                24.04) printf 'noble\n' ;;
+                24.10) printf 'oracular\n' ;;
+                25.04) printf 'plucky\n' ;;
+                25.10) printf 'questing\n' ;;
+                26.04) printf 'resolute\n' ;;
+                *) return 1 ;;
+        esac
+}
+
+should_use_direct_apt_codename_upgrade() {
+        # Returns 0 (yes) when the direct apt codename rewrite is the right
+        # tool for the current → target hop. 0/1/auto semantics:
+        #   1    -> always yes (operator override).
+        #   0    -> always no (force do-release-upgrade).
+        #   auto -> yes only for known-failing hops where do-release-upgrade
+        #           is known to bail out. Today: 24.04 LTS -> 25.10.
+        local from_ver="$1" to_ver="$2" mode="$3"
+        case "${mode}" in
+                1) return 0 ;;
+                0) return 1 ;;
+        esac
+        # auto
+        case "${from_ver}|${to_ver}" in
+                24.04|25.10) return 0 ;;
+                24.04\|25.10) return 0 ;;
+        esac
+        if [[ "${from_ver}" == "24.04" && "${to_ver}" == "25.10" ]]; then
+                return 0
+        fi
+        return 1
+}
+
+direct_apt_codename_upgrade() {
+        # Direct apt codename rewrite path. Used when do-release-upgrade
+        # cannot perform the hop (e.g. 24.04 LTS -> 25.10 questing). Steps:
+        #   1. Move third-party CUDA/NVIDIA/graphics-drivers apt sources
+        #      aside so they don't poison the dist-upgrade resolver.
+        #   2. apt-mark unhold all held packages.
+        #   3. Purge any installed CUDA/NVIDIA/xorg-nvidia packages; their
+        #      versions will be re-resolved from the new codename anyway.
+        #   4. Rewrite Ubuntu apt sources' codename in-place
+        #      (deb822 ubuntu.sources + legacy sources.list).
+        #   5. apt update + non-interactive dist-upgrade + autoremove +
+        #      dpkg --configure -a.
+        # Caller is responsible for scheduling the post-upgrade reboot via
+        # the continuation service.
+        local from_codename="$1" to_codename="$2"
+        log "Direct apt codename upgrade: ${from_codename} -> ${to_codename}"
+        log "WARNING: this path is experimental and target is non-LTS Ubuntu ${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}. CLOUDDEPLOY_ACCEPT_NON_LTS=1 was required to reach this code path."
+
+        # 1. Disable third-party CUDA/NVIDIA/graphics-drivers apt sources
+        # before the codename rewrite so dist-upgrade does not try to pull
+        # noble-keyed packages out of the new questing tree.
+        local disabled_dir="/etc/apt/sources.list.d/clouddeploy-disabled-during-upgrade"
+        install -d -m 0755 "${disabled_dir}"
+        local src basename match
+        for src in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+                [[ -f "${src}" ]] || continue
+                basename="$(basename "${src}")"
+                case "${basename}" in
+                        ubuntu.sources) continue ;;
+                esac
+                match=0
+                if grep -qE 'developer\.download\.nvidia\.com|ppa\.launchpadcontent\.net/graphics-drivers|cuda-keyring|nvidia-(drivers|cuda)|graphics-drivers' "${src}" 2>/dev/null; then
+                        match=1
+                elif [[ "${basename}" =~ (cuda|nvidia|graphics-drivers) ]]; then
+                        match=1
+                fi
+                if [[ "${match}" == "1" ]]; then
+                        log "  disabling third-party apt source: ${src} -> ${disabled_dir}/"
+                        mv "${src}" "${disabled_dir}/" || die "Could not move ${src} aside before release upgrade"
+                fi
+        done
+
+        # 2. Unhold any held packages so dist-upgrade can rewrite them.
+        local held held_list
+        held="$(apt-mark showhold 2>/dev/null || true)"
+        if [[ -n "${held}" ]]; then
+                log "Unholding packages before codename rewrite:"
+                printf '%s\n' "${held}" | while read -r held_list; do
+                        [[ -n "${held_list}" ]] || continue
+                        log "  apt-mark unhold ${held_list}"
+                        apt-mark unhold "${held_list}" >/dev/null 2>&1 || true
+                done
+        fi
+
+        # 3. Purge old NVIDIA/CUDA packages so we don't drag a 565/12.6 stack
+        # into the new codename.
+        log "Purging old CUDA/NVIDIA/xorg-nvidia packages before codename rewrite"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" purge -y \
+                'cuda-*' 'nsight-*' 'nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia-*' \
+                2>&1 || log "WARNING: some pre-upgrade NVIDIA/CUDA purges failed; continuing"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+                apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y 2>&1 || true
+
+        # 4. Rewrite Ubuntu apt sources codename. We handle both the modern
+        # deb822 layout at /etc/apt/sources.list.d/ubuntu.sources and the
+        # legacy /etc/apt/sources.list.
+        local rewrote=0
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+                log "Rewriting /etc/apt/sources.list.d/ubuntu.sources Suites: ${from_codename} -> ${to_codename}"
+                sed -i -E "s/(^Suites:[[:space:]]*[^#]*)\\b${from_codename}\\b/\\1${to_codename}/g" /etc/apt/sources.list.d/ubuntu.sources
+                # Catch any other line that still mentions the old codename.
+                sed -i -E "s/\\b${from_codename}\\b/${to_codename}/g" /etc/apt/sources.list.d/ubuntu.sources
+                rewrote=1
+        fi
+        if [[ -f /etc/apt/sources.list ]] && grep -qE "\\b${from_codename}\\b" /etc/apt/sources.list; then
+                log "Rewriting /etc/apt/sources.list ${from_codename} -> ${to_codename}"
+                sed -i -E "s/\\b${from_codename}\\b/${to_codename}/g" /etc/apt/sources.list
+                rewrote=1
+        fi
+        [[ "${rewrote}" == "1" ]] || die "Could not find an Ubuntu apt sources file mentioning ${from_codename} to rewrite. Refusing to dist-upgrade without confirming the codename is moving."
+
+        # 5. apt update + dist-upgrade against the new codename.
+        log "apt-get update on ${to_codename}"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" update -y \
+                || die "apt-get update failed after rewriting codename to ${to_codename}; check /etc/apt/sources.list.d/ubuntu.sources"
+
+        log "Running dist-upgrade ${from_codename} -> ${to_codename} (10-30 min)"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" -o Dpkg::Options::=--force-confnew dist-upgrade -y \
+                || die "dist-upgrade to ${to_codename} failed; inspect /var/log/apt/term.log and /var/log/dpkg.log"
+
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+                apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y \
+                2>&1 || log "WARNING: post-upgrade autoremove returned non-zero; continuing"
+        dpkg --configure -a 2>&1 || log "WARNING: dpkg --configure -a returned non-zero; continuation reboot may need to retry"
+}
+
 ubuntu_upgrade_progress_file() {
         printf '%s\n' "${CLOUDDEPLOY_STATE_DIR}/ubuntu-upgrade-from-version"
 }
@@ -638,6 +891,31 @@ maybe_upgrade_ubuntu() {
                         die "Ubuntu release upgrade did not make progress (was ${prior_ver}, still ${current_ver}); aborting to avoid an infinite reboot loop"
                 fi
                 log "Ubuntu release upgrade progressed: ${prior_ver} -> ${current_ver}"
+        fi
+
+        # Direct apt codename rewrite path. For 24.04 LTS -> 25.10 questing,
+        # do-release-upgrade -d errors with "Upgrades to the development
+        # release are only available from the latest supported release",
+        # so we rewrite the codename directly under apt instead.
+        if should_use_direct_apt_codename_upgrade "${current_ver}" "${target_ver}" "${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE}"; then
+                local target_codename
+                target_codename="$(ubuntu_codename_for_version "${target_ver}" || true)"
+                local current_codename
+                current_codename="$(ubuntu_codename)"
+                if [[ -z "${current_codename}" ]]; then
+                        current_codename="$(ubuntu_codename_for_version "${current_ver}" || true)"
+                fi
+                if [[ -z "${target_codename}" || -z "${current_codename}" ]]; then
+                        die "Direct apt codename upgrade requested but could not resolve codenames (current=${current_ver:-?}/${current_codename:-?}, target=${target_ver:-?}/${target_codename:-?}). Set CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=0 to force do-release-upgrade instead."
+                fi
+
+                install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+                printf '%s\n' "${current_ver}" > "${progress_file}"
+
+                direct_apt_codename_upgrade "${current_codename}" "${target_codename}"
+
+                schedule_reboot_for_continuation "ubuntu-upgrade" \
+                        "Direct apt codename upgrade ${current_codename} -> ${target_codename} dispatched (Ubuntu ${current_ver} -> ${target_ver}); rebooting to complete and resume CloudDeploy"
         fi
 
         # Pre-flight: make sure update-manager-core is present and the release
@@ -849,6 +1127,7 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_DEB_URL=%q\n' "${SUNSHINE_DEB_URL}"
                 printf 'FORCED_CONNECTOR=%q\n' "${FORCED_CONNECTOR}"
                 printf 'FORCE_CONNECTOR_AUTO=%q\n' "${FORCE_CONNECTOR_AUTO}"
+                printf 'CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=%q\n' "${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR}"
                 printf 'TARGET_WIDTH=%q\n' "${TARGET_WIDTH}"
                 printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
                 printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
@@ -889,6 +1168,7 @@ write_clouddeploy_env_file() {
                 printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}"
                 printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
                 printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
+                printf 'CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=%q\n' "${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE}"
                 printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}"
                 printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}"
                 printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS}"
@@ -3494,17 +3774,83 @@ apt_update_retry() {
         return "${update_rc}"
 }
 
+_clouddeploy_apt_progress_pid=""
+start_apt_progress_reporter() {
+        # Background heartbeat for long apt-get install runs that would
+        # otherwise look frozen from the operator's terminal. Tails
+        # /var/log/dpkg.log every ${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}
+        # seconds and prints the last changed line. Only enabled for
+        # batches with >= ${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15} packages
+        # (override either via env to tune). No-ops when /var/log/dpkg.log
+        # is unreadable or when one is already running.
+        local pkg_count="$1"
+        local threshold="${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15}"
+        local interval="${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}"
+        [[ -z "${_clouddeploy_apt_progress_pid}" ]] || return 0
+        [[ "${pkg_count}" -ge "${threshold}" ]] || return 0
+        [[ -r /var/log/dpkg.log ]] || return 0
+
+        (
+                # In the background subshell, detach from the trap and
+                # disable -e so a momentarily-missing dpkg.log line doesn't
+                # kill the reporter.
+                trap - ERR
+                set +eE
+                local last_line="" cur idle=0
+                while sleep "${interval}"; do
+                        cur="$(tail -n1 /var/log/dpkg.log 2>/dev/null || true)"
+                        if [[ -n "${cur}" && "${cur}" != "${last_line}" ]]; then
+                                printf '[apt-progress %s] %s\n' "$(date '+%T')" "${cur}"
+                                last_line="${cur}"
+                                idle=0
+                        else
+                                idle=$((idle + 1))
+                                printf '[apt-progress %s] dpkg.log idle for %d×%ss (last: %s)\n' \
+                                        "$(date '+%T')" "${idle}" "${interval}" "${last_line:-none yet}"
+                        fi
+                done
+        ) &
+        _clouddeploy_apt_progress_pid=$!
+        disown "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+}
+
+stop_apt_progress_reporter() {
+        if [[ -n "${_clouddeploy_apt_progress_pid}" ]]; then
+                kill "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+                wait "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+                _clouddeploy_apt_progress_pid=""
+        fi
+}
+
 apt_install_wait() {
-        local install_out install_rc
+        local install_out install_rc pkg_count=$#
+        local sample
+        sample="$(printf '%s\n' "$@" | head -n 6 | tr '\n' ' ')"
+        if (( pkg_count > 6 )); then
+                log "apt-get install: ${pkg_count} packages (sample: ${sample}...)"
+        else
+                log "apt-get install: ${pkg_count} packages (${sample})"
+        fi
+        if (( pkg_count >= "${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15}" )); then
+                log "Large package batch incoming; dpkg-log heartbeat enabled. Output may go quiet for several minutes - this is normal. Watch /var/log/dpkg.log if needed."
+        fi
 
         wait_for_apt
         repair_dpkg_state_if_needed
-        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+
+        start_apt_progress_reporter "${pkg_count}"
+        install_out="$(DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+        stop_apt_progress_reporter
         printf '%s\n' "${install_out}"
+
         if [[ "${install_rc}" -ne 0 ]]; then
                 log "apt-get install failed; attempting dpkg repair and one retry"
                 repair_dpkg_state_if_needed
-                install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+                start_apt_progress_reporter "${pkg_count}"
+                install_out="$(DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                        apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+                stop_apt_progress_reporter
                 printf '%s\n' "${install_out}"
         fi
         return "${install_rc}"
@@ -3637,6 +3983,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_DEB_URL=%q\n' "https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb"
         printf 'FORCED_CONNECTOR=%q\n' "DP-1"
         printf 'FORCE_CONNECTOR_AUTO=%q\n' "0"
+        printf 'CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=%q\n' "0"
         printf 'TARGET_WIDTH=%q\n' "3840"
         printf 'TARGET_HEIGHT=%q\n' "2160"
         printf 'TARGET_FPS=%q\n' "120"
@@ -3676,6 +4023,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "0"
         printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
         printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
+        printf 'CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=%q\n' "auto"
         printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "0"
         printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "0"
         printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "0"
@@ -4513,6 +4861,15 @@ require_patched_kwin_if_hdr() {
                 die "ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}. The stock KWin connector HDR path causes NVIDIA driver rejection. Either leave KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR unset (it inherits ENABLE_HDR=1) or set it to 1; set ENABLE_HDR=0 for an SDR deployment. See docs/HDR-NVIDIA-PRIVATE.md."
         fi
 
+        case "${FORCED_CONNECTOR}" in
+                Virtual*|virtual*)
+                        if [[ "${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR}" != "1" ]]; then
+                                die "ENABLE_HDR=1 with FORCED_CONNECTOR=${FORCED_CONNECTOR}. Virtual-* connectors are virtio-gpu outputs and cannot reach the documented NVIDIA private HDR state. Set FORCED_CONNECTOR=DP-1 (or another real NVIDIA DRM connector) and re-run, or set CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1 only if you have explicitly verified the NV private DRM props exist on that virtual output (they almost certainly don't)."
+                        fi
+                        log "WARNING: ENABLE_HDR=1 with FORCED_CONNECTOR=${FORCED_CONNECTOR}; CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1 was set so proceeding anyway. The HDR validation gate will still refuse to claim success unless drm_info shows the NV private DRM props on this output."
+                        ;;
+        esac
+
         if ! patched_kwin_installed; then
                 die "ENABLE_HDR=1 requires a patched KWin with NVIDIA private HDR support, but no patched KWin marker is present at ${PATCHED_KWIN_MARKER} after the patched-kwin phase. The build/install pipeline did not complete successfully. Check the patched-kwin phase logs; inspect /usr/local/src/clouddeploy-kwin and the dpkg-buildpackage output for apt-get build-dep / apt source / patch -p1 / dpkg-buildpackage failures. See docs/HDR-NVIDIA-PRIVATE.md."
         fi
@@ -4989,6 +5346,7 @@ install_optional_apps_nonfatal() {
 # Start
 # =========================
 require_root
+acquire_clouddeploy_lock
 ensure_headless_user_context
 ensure_headless_user_admin_access
 
@@ -5149,6 +5507,7 @@ repair_dpkg_state_if_needed
 apt_update_retry
 require_plasma6_available_from_native_repos
 mapfile -t KDE_PLASMA_PACKAGES < <(kde_plasma_package_list)
+log "Installing base packages including KDE/Plasma 6 (${#KDE_PLASMA_PACKAGES[@]} KDE packages). This phase unpacks hundreds of MB and is typically the longest quiet stretch of CloudDeploy. The dpkg-log heartbeat will print progress every ${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}s; tail /var/log/dpkg.log from another SSH session for line-by-line. The script is NOT stuck - do not start a second CloudDeploy run (the flock at /run/clouddeploy-wayland.lock would refuse it anyway)."
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
         pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \

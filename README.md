@@ -87,6 +87,45 @@ chmod +x CloudDeploy.sh
 sudo bash ./CloudDeploy.sh
 ```
 
+## Recommended run command — do NOT pass secrets on the command line
+
+`sudo env SUNSHINE_PASS=... TAILSCALE_AUTHKEY=... ./CloudDeploy-wayland.sh`
+exposes secrets in `ps`. The script supports a root-owned, mode-600 env
+file instead. On the target VM, as root:
+
+```bash
+install -d -m 0700 /root
+install -m 0600 /dev/null /root/clouddeploy-v2.env
+${EDITOR:-nano} /root/clouddeploy-v2.env
+```
+
+Example `/root/clouddeploy-v2.env`:
+
+```bash
+SUNSHINE_PASS=your-sunshine-password
+TAILSCALE_AUTHKEY=your-single-line-tailscale-auth-key
+ENABLE_HDR=1
+CLOUDDEPLOY_AUTO_DIST_UPGRADE=1
+CLOUDDEPLOY_ACCEPT_NON_LTS=1
+INSTALL_OPTIONAL_APPS=0
+```
+
+Then run:
+
+```bash
+sudo bash ./CloudDeploy-wayland.sh
+```
+
+`CloudDeploy-wayland.sh` sources `/root/clouddeploy-v2.env` (or whatever
+path you put in `CLOUDDEPLOY_USER_ENV_FILE`) before any default is
+evaluated, but only if the file is owned by root and mode 600 or 400.
+Files with looser permissions or non-root owners are skipped with a
+warning.
+
+A flock at `/run/clouddeploy-wayland.lock` refuses to start a second
+CloudDeploy run while one is in progress, so accidentally invoking the
+script twice won't corrupt apt/dpkg state.
+
 ## Rootless Cloud VM Recovery Launch
 
 Some cloud images ship with the default user outside sudo, no root password,
