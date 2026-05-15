@@ -74,6 +74,16 @@ SUNSHINE_INSTALL_BIN="${SUNSHINE_INSTALL_BIN:-/usr/local/bin/sunshine-clouddeplo
 # The KMS/DRM/Wayland/NVENC streaming path does not need it, so auto-disable it
 # on those releases. Set to "on" to force it on, or "off" to always disable.
 SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
+# Optional automated Ubuntu release upgrade. Off by default because dist-upgrade
+# of a running VM is destructive. CLOUDDEPLOY_AUTO_DIST_UPGRADE=1 + matching
+# CLOUDDEPLOY_TARGET_UBUNTU_VERSION runs `do-release-upgrade` (one hop per
+# CloudDeploy run, reboot via the continuation service in between) until
+# /etc/os-release VERSION_ID equals the target. Non-LTS targets (25.10, 26.10,
+# anything ending in .10) require CLOUDDEPLOY_ACCEPT_NON_LTS=1 (alias:
+# CLOUDDEPLOY_ALLOW_QUESTING=1) so accidental users do not get upgraded.
+CLOUDDEPLOY_AUTO_DIST_UPGRADE="${CLOUDDEPLOY_AUTO_DIST_UPGRADE:-0}"
+CLOUDDEPLOY_TARGET_UBUNTU_VERSION="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION:-25.10}"
+CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QUESTING:-0}}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
@@ -419,6 +429,117 @@ ubuntu_os_summary() {
         printf '%s\n' "${pretty:-ubuntu ${version:-unknown} ${codename:-unknown}}"
 }
 
+ubuntu_version_is_lts() {
+        # LTS releases land on even years and end in .04 (16.04, 18.04, 20.04,
+        # 22.04, 24.04, 26.04, ...). Anything else is a non-LTS interim.
+        local ver="$1"
+        [[ "${ver}" =~ ^(1[68]|2[0246])\.04$ ]]
+}
+
+ubuntu_upgrade_progress_file() {
+        printf '%s\n' "${CLOUDDEPLOY_STATE_DIR}/ubuntu-upgrade-from-version"
+}
+
+maybe_upgrade_ubuntu() {
+        # Optional release upgrade. Runs before any NVIDIA/CUDA repo work so apt
+        # state stays clean across the dist-upgrade. Returns 0 when already at
+        # target, dies when the previous reboot did not make progress, and
+        # otherwise dispatches do-release-upgrade and reboots via the
+        # continuation service with reason=ubuntu-upgrade.
+        [[ "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}" == "1" ]] || return 0
+
+        local current_ver target_ver progress_file
+        current_ver="$(ubuntu_version_id)"
+        target_ver="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
+        progress_file="$(ubuntu_upgrade_progress_file)"
+
+        if [[ -z "${current_ver}" ]]; then
+                die "Could not read VERSION_ID from /etc/os-release; refusing to attempt release upgrade"
+        fi
+
+        if [[ "${current_ver}" == "${target_ver}" ]]; then
+                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "ubuntu-upgrade" ]]; then
+                        log "Ubuntu release upgrade complete: now at ${current_ver} (target ${target_ver})"
+                else
+                        log "Ubuntu already at target ${target_ver}; no release upgrade needed"
+                fi
+                rm -f "${progress_file}" 2>/dev/null || true
+                return 0
+        fi
+
+        # Non-LTS gate. We rely on this explicit opt-in because a non-LTS upgrade
+        # (e.g. 24.04 LTS -> 24.10 -> 25.04 -> 25.10) is a significant policy
+        # change for the VM.
+        if ! ubuntu_version_is_lts "${target_ver}"; then
+                if [[ "${CLOUDDEPLOY_ACCEPT_NON_LTS}" != "1" ]]; then
+                        die "Refusing to upgrade to non-LTS Ubuntu ${target_ver} without CLOUDDEPLOY_ACCEPT_NON_LTS=1 (alias CLOUDDEPLOY_ALLOW_QUESTING=1)"
+                fi
+        fi
+
+        log "Ubuntu release upgrade: current=${current_ver} target=${target_ver}"
+
+        # Resume guard: if we just rebooted for an upgrade, the version must have
+        # moved. If it did not, refuse to loop forever.
+        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "ubuntu-upgrade" ]] && [[ -f "${progress_file}" ]]; then
+                local prior_ver
+                prior_ver="$(<"${progress_file}")"
+                if [[ "${prior_ver}" == "${current_ver}" ]]; then
+                        die "Ubuntu release upgrade did not make progress (was ${prior_ver}, still ${current_ver}); aborting to avoid an infinite reboot loop"
+                fi
+                log "Ubuntu release upgrade progressed: ${prior_ver} -> ${current_ver}"
+        fi
+
+        # Pre-flight: make sure update-manager-core is present and the release
+        # upgrader will offer non-LTS hops when allowed.
+        apt_install_wait update-manager-core || die "Could not install update-manager-core for release upgrade"
+
+        install -d -m 0755 /etc/update-manager
+        if [[ -f /etc/update-manager/release-upgrades ]]; then
+                if grep -qE '^Prompt=' /etc/update-manager/release-upgrades; then
+                        sed -i 's/^Prompt=.*/Prompt=normal/' /etc/update-manager/release-upgrades
+                else
+                        printf 'Prompt=normal\n' >> /etc/update-manager/release-upgrades
+                fi
+        else
+                cat > /etc/update-manager/release-upgrades <<'EOF'
+[DEFAULT]
+Prompt=normal
+EOF
+        fi
+
+        log "Bringing current Ubuntu ${current_ver} fully up to date before do-release-upgrade"
+        apt-get "${APT_DPKG_OPTIONS[@]}" update -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" dist-upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y || true
+
+        # Decide whether to pass -d (include development releases). do-release-
+        # upgrade on an LTS source only steps to the next LTS by default; -d
+        # opens up the intermediate non-LTS hops which is what gets us from
+        # 24.04 LTS -> 24.10 -> 25.04 -> 25.10.
+        local -a upgrade_flags
+        upgrade_flags=(-f DistUpgradeViewNonInteractive --quiet)
+        if ! ubuntu_version_is_lts "${target_ver}" || ! ubuntu_version_is_lts "${current_ver}"; then
+                upgrade_flags+=(-d)
+        fi
+
+        install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+        printf '%s\n' "${current_ver}" > "${progress_file}"
+
+        log "Running do-release-upgrade ${upgrade_flags[*]}"
+        local upgrade_rc=0
+        DEBIAN_FRONTEND=noninteractive do-release-upgrade "${upgrade_flags[@]}" || upgrade_rc=$?
+        log "do-release-upgrade exit=${upgrade_rc}"
+
+        # do-release-upgrade often reboots itself when -f DistUpgradeViewNonInteractive
+        # is used, but we cannot rely on that. Always go through the continuation
+        # service so the next pass re-enters maybe_upgrade_ubuntu, validates the
+        # version moved, and either continues hopping or proceeds to the
+        # NVIDIA/CUDA/KDE phases.
+        schedule_reboot_for_continuation "ubuntu-upgrade" \
+                "Ubuntu release upgrade dispatched (from ${current_ver} toward ${target_ver}); rebooting to complete and resume CloudDeploy"
+}
+
 version_major() {
         local version="$1"
         version="${version#*:}"
@@ -595,6 +716,9 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
                 printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "${SUNSHINE_ENABLE_CUDA_MODULE}"
+                printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}"
+                printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
+                printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
                 printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
@@ -3096,6 +3220,9 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
         printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "auto"
+        printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "0"
+        printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
+        printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
         printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
@@ -4342,6 +4469,12 @@ usermod -aG sudo,video,input,render "${HEADLESS_USER}" || true
 ensure_headless_user_admin_access
 loginctl enable-linger "${HEADLESS_USER}" 2>/dev/null || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
+
+if [[ "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}" == "1" ]]; then
+        set_phase "ubuntu-upgrade"
+        log "Auto Ubuntu release upgrade requested (target ${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}, current $(ubuntu_os_summary))"
+        maybe_upgrade_ubuntu
+fi
 
 set_phase "base-packages"
 repair_dpkg_state_if_needed
