@@ -84,6 +84,13 @@ SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
 CLOUDDEPLOY_AUTO_DIST_UPGRADE="${CLOUDDEPLOY_AUTO_DIST_UPGRADE:-0}"
 CLOUDDEPLOY_TARGET_UBUNTU_VERSION="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION:-25.10}"
 CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QUESTING:-0}}"
+# Experimental: opt-in to NVIDIA DKMS HDR metadata patches. The metadata path
+# never reliably produced NV_HDR_STATIC_METADATA != blob 0 + working Moonlight
+# HDR before the live VM was deleted (see docs/HDR-NVIDIA-PRIVATE.md). No DKMS
+# patches are bundled in this revision; setting this to 1 only emits a
+# reminder log line so future work can resume from the documented best-next
+# experiment without changing default behavior.
+CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA="${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA:-0}"
 # When FORCE_CONNECTOR_AUTO=1 (or FORCED_CONNECTOR=auto), pick a connector
 # from /sys/class/drm at runtime instead of hardcoding DP-1. HDMI-A-* is
 # preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
@@ -834,6 +841,7 @@ write_clouddeploy_env_file() {
                 printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}"
                 printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
                 printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
+                printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
                 printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
@@ -3352,6 +3360,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "0"
         printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
         printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
+        printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "0"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
         printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
@@ -4071,6 +4080,94 @@ wait_for_sunshine_post_start_markers() {
         return 1
 }
 
+install_clouddeploy_pipewire_virtual_sink() {
+        # Ensure at least one PipeWire sink exists so Sunshine always has a
+        # capture surface. Cloud VMs typically have no real HDA/USB audio
+        # device. Moonlight receives the stream and the client (Windows etc.)
+        # routes audio to whatever physical headset/MixAmp the user wants -
+        # the VM only needs a working source/sink for Sunshine to capture.
+        [[ -n "${HOME_DIR:-}" ]] || return 0
+        local conf_dir="${HOME_DIR}/.config/pipewire/pipewire.conf.d"
+        install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/pipewire"
+        install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${conf_dir}"
+        cat > "${conf_dir}/99-clouddeploy-virtual-sink.conf" <<'EOF'
+# CloudDeploy: PipeWire null sink so Sunshine always has a capture surface
+# even when no real HDA/USB audio device is attached. Sunshine captures
+# from the monitor source on this sink; Moonlight ships the audio stream
+# to the client which routes it to whatever physical output the user has.
+context.objects = [
+    {   factory = adapter
+        args = {
+            factory.name              = support.null-audio-sink
+            node.name                 = CloudDeployVirtualSink
+            node.description          = "CloudDeploy Virtual Sink"
+            media.class               = "Audio/Sink"
+            object.linger             = true
+            audio.position            = "FL,FR"
+            audio.channels            = 2
+            audio.rate                = 48000
+            audio.format              = "F32LE"
+            monitor.channel-volumes   = true
+        }
+    }
+]
+EOF
+        chown "${HEADLESS_USER}:${HEADLESS_USER}" "${conf_dir}/99-clouddeploy-virtual-sink.conf"
+        chmod 0644 "${conf_dir}/99-clouddeploy-virtual-sink.conf"
+        log "Installed PipeWire null sink config at ${conf_dir}/99-clouddeploy-virtual-sink.conf"
+}
+
+print_audio_diagnostics() {
+        echo "=== Audio stack diagnostics ==="
+        local pkg
+        for pkg in pipewire wireplumber pipewire-pulse pulseaudio-utils; do
+                printf '  %s: ' "${pkg}"
+                if dpkg_package_configured_ii "${pkg}"; then
+                        echo "installed"
+                else
+                        echo "NOT installed"
+                fi
+        done
+
+        if [[ -n "${HEADLESS_USER:-}" ]] && id "${HEADLESS_USER}" >/dev/null 2>&1; then
+                local headless_uid
+                headless_uid="$(id -u "${HEADLESS_USER}")"
+                local runtime_dir="/run/user/${headless_uid}"
+
+                echo
+                echo "Systemd user units for ${HEADLESS_USER}:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        systemctl --user --no-pager --full status pipewire wireplumber pipewire-pulse 2>&1 \
+                        | sed -n '1,30p' || true
+
+                echo
+                echo "pactl info:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl info 2>&1 | sed -n '1,12p' || true
+
+                echo
+                echo "pactl list short sinks:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl list short sinks 2>&1 || true
+
+                echo
+                echo "pactl list short sources:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl list short sources 2>&1 || true
+        else
+                echo "HEADLESS_USER not resolved; skipping pactl diagnostics."
+        fi
+}
+
+print_experimental_dkms_hdr_metadata_notice() {
+        [[ "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}" == "1" ]] || return 0
+        log "CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=1 was requested."
+        log "  No NVIDIA DKMS HDR metadata patches are bundled in this revision."
+        log "  The metadata path remained experimental (NV_HDR_STATIC_METADATA blob 0 is expected in the working state)."
+        log "  See docs/HDR-NVIDIA-PRIVATE.md for the documented best-next experiment if you want to resume metadata work."
+        log "  Deployment continues with the stock NVIDIA driver and metadata off."
+}
+
 known_good_clean_reset_streaming_stack() {
         log "Running clouddeploy-reset-streaming before final validation"
         write_clouddeploy_env_file
@@ -4511,6 +4608,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         fi
 
         install_clouddeploy_helpers
+        install_clouddeploy_pipewire_virtual_sink
         if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
                 systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service || true
         else
@@ -4541,6 +4639,8 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
 
         print_driver_cuda_sunshine_summary
         print_final_validation_summary
+        print_audio_diagnostics
+        print_experimental_dkms_hdr_metadata_notice
 
         if command -v tailscale >/dev/null 2>&1; then
                 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -4609,6 +4709,8 @@ if [[ "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}" == "1" ]]; then
         log "Auto Ubuntu release upgrade requested (target ${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}, current $(ubuntu_os_summary))"
         maybe_upgrade_ubuntu
 fi
+
+print_experimental_dkms_hdr_metadata_notice
 
 set_phase "base-packages"
 repair_dpkg_state_if_needed
@@ -5985,6 +6087,7 @@ fi
 systemctl restart tailscaled 2>/dev/null || true
 
 install_clouddeploy_helpers
+install_clouddeploy_pipewire_virtual_sink
 known_good_clean_reset_streaming_stack
 
 validate_streaming_stack_ready
@@ -5994,6 +6097,8 @@ log "Final validation markers"
 
 print_driver_cuda_sunshine_summary
 print_final_validation_summary
+print_audio_diagnostics
+print_experimental_dkms_hdr_metadata_notice
 
 echo "$SCRIPT_VERSION" > "$SENTINEL"
 
