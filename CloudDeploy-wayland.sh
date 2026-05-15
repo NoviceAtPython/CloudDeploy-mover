@@ -84,6 +84,11 @@ SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
 CLOUDDEPLOY_AUTO_DIST_UPGRADE="${CLOUDDEPLOY_AUTO_DIST_UPGRADE:-0}"
 CLOUDDEPLOY_TARGET_UBUNTU_VERSION="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION:-25.10}"
 CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QUESTING:-0}}"
+# When FORCE_CONNECTOR_AUTO=1 (or FORCED_CONNECTOR=auto), pick a connector
+# from /sys/class/drm at runtime instead of hardcoding DP-1. HDMI-A-* is
+# preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
+# differs between forced DP and forced HDMI; otherwise DP-1 is preferred.
+FORCE_CONNECTOR_AUTO="${FORCE_CONNECTOR_AUTO:-0}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
@@ -287,6 +292,115 @@ detect_nvidia_drm_card() {
                 fi
         done
         return 1
+}
+
+list_drm_connectors() {
+        # Emits connector names like "DP-1", "HDMI-A-2", one per line, deduped.
+        # Restricts to NVIDIA cards (PCI vendor 0x10de) when at least one is
+        # present, falling back to all cards otherwise so the early call
+        # (before nvidia driver loads) still has something to work with.
+        local card_dir base card_name connector_name vendor
+        local nvidia_seen=0
+
+        for card_dir in /sys/class/drm/card[0-9]; do
+                [[ -e "${card_dir}/device/vendor" ]] || continue
+                vendor="$(cat "${card_dir}/device/vendor" 2>/dev/null || true)"
+                if [[ "${vendor}" == "0x10de" ]]; then
+                        nvidia_seen=1
+                fi
+        done
+
+        for card_dir in /sys/class/drm/card[0-9]-*; do
+                [[ -d "${card_dir}" ]] || continue
+                base="${card_dir##*/}"                # card1-DP-1, card1-HDMI-A-2
+                card_name="${base%%-*}"               # card1
+                connector_name="${base#*-}"           # DP-1, HDMI-A-2
+                if [[ "${nvidia_seen}" == "1" ]]; then
+                        vendor="$(cat "/sys/class/drm/${card_name}/device/vendor" 2>/dev/null || true)"
+                        [[ "${vendor}" == "0x10de" ]] || continue
+                fi
+                printf '%s\n' "${connector_name}"
+        done | sort -V | awk 'NF && !seen[$0]++'
+}
+
+drm_connector_status() {
+        local connector="$1" path
+        for path in /sys/class/drm/card[0-9]-"${connector}"/status; do
+                [[ -r "${path}" ]] || continue
+                cat "${path}" 2>/dev/null
+                return 0
+        done
+        return 1
+}
+
+resolve_force_connector_auto() {
+        # Returns one connector name on stdout, or exits with non-zero status
+        # when nothing usable is enumerable. Preference order:
+        #   ENABLE_HDR=1: HDMI-A-* first (HDR metadata/InfoFrame behaviour
+        #     varies between forced DP and HDMI; HDMI-A-* has been the
+        #     better experimental surface). Within HDMI, lower index first.
+        #   ENABLE_HDR=0: DP-1, then any DP-*, then HDMI-A-*.
+        # Within each class, prefer connectors that report status=connected
+        # over status=disconnected (both can be EDID-forced via kernel cmdline).
+        local enable_hdr="${ENABLE_HDR:-0}"
+        local connector
+        local -a hdmi dp others
+        while read -r connector; do
+                [[ -n "${connector}" ]] || continue
+                case "${connector}" in
+                        HDMI-A-*) hdmi+=("${connector}") ;;
+                        DP-*) dp+=("${connector}") ;;
+                        *) others+=("${connector}") ;;
+                esac
+        done < <(list_drm_connectors)
+
+        local -a preferred=()
+        if [[ "${enable_hdr}" == "1" ]]; then
+                preferred=("${hdmi[@]}" "${dp[@]}" "${others[@]}")
+        else
+                local dp_first="" rest=()
+                for connector in "${dp[@]}"; do
+                        if [[ "${connector}" == "DP-1" ]]; then
+                                dp_first="${connector}"
+                        else
+                                rest+=("${connector}")
+                        fi
+                done
+                [[ -n "${dp_first}" ]] && preferred+=("${dp_first}")
+                preferred+=("${rest[@]}" "${hdmi[@]}" "${others[@]}")
+        fi
+
+        [[ "${#preferred[@]}" -gt 0 ]] || return 1
+
+        local status
+        for connector in "${preferred[@]}"; do
+                status="$(drm_connector_status "${connector}" 2>/dev/null || true)"
+                if [[ "${status}" == "connected" ]]; then
+                        printf '%s\n' "${connector}"
+                        return 0
+                fi
+        done
+        printf '%s\n' "${preferred[0]}"
+}
+
+maybe_resolve_force_connector() {
+        if [[ "${FORCE_CONNECTOR_AUTO}" != "1" && "${FORCED_CONNECTOR}" != "auto" ]]; then
+                return 0
+        fi
+        local picked
+        if picked="$(resolve_force_connector_auto)"; then
+                if [[ "${FORCED_CONNECTOR}" != "${picked}" ]]; then
+                        log "FORCE_CONNECTOR_AUTO: ENABLE_HDR=${ENABLE_HDR} -> FORCED_CONNECTOR=${picked} (was ${FORCED_CONNECTOR})"
+                else
+                        log "FORCE_CONNECTOR_AUTO: confirmed FORCED_CONNECTOR=${picked} (ENABLE_HDR=${ENABLE_HDR})"
+                fi
+                FORCED_CONNECTOR="${picked}"
+        else
+                if [[ "${FORCED_CONNECTOR}" == "auto" ]]; then
+                        FORCED_CONNECTOR="DP-1"
+                fi
+                log "WARNING: FORCE_CONNECTOR_AUTO found no enumerable DRM connectors yet; keeping FORCED_CONNECTOR=${FORCED_CONNECTOR}"
+        fi
 }
 
 nvidia_modules_present_for_running_kernel() {
@@ -679,6 +793,7 @@ write_clouddeploy_env_file() {
                 printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
                 printf 'SUNSHINE_DEB_URL=%q\n' "${SUNSHINE_DEB_URL}"
                 printf 'FORCED_CONNECTOR=%q\n' "${FORCED_CONNECTOR}"
+                printf 'FORCE_CONNECTOR_AUTO=%q\n' "${FORCE_CONNECTOR_AUTO}"
                 printf 'TARGET_WIDTH=%q\n' "${TARGET_WIDTH}"
                 printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
                 printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
@@ -2122,13 +2237,22 @@ verify_cuda_toolkit_or_fail() {
 }
 
 install_cuda_toolkit_from_runfile() {
-        local runfile runfile_size
+        local runfile runfile_size cuda_tmpdir
 
         CUDA_TOOLKIT_SOURCE="runfile"
         log "Installing CUDA toolkit using toolkit-only NVIDIA runfile"
         log "CUDA runfile URL: ${CUDA_RUNFILE_URL}"
 
-        runfile="$(mktemp /tmp/cuda-toolkit.XXXXXX.run)"
+        # NVIDIA's CUDA runfile self-extracts (~4 GiB) to TMPDIR. /tmp is tmpfs
+        # / RAM-backed on most cloud images and can fail to allocate the
+        # extraction working space, producing checksum or "no space left on
+        # device" errors. Use a disk-backed staging directory under /var/tmp
+        # and point both wget and the runfile at it via TMPDIR + --tmpdir.
+        cuda_tmpdir="/var/tmp/clouddeploy-cuda"
+        install -d -m 0755 "${cuda_tmpdir}"
+        export TMPDIR="${cuda_tmpdir}"
+
+        runfile="$(mktemp "${cuda_tmpdir}/cuda-toolkit.XXXXXX.run")"
         if ! wget -O "${runfile}" "${CUDA_RUNFILE_URL}"; then
                 rm -f "${runfile}"
                 if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
@@ -2155,9 +2279,9 @@ install_cuda_toolkit_from_runfile() {
         chmod 0755 "${runfile}"
 
         # NVIDIA runfiles support --check to validate the embedded MD5 sum.
-        if ! sh "${runfile}" --check >/tmp/cuda-runfile-check.log 2>&1; then
-                log "CUDA runfile --check failed; tail of /tmp/cuda-runfile-check.log:"
-                tail -n 20 /tmp/cuda-runfile-check.log 2>/dev/null || true
+        if ! sh "${runfile}" --check --tmpdir="${cuda_tmpdir}" >"${cuda_tmpdir}/runfile-check.log" 2>&1; then
+                log "CUDA runfile --check failed; tail of ${cuda_tmpdir}/runfile-check.log:"
+                tail -n 20 "${cuda_tmpdir}/runfile-check.log" 2>/dev/null || true
                 rm -f "${runfile}"
                 if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
                         die "CUDA runfile integrity check (--check) failed for ${CUDA_RUNFILE_URL}"
@@ -2166,7 +2290,10 @@ install_cuda_toolkit_from_runfile() {
                 return 0
         fi
 
-        if ! sh "${runfile}" --silent --toolkit --override; then
+        # --toolkit (never --driver): the NVIDIA driver is installed separately
+        # by the apt path so a CUDA toolkit install failure here cannot remove
+        # or break the working NVIDIA 580 driver.
+        if ! sh "${runfile}" --silent --toolkit --override --tmpdir="${cuda_tmpdir}"; then
                 rm -f "${runfile}"
                 if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
                         die "CUDA toolkit-only runfile install failed from ${CUDA_RUNFILE_URL}"
@@ -2175,6 +2302,7 @@ install_cuda_toolkit_from_runfile() {
                 return 0
         fi
         rm -f "${runfile}"
+        rm -rf "${cuda_tmpdir}" 2>/dev/null || true
 
         verify_cuda_toolkit_or_fail
 }
@@ -3184,6 +3312,7 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
         printf 'SUNSHINE_DEB_URL=%q\n' "https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb"
         printf 'FORCED_CONNECTOR=%q\n' "DP-1"
+        printf 'FORCE_CONNECTOR_AUTO=%q\n' "0"
         printf 'TARGET_WIDTH=%q\n' "3840"
         printf 'TARGET_HEIGHT=%q\n' "2160"
         printf 'TARGET_FPS=%q\n' "120"
@@ -4355,6 +4484,11 @@ else
         HOME_DIR=""
 fi
 
+# Early FORCE_CONNECTOR_AUTO resolution: best-effort, /sys/class/drm may not
+# yet enumerate NVIDIA connectors before the driver loads. The
+# display-detection phase re-resolves once the driver is up.
+maybe_resolve_force_connector
+
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
         [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
@@ -4548,6 +4682,12 @@ set_phase "display-detection"
 log "Detecting NVIDIA BusID"
 NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
+
+# Re-resolve FORCE_CONNECTOR_AUTO now that the NVIDIA driver is loaded so the
+# value written to /etc/clouddeploy-wayland.env reflects /sys/class/drm with
+# nvidia connectors enumerated. Helper scripts and systemd units source the
+# env file and pick this value up.
+maybe_resolve_force_connector
 
 log "Detecting NVIDIA DRM card node"
 if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
