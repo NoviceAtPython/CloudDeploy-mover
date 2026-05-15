@@ -110,7 +110,7 @@ index c81140c16..clouddeploy 100644
  bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
  {
 +    const bool cloudDeployNvPrivateHdr =
-+        qEnvironmentVariableIsSet("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR") && gpu()->isNVidia();
++        qEnvironmentVariable("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR") == QStringLiteral("1") && gpu()->isNVidia();
 +    const bool cloudDeployHdrLike = m_pending.hdr || m_pending.wcg;
 +
      commit->addProperty(m_connector->crtcId, m_pending.crtc->id());
@@ -192,7 +192,7 @@ index c81140c16..clouddeploy 100644
 +     *   NV_HDR_STATIC_METADATA=blob 0
 +     */
 +    if (cloudDeployNvPrivateHdr
-+        && qEnvironmentVariableIsSet("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS")) {
++        && qEnvironmentVariable("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS") == QStringLiteral("1")) {
 +        if (primary->nvInputColorspace.isValid()) {
 +            commit->addProperty(primary->nvInputColorspace, cloudDeployHdrLike ? 2 : 0);
 +        }

@@ -84,12 +84,13 @@ Update this section whenever the build/patch changes.
 | Piece | Status |
 |---|---|
 | `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*` env vars wired through `/etc/clouddeploy-wayland.env` | **Done** |
-| `Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*=1` lines written into `kwin-realvt.service` when `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1` (and *not* written when 0, so `qEnvironmentVariableIsSet()` in the patched KWin returns false) | **Done** |
+| `Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*=1` lines written into `kwin-realvt.service` only when the script-side var is `1`. The patched KWin compares `qEnvironmentVariable("…") == "1"` so unsetting and setting to `"0"` both take the stock code path. | **Done** |
 | Patch file at [`patches/kwin-clouddeploy-nvidia-private-hdr.patch`](../patches/kwin-clouddeploy-nvidia-private-hdr.patch) | **Done** |
 | `build_install_patched_kwin`: enables deb-src, `apt-get build-dep -y kwin`, `apt source kwin`, applies the patch, `DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" dpkg-buildpackage -us -uc -b`, stops kwin/sunshine, installs the resulting `.deb`s, `apt-mark hold`s them, runs `kwin_wayland --version`, and writes `${PATCHED_KWIN_MARKER}` | **Done** |
 | New `patched-kwin` phase wired between `sunshine-build` and `systemd-units` (only when `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1`) | **Done** |
-| Early guard `require_patched_kwin_if_hdr` refuses `ENABLE_HDR=1` when the patched KWin marker is missing | **Done** |
-| Post-deploy `validate_hdr_final_state` requires KScreen HDR/WCG + drm_info `NV_CRTC_REGAMMA_TF=PQ` + `NV_INPUT_COLORSPACE=BT.2100 PQ` + `NV_PLANE_DEGAMMA_TF=PQ` and fails loudly on miss | **Done** |
+| Early `require_patched_kwin_config_if_hdr` catches the misconfiguration `ENABLE_HDR=1` + `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=0` before any apt or build work | **Done** |
+| `require_patched_kwin_if_hdr` runs *after* `build_install_patched_kwin` so a fresh `ENABLE_HDR=1` VM is allowed to build the patched KWin on its first pass; the marker check fails the deploy only if the build pipeline itself did not produce the marker | **Done** |
+| Post-deploy `validate_hdr_final_state` checks the *active* CRTC + *active* primary plane driving `${FORCED_CONNECTOR}` (via `scripts/validate-hdr-drm-state.py` against `drm_info -j`), not a global grep. Requires `NV_CRTC_REGAMMA_TF=PQ` on the active CRTC + `NV_INPUT_COLORSPACE=BT.2100 PQ` + `NV_PLANE_DEGAMMA_TF=PQ` on the active primary plane; fails loudly on miss | **Done** |
 | KWin runtime debug toggle file paths honoured by the patched KWin | **Not in this patch.** The integrated patch is the production baseline (NVIDIA private CRTC/plane props, metadata blob 0). The `/tmp/clouddeploy-*` debug toggles listed below are for a future diagnostic patch and currently have no effect. |
 
 **What you get when `ENABLE_HDR=1` runs to completion**
