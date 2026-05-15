@@ -3190,11 +3190,28 @@ build_install_patched_kwin() {
         local patch_file
         patch_file="$(require_clouddeploy_repo_asset "patches/${patch_file_name}")"
 
+        # 3a. Dry-run the patch first. If the unified diff is malformed (bad
+        #     hunk counts, blank context lines without a leading space) or
+        #     the kwin source tree has drifted from KWin 6.4.x, fail BEFORE
+        #     we modify anything. The fresh-VM run hit a malformed-hunk
+        #     bug here that left the tree half-patched and required a manual
+        #     cleanup, so we never start the real apply unless dry-run is
+        #     clean.
+        log "Dry-run patch check (patch -p1 --dry-run < ${patch_file})"
+        local dry_run_log="/var/tmp/clouddeploy-cuda/kwin-patch-dry-run.log"
+        install -d -m 0755 "$(dirname "${dry_run_log}")"
+        if ! (cd "${source_dir}" && patch -p1 --dry-run < "${patch_file}") > "${dry_run_log}" 2>&1; then
+                log "patch -p1 --dry-run FAILED. Tail of ${dry_run_log}:"
+                tail -n 40 "${dry_run_log}" 2>/dev/null || true
+                die "Patch ${patch_file_name} is malformed or does not apply to ${source_dir} (KWin source). See ${dry_run_log}. Either the patch file is broken (blank context lines without a leading space, stale hunk counts, etc.) or the kwin source tree has drifted from the KWin 6.4.x layout the patch was written against. Run scripts/validate-kwin-patch.sh locally to reproduce and fix before re-running CloudDeploy."
+        fi
+        log "Dry-run patch check: OK"
+
         log "Applying KWin patch from ${patch_file}"
         (
                 cd "${source_dir}"
                 patch -p1 --forward < "${patch_file}" \
-                        || die "patch -p1 failed to apply ${patch_file_name} to ${source_dir} - the kwin source tree may have drifted from the KWin 6.4.x layout the patch was written against."
+                        || die "patch -p1 failed to apply ${patch_file_name} to ${source_dir} even though --dry-run succeeded. The kwin source tree may have been modified between the dry-run and the real apply, or disk is full."
         )
 
         # 4. Build. dpkg-buildpackage on Ubuntu accepts running as root; we

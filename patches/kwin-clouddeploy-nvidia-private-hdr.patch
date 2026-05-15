@@ -23,7 +23,7 @@ index 3604a1571..clouddeploy 100644
 @@ -54,6 +54,12 @@ public:
      DrmProperty degammaLut;
      DrmProperty degammaLutSize;
-
+ 
 +    /*
 +     * NVIDIA private HDR property.
 +     * nvidia-drm enum values observed: Default=0, Linear=1, PQ=2.
@@ -31,7 +31,7 @@ index 3604a1571..clouddeploy 100644
 +    DrmProperty nvCrtcRegammaTf;
 +
      DrmAbstractColorOp *postBlendingPipeline = nullptr;
-
+ 
  private:
 diff --git a/src/backends/drm/drm_crtc.cpp b/src/backends/drm/drm_crtc.cpp
 index 88aca750a..clouddeploy 100644
@@ -50,17 +50,17 @@ index 88aca750a..clouddeploy 100644
      degammaLut.update(props);
      degammaLutSize.update(props);
 +    nvCrtcRegammaTf.update(props);
-
+ 
      if (!postBlendingPipeline) {
          DrmAbstractColorOp *next = nullptr;
 diff --git a/src/backends/drm/drm_plane.h b/src/backends/drm/drm_plane.h
 index 17007d1e6..clouddeploy 100644
 --- a/src/backends/drm/drm_plane.h
 +++ b/src/backends/drm/drm_plane.h
-@@ -92,6 +92,18 @@ public:
+@@ -92,6 +92,19 @@ public:
      DrmProperty inFenceFd;
      DrmProperty sizeHints;
-
+ 
 +    /*
 +     * NVIDIA private HDR properties.
 +     *
@@ -90,7 +90,7 @@ index 845901a90..clouddeploy 100644
 +    , nvPlaneDegammaTf(this, QByteArrayLiteral("NV_PLANE_DEGAMMA_TF"))
  {
  }
-
+ 
 @@ -94,6 +97,9 @@ bool DrmPlane::updateProperties()
      vmHotspotY.update(props);
      inFenceFd.update(props);
@@ -98,7 +98,7 @@ index 845901a90..clouddeploy 100644
 +    nvInputColorspace.update(props);
 +    nvHdrStaticMetadata.update(props);
 +    nvPlaneDegammaTf.update(props);
-
+ 
      if (!type.isValid() || !srcX.isValid() || !srcY.isValid() || !srcW.isValid() || !srcH.isValid()
          || !crtcX.isValid() || !crtcY.isValid() || !crtcW.isValid() || !crtcH.isValid() || !fbId.isValid()) {
 diff --git a/src/backends/drm/drm_pipeline.cpp b/src/backends/drm/drm_pipeline.cpp
@@ -106,7 +106,7 @@ index c81140c16..clouddeploy 100644
 --- a/src/backends/drm/drm_pipeline.cpp
 +++ b/src/backends/drm/drm_pipeline.cpp
 @@ -299,6 +299,10 @@ static const auto s_forceScalingMode = []() -> std::optional<DrmConnector::Scali
-
+ 
  bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
  {
 +    const bool cloudDeployNvPrivateHdr =
@@ -116,7 +116,7 @@ index c81140c16..clouddeploy 100644
      commit->addProperty(m_connector->crtcId, m_pending.crtc->id());
      if (m_connector->broadcastRGB.isValid()) {
          commit->addEnum(m_connector->broadcastRGB, DrmConnector::rgbRangeToBroadcastRgb(m_pending.rgbRange));
-@@ -316,19 +320,33 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
+@@ -316,19 +320,37 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
      if (m_connector->maxBpc.isValid()) {
          commit->addProperty(m_connector->maxBpc, std::clamp<uint32_t>(m_pending.maxBpc, m_connector->maxBpc.minValue(), m_connector->maxBpc.maxValue()));
      }
@@ -159,7 +159,7 @@ index c81140c16..clouddeploy 100644
      if (m_connector->scalingMode.isValid()) {
          if (s_forceScalingMode.has_value()) {
              if (m_connector->scalingMode.hasEnum(*s_forceScalingMode)) {
-@@ -351,8 +369,40 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
+@@ -351,8 +369,47 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
      if (m_pending.crtc->degammaLut.isValid()) {
          commit->addProperty(m_pending.crtc->degammaLut, 0);
      }
@@ -176,7 +176,7 @@ index c81140c16..clouddeploy 100644
 +    if (cloudDeployNvPrivateHdr && m_pending.crtc->nvCrtcRegammaTf.isValid()) {
 +        commit->addProperty(m_pending.crtc->nvCrtcRegammaTf, cloudDeployHdrLike ? 2 : 0);
 +    }
-
+ 
      const auto primary = m_pending.crtc->primaryPlane();
 +
 +    /*
