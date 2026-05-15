@@ -2576,63 +2576,143 @@ verify_cuda_toolkit_or_fail() {
         return 0
 }
 
+cuda_nvcc_release_major() {
+        # Parse the major number from `nvcc --version` output, e.g.
+        # "Cuda compilation tools, release 13.0, V13.0.88" -> "13".
+        # Empty on missing nvcc or unparseable output.
+        [[ -x /usr/local/cuda/bin/nvcc ]] || return 0
+        /usr/local/cuda/bin/nvcc --version 2>/dev/null \
+                | sed -nE 's/.*release ([0-9]+)\.[0-9]+.*/\1/p' | head -n1
+}
+
 install_cuda_toolkit_from_runfile() {
-        local runfile runfile_size cuda_tmpdir
+        local cuda_tmpdir="/var/tmp/clouddeploy-cuda"
+        local max_attempts="${CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS:-3}"
 
         CUDA_TOOLKIT_SOURCE="runfile"
+
+        # Defense-in-depth skip: if nvcc already reports a matching release
+        # under /usr/local/cuda, don't redownload the ~4 GiB runfile. The
+        # caller (install_cuda_toolkit_if_requested) also has a
+        # cuda_toolkit_ready short-circuit, but match here too so a partial
+        # /usr/local/cuda layout (missing /include or /lib64 symlink) that
+        # tripped cuda_toolkit_ready can still skip the runfile when nvcc
+        # is good.
+        local actual_major expected_major
+        actual_major="$(cuda_nvcc_release_major || true)"
+        expected_major="$(expected_cuda_major || true)"
+        if [[ -n "${actual_major}" ]]; then
+                if [[ -z "${expected_major}" || "${actual_major}" == "${expected_major}" ]]; then
+                        log "CUDA toolkit runfile install skipped: /usr/local/cuda/bin/nvcc already reports release ${actual_major}.x (matches expected ${expected_major:-any}; REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT})."
+                        CUDA_TOOLKIT_SOURCE="already installed (nvcc ${actual_major}.x)"
+                        verify_cuda_toolkit_or_fail
+                        return 0
+                fi
+                log "CUDA runfile install will proceed despite nvcc release ${actual_major}.x being present (expected ${expected_major}.x)."
+        fi
+
         log "Installing CUDA toolkit using toolkit-only NVIDIA runfile"
         log "CUDA runfile URL: ${CUDA_RUNFILE_URL}"
+        log "CUDA runfile retries: max ${max_attempts} attempts; curl --retry 10 --retry-all-errors --retry-delay 10"
 
         # NVIDIA's CUDA runfile self-extracts (~4 GiB) to TMPDIR. /tmp is tmpfs
         # / RAM-backed on most cloud images and can fail to allocate the
         # extraction working space, producing checksum or "no space left on
         # device" errors. Use a disk-backed staging directory under /var/tmp
-        # and point both wget and the runfile at it via TMPDIR + --tmpdir.
-        cuda_tmpdir="/var/tmp/clouddeploy-cuda"
+        # and point both curl and the runfile at it via TMPDIR + --tmpdir.
         install -d -m 0755 "${cuda_tmpdir}"
         export TMPDIR="${cuda_tmpdir}"
 
-        runfile="$(mktemp "${cuda_tmpdir}/cuda-toolkit.XXXXXX.run")"
-        if ! wget -O "${runfile}" "${CUDA_RUNFILE_URL}"; then
-                rm -f "${runfile}"
-                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
-                        die "CUDA toolkit runfile download failed from ${CUDA_RUNFILE_URL}"
+        local download_log="${cuda_tmpdir}/curl.log"
+        local check_log="${cuda_tmpdir}/runfile-check.log"
+        local runfile=""
+        local last_failure=""
+        local attempt=0
+
+        while (( attempt < max_attempts )); do
+                attempt=$((attempt + 1))
+                rm -f "${cuda_tmpdir}"/cuda-toolkit.*.run 2>/dev/null || true
+                runfile="$(mktemp "${cuda_tmpdir}/cuda-toolkit.XXXXXX.run")"
+
+                log "CUDA runfile attempt ${attempt}/${max_attempts}: downloading to ${runfile}"
+                : > "${download_log}"
+                if ! curl -fL \
+                                --retry 10 \
+                                --retry-all-errors \
+                                --retry-delay 10 \
+                                --connect-timeout 30 \
+                                --silent --show-error \
+                                -w 'curl: http_code=%{http_code} bytes=%{size_download} time=%{time_total}s redirects=%{num_redirects}\n' \
+                                -o "${runfile}" \
+                                "${CUDA_RUNFILE_URL}" \
+                                > "${download_log}" 2>&1; then
+                        log "Attempt ${attempt}: curl exited non-zero; tail of ${download_log}:"
+                        tail -n 20 "${download_log}" 2>/dev/null || true
+                        rm -f "${runfile}"
+                        runfile=""
+                        last_failure="curl download failed (attempt ${attempt})"
+                        if (( attempt < max_attempts )); then
+                                log "Retrying CUDA runfile download in 10s..."
+                                sleep 10
+                        fi
+                        continue
                 fi
-                log "CUDA toolkit runfile download failed; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+
+                local runfile_size sha256
+                runfile_size="$(stat -c '%s' "${runfile}" 2>/dev/null || echo 0)"
+                sha256="$(sha256sum "${runfile}" 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+                log "Attempt ${attempt}: downloaded size=${runfile_size} bytes, sha256=${sha256}"
+
+                if (( runfile_size < 1073741824 )); then
+                        log "Attempt ${attempt}: runfile size ${runfile_size} < 1 GiB; almost certainly an HTML error page. Discarding. Tail of curl log:"
+                        tail -n 10 "${download_log}" 2>/dev/null || true
+                        rm -f "${runfile}"
+                        runfile=""
+                        last_failure="runfile <1 GiB (${runfile_size} bytes; sha256=${sha256})"
+                        if (( attempt < max_attempts )); then
+                                log "Retrying CUDA runfile download in 10s..."
+                                sleep 10
+                        fi
+                        continue
+                fi
+
+                chmod 0755 "${runfile}"
+
+                # NVIDIA runfiles support --check to validate the embedded
+                # MD5 sum. This is the check that flagged "downloaded MD5
+                # differed from embedded expected MD5" on the live VM.
+                : > "${check_log}"
+                if sh "${runfile}" --check --tmpdir="${cuda_tmpdir}" > "${check_log}" 2>&1; then
+                        log "Attempt ${attempt}: runfile --check passed (size=${runfile_size}, sha256=${sha256})"
+                        break
+                fi
+
+                log "Attempt ${attempt}: runfile --check FAILED. size=${runfile_size}, sha256=${sha256}"
+                log "Tail of ${check_log}:"
+                tail -n 20 "${check_log}" 2>/dev/null || true
+                log "Tail of ${download_log}:"
+                tail -n 10 "${download_log}" 2>/dev/null || true
+                rm -f "${runfile}"
+                runfile=""
+                last_failure="--check failed (attempt ${attempt}; size=${runfile_size}; sha256=${sha256})"
+                if (( attempt < max_attempts )); then
+                        log "Retrying CUDA runfile download in 10s (max ${max_attempts} attempts)..."
+                        sleep 10
+                fi
+        done
+
+        if [[ -z "${runfile}" || ! -f "${runfile}" ]]; then
+                rm -rf "${cuda_tmpdir}" 2>/dev/null || true
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA runfile integrity check failed after ${max_attempts} attempts from ${CUDA_RUNFILE_URL}. Last failure: ${last_failure:-unknown}. Inspect ${download_log} and ${check_log} before re-running. The CUDA mirror may be intermittently corrupting downloads - set CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS=5 (or higher) to give it more chances, or set CUDA_INSTALL_METHOD=apt to use the apt repo path instead."
+                fi
+                log "CUDA runfile integrity check failed after ${max_attempts} attempts; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
                 return 0
         fi
 
-        # The real CUDA 13 toolkit-only runfile is ~4 GiB. Anything dramatically
-        # smaller is almost certainly an HTML error page (404, redirect, captive
-        # portal) saved as the target file. Refuse to execute it.
-        runfile_size="$(stat -c '%s' "${runfile}" 2>/dev/null || echo 0)"
-        if (( runfile_size < 1073741824 )); then
-                log "CUDA runfile from ${CUDA_RUNFILE_URL} is suspiciously small (${runfile_size} bytes); refusing to execute it."
-                rm -f "${runfile}"
-                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
-                        die "CUDA runfile integrity check failed: file is only ${runfile_size} bytes (expected >1 GiB)"
-                fi
-                log "Skipping runfile install because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
-                return 0
-        fi
-
-        chmod 0755 "${runfile}"
-
-        # NVIDIA runfiles support --check to validate the embedded MD5 sum.
-        if ! sh "${runfile}" --check --tmpdir="${cuda_tmpdir}" >"${cuda_tmpdir}/runfile-check.log" 2>&1; then
-                log "CUDA runfile --check failed; tail of ${cuda_tmpdir}/runfile-check.log:"
-                tail -n 20 "${cuda_tmpdir}/runfile-check.log" 2>/dev/null || true
-                rm -f "${runfile}"
-                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
-                        die "CUDA runfile integrity check (--check) failed for ${CUDA_RUNFILE_URL}"
-                fi
-                log "Skipping runfile install because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
-                return 0
-        fi
-
-        # --toolkit (never --driver): the NVIDIA driver is installed separately
-        # by the apt path so a CUDA toolkit install failure here cannot remove
-        # or break the working NVIDIA 580 driver.
+        # --toolkit (never --driver): the NVIDIA driver is installed
+        # separately by the apt path so a CUDA toolkit install failure here
+        # cannot remove or break the working NVIDIA 580 driver.
         if ! sh "${runfile}" --silent --toolkit --override --tmpdir="${cuda_tmpdir}"; then
                 rm -f "${runfile}"
                 if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
