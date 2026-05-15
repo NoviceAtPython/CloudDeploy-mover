@@ -91,6 +91,10 @@ CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QU
 # reminder log line so future work can resume from the documented best-next
 # experiment without changing default behavior.
 CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA="${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA:-0}"
+# Initialize ENABLE_HDR before any other default that references it.
+# KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR inherits from this, so it must be
+# defined first - otherwise set -u trips on the bare ${ENABLE_HDR}.
+ENABLE_HDR="${ENABLE_HDR:-0}"
 # Patched-KWin NVIDIA private HDR. The stock KWin connector HDR path causes
 # NVIDIA driver rejection ("the driver rejected the output configuration"),
 # so a patched KWin that skips connector HDR_OUTPUT_METADATA + connector
@@ -99,9 +103,7 @@ CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA="${CLOUDDEPLOY_EXPERIMENTAL_NV
 # NV_PLANE_DEGAMMA_TF=PQ) is required to produce the documented HDR good
 # state. ENABLE_HDR=1 implies KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 unless
 # explicitly overridden. See docs/HDR-NVIDIA-PRIVATE.md.
-# Note: explicit ${ENABLE_HDR:-0} fallback so set -u never trips even if
-# someone reorders these defaults.
-KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR:-${ENABLE_HDR:-0}}"
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR:-${ENABLE_HDR}}"
 # Whether the patched KWin should write NVIDIA private DRM props on the
 # primary plane during modeset. The good state requires plane-prop writes,
 # so this defaults on when KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1.
@@ -112,6 +114,12 @@ KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_
 # Marker the patched-KWin build pipeline drops after a successful install.
 # Used by require_patched_kwin_if_hdr to refuse ENABLE_HDR=1 without it.
 PATCHED_KWIN_MARKER="${PATCHED_KWIN_MARKER:-/var/lib/clouddeploy/patched-kwin-installed}"
+# Origin of the CloudDeploy-mover repo, used when this script is run from a
+# raw curl download and needs to fetch patches/ or scripts/ assets that did
+# not ship alongside it. Both gh CLI and GH_TOKEN/GITHUB_TOKEN-authed curl
+# are tried before falling back to anonymous raw.githubusercontent.com.
+CLOUDDEPLOY_REPO_URL="${CLOUDDEPLOY_REPO_URL:-https://github.com/NoviceAtPython/CloudDeploy-mover}"
+CLOUDDEPLOY_REPO_BRANCH="${CLOUDDEPLOY_REPO_BRANCH:-v2}"
 # When FORCE_CONNECTOR_AUTO=1 (or FORCED_CONNECTOR=auto), pick a connector
 # from /sys/class/drm at runtime instead of hardcoding DP-1. HDMI-A-* is
 # preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
@@ -121,7 +129,8 @@ FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
-ENABLE_HDR="${ENABLE_HDR:-0}"
+# ENABLE_HDR is initialized above (before KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR
+# inherits from it), so it's already a real shell variable at this point.
 EDID_PROFILE="${EDID_PROFILE:-auto}"
 ENABLE_PLASMA6="${ENABLE_PLASMA6:-0}"
 STREAM_MODE="${STREAM_MODE:-plasma}"
@@ -2642,6 +2651,107 @@ kwin_clouddeploy_env_block() {
         return 0
 }
 
+clouddeploy_repo_asset_path() {
+        # Locate a file shipped alongside the deploy script in the
+        # CloudDeploy-mover repo (e.g. "patches/kwin-...patch",
+        # "scripts/validate-hdr-drm-state.py"). When the script is run from
+        # a full repo checkout this is just the local path; when the script
+        # was curl'd by itself we fall back to fetching the file from
+        # origin/${CLOUDDEPLOY_REPO_BRANCH} via, in order:
+        #   1. gh CLI if it is installed and authenticated (works for both
+        #      public and private repos);
+        #   2. authenticated curl using GH_TOKEN/GITHUB_TOKEN against the
+        #      GitHub contents API (works for private repos);
+        #   3. public raw.githubusercontent.com fetch (only works once the
+        #      repo is public).
+        # Downloaded files are cached under
+        # /var/lib/clouddeploy/repo-cache/<relpath> so subsequent calls in
+        # the same deploy don't re-fetch.
+        local relpath="$1"
+        [[ -n "${relpath}" ]] || return 1
+
+        local script_dir cache_dir cache_path candidate
+        script_dir="$(dirname "$(readlink -f "$0")")"
+        for candidate in \
+                "${script_dir}/${relpath}" \
+                "${CLOUDDEPLOY_REPO_DIR:-}/${relpath}" \
+                "/usr/local/share/clouddeploy/${relpath}"; do
+                if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        cache_dir="/var/lib/clouddeploy/repo-cache"
+        cache_path="${cache_dir}/${relpath}"
+        if [[ -f "${cache_path}" && -s "${cache_path}" ]]; then
+                printf '%s\n' "${cache_path}"
+                return 0
+        fi
+        install -d -m 0755 "$(dirname "${cache_path}")"
+
+        local repo_owner_repo
+        repo_owner_repo="${CLOUDDEPLOY_REPO_URL##*github.com/}"
+        repo_owner_repo="${repo_owner_repo%.git}"
+        repo_owner_repo="${repo_owner_repo%/}"
+
+        local raw_url="${CLOUDDEPLOY_REPO_URL%/}/raw/${CLOUDDEPLOY_REPO_BRANCH}/${relpath}"
+        local api_url="https://api.github.com/repos/${repo_owner_repo}/contents/${relpath}?ref=${CLOUDDEPLOY_REPO_BRANCH}"
+
+        if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+                log "Fetching ${relpath} from ${repo_owner_repo}@${CLOUDDEPLOY_REPO_BRANCH} via gh"
+                if gh api "repos/${repo_owner_repo}/contents/${relpath}?ref=${CLOUDDEPLOY_REPO_BRANCH}" \
+                                -H "Accept: application/vnd.github.v3.raw" \
+                                > "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        local gh_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+        if [[ -n "${gh_token}" ]] && command -v curl >/dev/null 2>&1; then
+                log "Fetching ${relpath} from ${repo_owner_repo}@${CLOUDDEPLOY_REPO_BRANCH} via authenticated curl"
+                if curl -fsSL \
+                                -H "Authorization: token ${gh_token}" \
+                                -H "Accept: application/vnd.github.v3.raw" \
+                                "${api_url}" -o "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        if command -v curl >/dev/null 2>&1; then
+                log "Fetching ${relpath} from public ${raw_url}"
+                if curl -fsSL "${raw_url}" -o "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        return 1
+}
+
+require_clouddeploy_repo_asset() {
+        # Wrapper that dies with a clear message when an asset is not
+        # locatable in a clone or fetchable from the v2 branch.
+        local relpath="$1"
+        local path
+        if path="$(clouddeploy_repo_asset_path "${relpath}")"; then
+                printf '%s\n' "${path}"
+                return 0
+        fi
+        die "Could not locate ${relpath} alongside CloudDeploy-wayland.sh or fetch it from ${CLOUDDEPLOY_REPO_URL%/}/tree/${CLOUDDEPLOY_REPO_BRANCH}. Either: (a) run CloudDeploy-wayland.sh from a full git clone of NoviceAtPython/CloudDeploy-mover (branch ${CLOUDDEPLOY_REPO_BRANCH}) so ${relpath} is on disk next to it; or (b) set GH_TOKEN/GITHUB_TOKEN to a token with read access to the private repo and re-run; or (c) install the repo at /usr/local/share/clouddeploy/${relpath%%/*}/. When ${CLOUDDEPLOY_REPO_URL##*/} is made public, plain anonymous curl will also work."
+}
+
 ensure_apt_deb_src_enabled() {
         # apt source kwin requires deb-src to be enabled. Ubuntu 24.04+ uses
         # the deb822 format at /etc/apt/sources.list.d/ubuntu.sources where
@@ -2714,20 +2824,11 @@ build_install_patched_kwin() {
         [[ -n "${source_dir}" ]] || die "Could not locate unpacked kwin source under ${build_dir}"
         log "kwin source unpacked at ${source_dir}"
 
-        # 3. Locate the patch file (lives in the CloudDeploy-mover repo).
-        local script_dir patch_file=""
-        script_dir="$(dirname "$(readlink -f "$0")")"
-        local candidate
-        for candidate in \
-                "${script_dir}/patches/${patch_file_name}" \
-                "${CLOUDDEPLOY_REPO_DIR:-}/patches/${patch_file_name}" \
-                "/usr/local/share/clouddeploy/patches/${patch_file_name}"; do
-                if [[ -f "${candidate}" ]]; then
-                        patch_file="${candidate}"
-                        break
-                fi
-        done
-        [[ -n "${patch_file}" ]] || die "Could not locate ${patch_file_name} in the CloudDeploy-mover repo (looked under ${script_dir}/patches and /usr/local/share/clouddeploy/patches). Make sure you are running the v2 branch of NoviceAtPython/CloudDeploy-mover so the patch file is present."
+        # 3. Locate the patch file. Works both for repo-checkout runs and
+        #    for raw curl downloads (auto-fetches from origin/v2 when the
+        #    patches/ directory isn't on disk next to the script).
+        local patch_file
+        patch_file="$(require_clouddeploy_repo_asset "patches/${patch_file_name}")"
 
         log "Applying KWin patch from ${patch_file}"
         (
@@ -4396,28 +4497,26 @@ patched_kwin_installed() {
         [[ -f "${PATCHED_KWIN_MARKER}" ]]
 }
 
-require_patched_kwin_config_if_hdr() {
-        # Run very early. Catches the user-config error case where the
-        # operator asked for ENABLE_HDR=1 but explicitly turned off the
-        # NVIDIA-private patch path. Stock KWin's connector HDR_OUTPUT_METADATA
-        # + connector Colorspace path is rejected by the NVIDIA atomic check,
-        # so a misaligned configuration cannot succeed - fail before we do
-        # any apt or build work.
-        [[ "${ENABLE_HDR}" == "1" ]] || return 0
-        if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" != "1" ]]; then
-                die "ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}. The stock KWin connector HDR path causes NVIDIA driver rejection. Either leave KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR unset (it inherits ENABLE_HDR), set it to 1, or set ENABLE_HDR=0 for an SDR deployment. See docs/HDR-NVIDIA-PRIVATE.md."
-        fi
-}
-
 require_patched_kwin_if_hdr() {
-        # Marker check. Must run AFTER build_install_patched_kwin so a fresh
-        # ENABLE_HDR=1 VM is allowed to build the patched KWin from source on
-        # its first pass. Refuses to proceed into the streaming stack unless
-        # the marker is present.
+        # Called AFTER build_install_patched_kwin has had a chance to run,
+        # so a fresh ENABLE_HDR=1 VM is allowed to build the patched KWin on
+        # its first pass. Two failure modes, both fatal:
+        #   * ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR != 1 -
+        #     the user explicitly disabled the patched path, so the build
+        #     phase was skipped and no marker will ever land. Stock KWin
+        #     would hit "the driver rejected the output configuration".
+        #   * KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 but ${PATCHED_KWIN_MARKER}
+        #     is missing - the build pipeline did not complete successfully.
         [[ "${ENABLE_HDR}" == "1" ]] || return 0
-        if ! patched_kwin_installed; then
-                die "ENABLE_HDR=1 requires a patched KWin with NVIDIA private HDR support, but no patched KWin marker is present at ${PATCHED_KWIN_MARKER} after the patched-kwin phase. The build/install pipeline did not complete successfully. Check the patched-kwin phase logs; inspect /usr/local/src/clouddeploy-kwin and /var/log for apt-get build-dep, apt source, patch -p1, dpkg-buildpackage failures. See docs/HDR-NVIDIA-PRIVATE.md."
+
+        if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" != "1" ]]; then
+                die "ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}. The stock KWin connector HDR path causes NVIDIA driver rejection. Either leave KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR unset (it inherits ENABLE_HDR=1) or set it to 1; set ENABLE_HDR=0 for an SDR deployment. See docs/HDR-NVIDIA-PRIVATE.md."
         fi
+
+        if ! patched_kwin_installed; then
+                die "ENABLE_HDR=1 requires a patched KWin with NVIDIA private HDR support, but no patched KWin marker is present at ${PATCHED_KWIN_MARKER} after the patched-kwin phase. The build/install pipeline did not complete successfully. Check the patched-kwin phase logs; inspect /usr/local/src/clouddeploy-kwin and the dpkg-buildpackage output for apt-get build-dep / apt source / patch -p1 / dpkg-buildpackage failures. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+
         log "ENABLE_HDR=1 prerequisites OK: KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 and patched KWin marker present at ${PATCHED_KWIN_MARKER}"
 }
 
@@ -4481,20 +4580,8 @@ validate_hdr_final_state() {
                 die "HDR validation failed: python3 is not available; cannot run scripts/validate-hdr-drm-state.py."
         fi
 
-        local script_dir
-        script_dir="$(dirname "$(readlink -f "$0")")"
-        local helper="${script_dir}/scripts/validate-hdr-drm-state.py"
-        if [[ ! -f "${helper}" ]]; then
-                for candidate in \
-                        "${CLOUDDEPLOY_REPO_DIR:-}/scripts/validate-hdr-drm-state.py" \
-                        "/usr/local/share/clouddeploy/scripts/validate-hdr-drm-state.py"; do
-                        if [[ -f "${candidate}" ]]; then
-                                helper="${candidate}"
-                                break
-                        fi
-                done
-        fi
-        [[ -f "${helper}" ]] || die "HDR validation failed: cannot locate scripts/validate-hdr-drm-state.py (looked under ${script_dir}/scripts and standard CloudDeploy locations)."
+        local helper
+        helper="$(require_clouddeploy_repo_asset "scripts/validate-hdr-drm-state.py")"
 
         local drm_json check_out check_rc=0
         drm_json="$(drm_info -j 2>/dev/null || true)"
@@ -4931,12 +5018,6 @@ fi
 # display-detection phase re-resolves once the driver is up.
 maybe_resolve_force_connector
 
-# Early config-consistency check: ENABLE_HDR=1 must imply
-# KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1. The marker check happens later,
-# after build_install_patched_kwin has had a chance to produce it on a
-# fresh VM.
-require_patched_kwin_config_if_hdr
-
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
         [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
@@ -5117,12 +5198,19 @@ SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
 log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
 ensure_nvidia_egl_vulkan_runtime_config
 
-if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]]; then
+if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] && ! patched_kwin_installed; then
         set_phase "patched-kwin"
         build_install_patched_kwin
-        require_patched_kwin_if_hdr
         mark_phase_done "patched-kwin.done"
 fi
+
+# Always gate ENABLE_HDR=1 on the patched-kwin marker, regardless of how we
+# got here. If KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 we just built it (or
+# the marker was already there from a previous run). If ENABLE_HDR=1 but
+# KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=0 was set explicitly by the operator,
+# we never ran the build and this fires the config-error path. ENABLE_HDR=0
+# is a no-op.
+require_patched_kwin_if_hdr
 
 set_phase "systemd-units"
 install_clouddeploy_systemd_units
