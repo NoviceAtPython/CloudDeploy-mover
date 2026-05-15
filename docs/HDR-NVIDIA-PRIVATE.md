@@ -79,19 +79,25 @@ KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=0           # default
 ## Integration state in CloudDeploy-mover (v2)
 
 This is the current state of the patched-KWin integration in the script.
-Update this section whenever the build pipeline lands.
+Update this section whenever the build/patch changes.
 
 | Piece | Status |
 |---|---|
 | `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*` env vars wired through `/etc/clouddeploy-wayland.env` | **Done** |
+| `Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*=1` lines written into `kwin-realvt.service` when `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1` (and *not* written when 0, so `qEnvironmentVariableIsSet()` in the patched KWin returns false) | **Done** |
+| Patch file at [`patches/kwin-clouddeploy-nvidia-private-hdr.patch`](../patches/kwin-clouddeploy-nvidia-private-hdr.patch) | **Done** |
+| `build_install_patched_kwin`: enables deb-src, `apt-get build-dep -y kwin`, `apt source kwin`, applies the patch, `DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" dpkg-buildpackage -us -uc -b`, stops kwin/sunshine, installs the resulting `.deb`s, `apt-mark hold`s them, runs `kwin_wayland --version`, and writes `${PATCHED_KWIN_MARKER}` | **Done** |
+| New `patched-kwin` phase wired between `sunshine-build` and `systemd-units` (only when `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1`) | **Done** |
 | Early guard `require_patched_kwin_if_hdr` refuses `ENABLE_HDR=1` when the patched KWin marker is missing | **Done** |
-| Post-deploy `validate_hdr_final_state` checks KScreen HDR/WCG + drm_info NV_CRTC_REGAMMA_TF=PQ + NV_INPUT_COLORSPACE=BT.2100 PQ + NV_PLANE_DEGAMMA_TF=PQ and fails loudly on miss | **Done** |
-| Apt-source + dpkg-buildpackage + install of patched KWin, leaving `${PATCHED_KWIN_MARKER}` (default `/var/lib/clouddeploy/patched-kwin-installed`) | **NOT YET** — pending the actual C++ patch |
-| KWin runtime debug toggle file paths honoured by the patched KWin | **NOT YET** — depends on the patched KWin build |
+| Post-deploy `validate_hdr_final_state` requires KScreen HDR/WCG + drm_info `NV_CRTC_REGAMMA_TF=PQ` + `NV_INPUT_COLORSPACE=BT.2100 PQ` + `NV_PLANE_DEGAMMA_TF=PQ` and fails loudly on miss | **Done** |
+| KWin runtime debug toggle file paths honoured by the patched KWin | **Not in this patch.** The integrated patch is the production baseline (NVIDIA private CRTC/plane props, metadata blob 0). The `/tmp/clouddeploy-*` debug toggles listed below are for a future diagnostic patch and currently have no effect. |
 
-**Until the patched KWin build/install lands, `ENABLE_HDR=1` will fail
-early with a clear error message.** Run with `ENABLE_HDR=0` for an SDR
-deployment, or wait for the patch to be integrated.
+**What you get when `ENABLE_HDR=1` runs to completion**
+
+1. apt source kwin → patch applies → kwin/libkwin .debs are built and installed
+2. kwin-realvt.service gets `Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1` and `Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1`
+3. When KWin runs the atomic modeset, the patched code path skips connector `HDR_OUTPUT_METADATA` and `Colorspace=BT2020_RGB` (which NVIDIA rejects), and instead writes `NV_CRTC_REGAMMA_TF=PQ` on the CRTC and `NV_INPUT_COLORSPACE=BT.2100 PQ` + `NV_PLANE_DEGAMMA_TF=PQ` on the primary plane (with `NV_HDR_STATIC_METADATA` left as blob 0)
+4. `validate_hdr_final_state` confirms the documented good state via `kscreen-doctor -o` and `drm_info` and refuses to claim success otherwise.
 
 ## Debug toggles (not deployment-required)
 
