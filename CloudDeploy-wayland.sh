@@ -91,6 +91,25 @@ CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QU
 # reminder log line so future work can resume from the documented best-next
 # experiment without changing default behavior.
 CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA="${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA:-0}"
+# Patched-KWin NVIDIA private HDR. The stock KWin connector HDR path causes
+# NVIDIA driver rejection ("the driver rejected the output configuration"),
+# so a patched KWin that skips connector HDR_OUTPUT_METADATA + connector
+# Colorspace and sets NVIDIA private CRTC/plane DRM props
+# (NV_CRTC_REGAMMA_TF=PQ, NV_INPUT_COLORSPACE=BT.2100 PQ,
+# NV_PLANE_DEGAMMA_TF=PQ) is required to produce the documented HDR good
+# state. ENABLE_HDR=1 implies KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 unless
+# explicitly overridden. See docs/HDR-NVIDIA-PRIVATE.md.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR:-${ENABLE_HDR}}"
+# Whether the patched KWin should write NVIDIA private DRM props on the
+# primary plane during modeset. The good state requires plane-prop writes,
+# so this defaults on when KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS:-${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}}"
+# NV_HDR_STATIC_METADATA stays blob 0 by default; setting it broke the path
+# in every variant tested on the live VM and remains experimental.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA:-0}"
+# Marker the patched-KWin build pipeline drops after a successful install.
+# Used by require_patched_kwin_if_hdr to refuse ENABLE_HDR=1 without it.
+PATCHED_KWIN_MARKER="${PATCHED_KWIN_MARKER:-/var/lib/clouddeploy/patched-kwin-installed}"
 # When FORCE_CONNECTOR_AUTO=1 (or FORCED_CONNECTOR=auto), pick a connector
 # from /sys/class/drm at runtime instead of hardcoding DP-1. HDMI-A-* is
 # preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
@@ -842,6 +861,10 @@ write_clouddeploy_env_file() {
                 printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
                 printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
                 printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA}"
+                printf 'PATCHED_KWIN_MARKER=%q\n' "${PATCHED_KWIN_MARKER}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
                 printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
@@ -3361,6 +3384,10 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
         printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
         printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=%q\n' "0"
+        printf 'PATCHED_KWIN_MARKER=%q\n' "/var/lib/clouddeploy/patched-kwin-installed"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
         printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
@@ -4168,6 +4195,125 @@ print_experimental_dkms_hdr_metadata_notice() {
         log "  Deployment continues with the stock NVIDIA driver and metadata off."
 }
 
+patched_kwin_installed() {
+        # Detect whether the CloudDeploy patched KWin with NVIDIA private HDR
+        # support is on this system. The build pipeline drops
+        # ${PATCHED_KWIN_MARKER} on a successful install. Until the patch is
+        # integrated, this returns non-zero and require_patched_kwin_if_hdr
+        # refuses ENABLE_HDR=1.
+        [[ -f "${PATCHED_KWIN_MARKER}" ]]
+}
+
+require_patched_kwin_if_hdr() {
+        # Stock KWin's connector HDR_OUTPUT_METADATA + connector Colorspace
+        # path is rejected by the NVIDIA atomic check. Deployment must not
+        # silently fall back to stock KWin when ENABLE_HDR=1; we either have
+        # a patched KWin that uses NVIDIA private CRTC/plane props, or we
+        # refuse the deploy.
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" != "1" ]]; then
+                die "ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}. The stock KWin connector HDR path causes NVIDIA driver rejection. Set KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 (or leave it unset so it inherits from ENABLE_HDR) and provide the patched KWin build. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+
+        if ! patched_kwin_installed; then
+                die "ENABLE_HDR=1 requires a patched KWin with NVIDIA private HDR support, but no patched KWin is installed (marker ${PATCHED_KWIN_MARKER} missing). The CloudDeploy build/install pipeline for the KWin patch is not yet integrated in this revision; the stock KWin connector HDR path produced 'the driver rejected the output configuration' on the live VM. To proceed, either set ENABLE_HDR=0 for an SDR deployment now, or supply the patched KWin (see docs/HDR-NVIDIA-PRIVATE.md) and re-run."
+        fi
+
+        log "ENABLE_HDR=1 prerequisites OK: KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 and patched KWin marker present at ${PATCHED_KWIN_MARKER}"
+}
+
+validate_hdr_final_state() {
+        # Runs after KWin is up and the force-mode helper has driven the
+        # ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} scale.1 path. When
+        # ENABLE_HDR=1 the deploy is only considered successful if both:
+        #   1. kscreen-doctor -o reports HDR enabled + Wide Color Gamut enabled
+        #      on ${FORCED_CONNECTOR}.
+        #   2. drm_info shows the NVIDIA private DRM properties:
+        #         NV_CRTC_REGAMMA_TF = PQ            (active CRTC)
+        #         NV_INPUT_COLORSPACE = BT.2100 PQ   (active primary plane)
+        #         NV_PLANE_DEGAMMA_TF = PQ           (active primary plane)
+        #      NV_HDR_STATIC_METADATA = blob 0 is the expected good state;
+        #      anything else is accepted but logged (metadata stays experimental).
+        # If the state is not reached, the deploy fails loudly with diagnostics
+        # rather than silently continuing.
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        log "Validating final HDR state (KScreen HDR/WCG + NVIDIA private DRM props)"
+
+        if [[ -z "${HEADLESS_USER:-}" ]] || [[ -z "${RUNTIME_DIR:-}" ]] || [[ -z "${KWIN_DISPLAY:-}" ]]; then
+                die "HDR validation: HEADLESS_USER/RUNTIME_DIR/KWIN_DISPLAY not resolved; cannot query KWin."
+        fi
+
+        local kscreen_out connector_block hdr_line wcg_line
+        kscreen_out="$(runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                USER="${HEADLESS_USER}" \
+                LOGNAME="${HEADLESS_USER}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                kscreen-doctor -o 2>&1 || true)"
+
+        connector_block="$(printf '%s\n' "${kscreen_out}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = ($0 ~ conn) ? 1 : 0 }
+                in_block { print }
+        ')"
+        hdr_line="$(printf '%s\n' "${connector_block}" | grep -iE '^[[:space:]]*HDR[[:space:]]*:' | head -n1 || true)"
+        wcg_line="$(printf '%s\n' "${connector_block}" | grep -iE '^[[:space:]]*Wide Color Gamut[[:space:]]*:' | head -n1 || true)"
+
+        if [[ "${hdr_line}" != *"enabled"* ]] || [[ "${wcg_line}" != *"enabled"* ]]; then
+                echo "=== kscreen-doctor -o output ==="
+                printf '%s\n' "${kscreen_out}"
+                echo "=== relevant ${FORCED_CONNECTOR} block ==="
+                printf '%s\n' "${connector_block}"
+                die "HDR validation failed: KScreen does not report HDR enabled + Wide Color Gamut enabled on ${FORCED_CONNECTOR}. Observed HDR='${hdr_line:-missing}', WCG='${wcg_line:-missing}'. This usually means the stock KWin connector HDR path was hit and the NVIDIA atomic check rejected the modeset. The patched KWin must skip standard connector HDR_OUTPUT_METADATA + Colorspace and set NVIDIA private CRTC/plane props instead. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+        log "HDR validation: KScreen reports HDR enabled + Wide Color Gamut enabled on ${FORCED_CONNECTOR}"
+
+        if ! command -v drm_info >/dev/null 2>&1; then
+                die "HDR validation failed: drm_info is not installed; cannot verify NVIDIA private DRM properties. Install libdrm-tests (already part of base-packages) and re-run."
+        fi
+
+        local drm_out
+        drm_out="$(drm_info 2>&1 || true)"
+
+        local -a missing=()
+        local prop_pattern
+        # NV_CRTC_REGAMMA_TF on active CRTC must read PQ
+        prop_pattern='NV_CRTC_REGAMMA_TF[[:space:]:=]*PQ'
+        printf '%s\n' "${drm_out}" | grep -E "${prop_pattern}" >/dev/null 2>&1 \
+                || missing+=("NV_CRTC_REGAMMA_TF=PQ")
+        # NV_INPUT_COLORSPACE on active primary plane must read BT.2100 PQ
+        prop_pattern='NV_INPUT_COLORSPACE[[:space:]:=]*BT[.]?2100[[:space:]]+PQ'
+        printf '%s\n' "${drm_out}" | grep -E "${prop_pattern}" >/dev/null 2>&1 \
+                || missing+=("NV_INPUT_COLORSPACE=BT.2100 PQ")
+        # NV_PLANE_DEGAMMA_TF on active primary plane must read PQ
+        prop_pattern='NV_PLANE_DEGAMMA_TF[[:space:]:=]*PQ'
+        printf '%s\n' "${drm_out}" | grep -E "${prop_pattern}" >/dev/null 2>&1 \
+                || missing+=("NV_PLANE_DEGAMMA_TF=PQ")
+
+        if (( ${#missing[@]} > 0 )); then
+                echo "=== drm_info NV_* lines ==="
+                printf '%s\n' "${drm_out}" | grep -E 'NV_CRTC_REGAMMA_TF|NV_INPUT_COLORSPACE|NV_PLANE_DEGAMMA_TF|NV_HDR_STATIC_METADATA' || true
+                die "HDR validation failed: drm_info is missing required NVIDIA private DRM properties: ${missing[*]}. Expected state: NV_CRTC_REGAMMA_TF=PQ on active CRTC; NV_INPUT_COLORSPACE=BT.2100 PQ and NV_PLANE_DEGAMMA_TF=PQ on active primary plane. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+        log "HDR validation: drm_info confirms NV_CRTC_REGAMMA_TF=PQ, NV_INPUT_COLORSPACE=BT.2100 PQ, NV_PLANE_DEGAMMA_TF=PQ"
+
+        # NV_HDR_STATIC_METADATA: blob 0 is the expected good state; anything
+        # else is accepted but surfaced so a future metadata experiment can
+        # tell that the deploy is the one producing the change.
+        if printf '%s\n' "${drm_out}" | grep -Eq 'NV_HDR_STATIC_METADATA[[:space:]:=]*blob[[:space:]]+0'; then
+                log "HDR validation: NV_HDR_STATIC_METADATA = blob 0 (expected; metadata path remains experimental)"
+        elif printf '%s\n' "${drm_out}" | grep -E 'NV_HDR_STATIC_METADATA' >/dev/null 2>&1; then
+                log "HDR validation: NV_HDR_STATIC_METADATA is non-empty"
+                printf '%s\n' "${drm_out}" | grep -E 'NV_HDR_STATIC_METADATA' || true
+        fi
+}
+
 known_good_clean_reset_streaming_stack() {
         log "Running clouddeploy-reset-streaming before final validation"
         write_clouddeploy_env_file
@@ -4315,6 +4461,9 @@ validate_streaming_stack_ready() {
                 print_server_validation_diagnostics
                 die "Sunshine failure marker observed: ${KNOWN_SUNSHINE_FAILURE_LINE}"
         fi
+
+        # ENABLE_HDR=1 requires the full HDR good state, not just SDR streaming.
+        validate_hdr_final_state
 }
 
 print_driver_cuda_sunshine_summary() {
@@ -4585,6 +4734,11 @@ fi
 # yet enumerate NVIDIA connectors before the driver loads. The
 # display-detection phase re-resolves once the driver is up.
 maybe_resolve_force_connector
+
+# ENABLE_HDR=1 must not silently fall through to stock KWin, which produced
+# "the driver rejected the output configuration" on the live VM. Fail loudly
+# before any apt/install/build/reboot work begins.
+require_patched_kwin_if_hdr
 
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
