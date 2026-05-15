@@ -76,9 +76,22 @@ KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1
 KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=0           # default
 ```
 
-`CloudDeploy-wayland.sh` is wired up to build and apply this patched
-KWin only when `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1`. The default
-deployment uses stock KWin.
+## Integration state in CloudDeploy-mover (v2)
+
+This is the current state of the patched-KWin integration in the script.
+Update this section whenever the build pipeline lands.
+
+| Piece | Status |
+|---|---|
+| `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR*` env vars wired through `/etc/clouddeploy-wayland.env` | **Done** |
+| Early guard `require_patched_kwin_if_hdr` refuses `ENABLE_HDR=1` when the patched KWin marker is missing | **Done** |
+| Post-deploy `validate_hdr_final_state` checks KScreen HDR/WCG + drm_info NV_CRTC_REGAMMA_TF=PQ + NV_INPUT_COLORSPACE=BT.2100 PQ + NV_PLANE_DEGAMMA_TF=PQ and fails loudly on miss | **Done** |
+| Apt-source + dpkg-buildpackage + install of patched KWin, leaving `${PATCHED_KWIN_MARKER}` (default `/var/lib/clouddeploy/patched-kwin-installed`) | **NOT YET** — pending the actual C++ patch |
+| KWin runtime debug toggle file paths honoured by the patched KWin | **NOT YET** — depends on the patched KWin build |
+
+**Until the patched KWin build/install lands, `ENABLE_HDR=1` will fail
+early with a clear error message.** Run with `ENABLE_HDR=0` for an SDR
+deployment, or wait for the patch to be integrated.
 
 ## Debug toggles (not deployment-required)
 
