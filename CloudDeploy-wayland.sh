@@ -2495,6 +2495,7 @@ Environment=KWIN_FORCE_SW_CURSOR=1
 Environment=KWIN_USE_OVERLAYS=0
 Environment=GBM_BACKEND=nvidia-drm
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+$(kwin_clouddeploy_env_block)
 PermissionsStartOnly=true
 ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
 ExecStartPre=-/usr/bin/systemctl start user@${HEADLESS_UID}.service
@@ -2604,6 +2605,177 @@ resolve_sunshine_cuda_module() {
                         printf 'on\n'
                         ;;
         esac
+}
+
+kwin_clouddeploy_env_block() {
+        # Emits systemd Environment= lines for the KWin patched-HDR vars,
+        # one per line. The patched KWin checks qEnvironmentVariableIsSet(),
+        # which returns true for "0" / empty too — to take the stock code
+        # path we must omit the Environment= line entirely. So emit only
+        # when the var is "1".
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1\n'
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1\n'
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=1\n'
+        return 0
+}
+
+ensure_apt_deb_src_enabled() {
+        # apt source kwin requires deb-src to be enabled. Ubuntu 24.04+ uses
+        # the deb822 format at /etc/apt/sources.list.d/ubuntu.sources where
+        # Types: deb must be widened to Types: deb deb-src; older releases
+        # use /etc/apt/sources.list with commented "# deb-src ..." lines.
+        local changed=0
+        local f
+
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+                if grep -qE '^Types:[[:space:]]+deb[[:space:]]*$' /etc/apt/sources.list.d/ubuntu.sources; then
+                        sed -i -E 's/^Types:[[:space:]]+deb[[:space:]]*$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+                        changed=1
+                fi
+        fi
+
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+                [[ -f "${f}" ]] || continue
+                if grep -qE '^#[[:space:]]*deb-src[[:space:]]+' "${f}"; then
+                        sed -i -E 's/^#[[:space:]]*(deb-src[[:space:]]+)/\1/' "${f}"
+                        changed=1
+                fi
+        done
+
+        if [[ "${changed}" == "1" ]]; then
+                log "Enabled deb-src for kwin source fetch; running apt-get update"
+                apt-get "${APT_DPKG_OPTIONS[@]}" update -y || die "apt-get update failed after enabling deb-src"
+        fi
+}
+
+build_install_patched_kwin() {
+        # Builds and installs the CloudDeploy patched KWin with NVIDIA private
+        # HDR support. Idempotent: skips if ${PATCHED_KWIN_MARKER} already
+        # exists. After a successful install, drops the marker so
+        # require_patched_kwin_if_hdr stops blocking ENABLE_HDR=1.
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] || {
+                log "KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR != 1; skipping patched KWin build"
+                return 0
+        }
+
+        if patched_kwin_installed; then
+                log "Patched KWin marker already present at ${PATCHED_KWIN_MARKER}; skipping rebuild"
+                return 0
+        fi
+
+        local build_dir="${KWIN_PATCHED_BUILD_DIR:-/usr/local/src/clouddeploy-kwin}"
+        local patch_file_name="${KWIN_PATCH_FILE_NAME:-kwin-clouddeploy-nvidia-private-hdr.patch}"
+
+        log "Building patched KWin with NVIDIA private HDR support in ${build_dir}"
+
+        # 1. Build tooling + kwin build dependencies.
+        apt_install_wait dpkg-dev fakeroot devscripts patch
+        ensure_apt_deb_src_enabled
+        log "Installing kwin build-dependencies (apt-get build-dep -y kwin)"
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" build-dep -y kwin \
+                || die "apt-get build-dep -y kwin failed; cannot build patched KWin"
+
+        # 2. apt source kwin into the workdir.
+        install -d -m 0755 "${build_dir}"
+        (
+                cd "${build_dir}"
+                find . -maxdepth 1 -type d -name 'kwin-*' -exec rm -rf {} + 2>/dev/null || true
+                log "Fetching kwin source via apt source into ${build_dir}"
+                apt-get "${APT_DPKG_OPTIONS[@]}" source kwin \
+                        || die "apt source kwin failed; ensure deb-src is enabled and the kwin source package is available"
+        )
+
+        local source_dir
+        source_dir="$(find "${build_dir}" -maxdepth 1 -type d -name 'kwin-*' | head -n1)"
+        [[ -n "${source_dir}" ]] || die "Could not locate unpacked kwin source under ${build_dir}"
+        log "kwin source unpacked at ${source_dir}"
+
+        # 3. Locate the patch file (lives in the CloudDeploy-mover repo).
+        local script_dir patch_file=""
+        script_dir="$(dirname "$(readlink -f "$0")")"
+        local candidate
+        for candidate in \
+                "${script_dir}/patches/${patch_file_name}" \
+                "${CLOUDDEPLOY_REPO_DIR:-}/patches/${patch_file_name}" \
+                "/usr/local/share/clouddeploy/patches/${patch_file_name}"; do
+                if [[ -f "${candidate}" ]]; then
+                        patch_file="${candidate}"
+                        break
+                fi
+        done
+        [[ -n "${patch_file}" ]] || die "Could not locate ${patch_file_name} in the CloudDeploy-mover repo (looked under ${script_dir}/patches and /usr/local/share/clouddeploy/patches). Make sure you are running the v2 branch of NoviceAtPython/CloudDeploy-mover so the patch file is present."
+
+        log "Applying KWin patch from ${patch_file}"
+        (
+                cd "${source_dir}"
+                patch -p1 --forward < "${patch_file}" \
+                        || die "patch -p1 failed to apply ${patch_file_name} to ${source_dir} - the kwin source tree may have drifted from the KWin 6.4.x layout the patch was written against."
+        )
+
+        # 4. Build. dpkg-buildpackage on Ubuntu accepts running as root; we
+        #    skip checks (nocheck) for speed since the patch only changes
+        #    DRM property writes and KWin's own tests are not load-bearing
+        #    for our deploy.
+        log "Building patched kwin (dpkg-buildpackage; can take 20+ minutes)"
+        (
+                cd "${source_dir}"
+                DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" \
+                        dpkg-buildpackage -us -uc -b \
+                        || die "dpkg-buildpackage failed for patched kwin under ${source_dir}"
+        )
+
+        # 5. Stop services that hold the running kwin_wayland before we
+        #    swap the binaries underneath it.
+        log "Stopping KWin/Sunshine services before installing patched kwin .debs"
+        systemctl stop sunshine-headless.service plasma-shell-realvt.service kwin-realvt.service 2>/dev/null || true
+        pkill -9 -u "${HEADLESS_USER}" -x kwin_wayland 2>/dev/null || true
+
+        # 6. Install the generated kwin/libkwin .debs (and the rest of the
+        #    binary packages from the same source) so co-installed runtime
+        #    libraries stay in sync.
+        local -a deb_files
+        mapfile -t deb_files < <(find "${build_dir}" -maxdepth 1 -type f -name '*.deb')
+        [[ "${#deb_files[@]}" -gt 0 ]] || die "No kwin .deb files were produced under ${build_dir}"
+        log "Installing ${#deb_files[@]} patched kwin .deb file(s)"
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y --allow-downgrades "${deb_files[@]}" \
+                || die "apt-get install failed for patched kwin .deb files under ${build_dir}"
+
+        # Hold the installed kwin/libkwin packages so a later apt upgrade
+        # doesn't silently swap the patched binaries back to stock.
+        local deb pkg_name
+        for deb in "${deb_files[@]}"; do
+                pkg_name="$(dpkg-deb -f "${deb}" Package 2>/dev/null || true)"
+                if [[ -n "${pkg_name}" ]]; then
+                        apt-mark hold "${pkg_name}" >/dev/null 2>&1 || true
+                fi
+        done
+
+        # 7. Sanity check.
+        if command -v kwin_wayland >/dev/null 2>&1; then
+                log "kwin_wayland --version after patched install:"
+                kwin_wayland --version 2>&1 | head -n5 || true
+        else
+                die "kwin_wayland binary is missing after patched kwin install"
+        fi
+
+        # 8. Marker. validate_hdr_final_state still decides whether the
+        #    install actually produced the documented HDR good state.
+        install -d -m 0755 "$(dirname "${PATCHED_KWIN_MARKER}")"
+        {
+                printf 'patched-kwin-installed=1\n'
+                printf 'patch-file=%s\n' "${patch_file}"
+                printf 'source-dir=%s\n' "${source_dir}"
+                printf 'timestamp=%s\n' "$(date -Iseconds 2>/dev/null || date -u +%FT%TZ)"
+                if command -v kwin_wayland >/dev/null 2>&1; then
+                        printf 'kwin-version=%s\n' "$(kwin_wayland --version 2>/dev/null | head -n1 || true)"
+                fi
+        } > "${PATCHED_KWIN_MARKER}"
+        log "Wrote patched KWin marker at ${PATCHED_KWIN_MARKER}"
 }
 
 install_sunshine_from_fork_if_requested() {
@@ -4919,6 +5091,13 @@ SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
 [[ -x "${SUNSHINE_RUNTIME_BIN}" ]] || die "Sunshine runtime binary is not executable: ${SUNSHINE_RUNTIME_BIN}"
 log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
 ensure_nvidia_egl_vulkan_runtime_config
+
+if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]]; then
+        set_phase "patched-kwin"
+        build_install_patched_kwin
+        mark_phase_done "patched-kwin.done"
+fi
+
 set_phase "systemd-units"
 install_clouddeploy_systemd_units
 
@@ -6020,6 +6199,7 @@ Environment=KWIN_FORCE_SW_CURSOR=1
 Environment=KWIN_USE_OVERLAYS=0
 Environment=GBM_BACKEND=nvidia-drm
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+$(kwin_clouddeploy_env_block)
 
 PermissionsStartOnly=true
 ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service

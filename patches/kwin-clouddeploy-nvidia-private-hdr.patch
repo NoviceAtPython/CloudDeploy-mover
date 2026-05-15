@@ -1,0 +1,209 @@
+Description: CloudDeploy NVIDIA private HDR/PQ baseline for KWin 6.4.x
+ Adds a runtime opt-in (KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1) that, when the
+ GPU is NVIDIA, skips the standard connector HDR_OUTPUT_METADATA and
+ Colorspace=BT2020_RGB writes (NVIDIA's atomic check rejects them on the
+ forced/headless DRM virtual output) and instead drives NVIDIA private
+ properties:
+   CRTC NV_CRTC_REGAMMA_TF        = PQ
+   primary plane NV_INPUT_COLORSPACE = BT.2100 PQ
+   primary plane NV_PLANE_DEGAMMA_TF = PQ
+   primary plane NV_HDR_STATIC_METADATA = blob 0
+ Empirically this is the configuration that produced KScreen reporting
+ "HDR: enabled" + "Wide Color Gamut: enabled" on the live Ubuntu 25.10 /
+ Plasma 6 / NVIDIA 580 VM. NV_HDR_STATIC_METADATA stays blob 0 by default
+ because every variant that set it tripped nvKms->applyModeSetConfig.
+Author: CloudDeploy
+Forwarded: not-needed
+Last-Update: 2026-05-14
+
+diff --git a/src/backends/drm/drm_crtc.h b/src/backends/drm/drm_crtc.h
+index 3604a1571..clouddeploy 100644
+--- a/src/backends/drm/drm_crtc.h
++++ b/src/backends/drm/drm_crtc.h
+@@ -54,6 +54,12 @@ public:
+     DrmProperty degammaLut;
+     DrmProperty degammaLutSize;
+
++    /*
++     * NVIDIA private HDR property.
++     * nvidia-drm enum values observed: Default=0, Linear=1, PQ=2.
++     */
++    DrmProperty nvCrtcRegammaTf;
++
+     DrmAbstractColorOp *postBlendingPipeline = nullptr;
+
+ private:
+diff --git a/src/backends/drm/drm_crtc.cpp b/src/backends/drm/drm_crtc.cpp
+index 88aca750a..clouddeploy 100644
+--- a/src/backends/drm/drm_crtc.cpp
++++ b/src/backends/drm/drm_crtc.cpp
+@@ -32,6 +32,7 @@ DrmCrtc::DrmCrtc(DrmGpu *gpu, uint32_t crtcId, int pipeIndex, DrmPlane *primaryP
+     , ctm(this, QByteArrayLiteral("CTM"))
+     , degammaLut(this, QByteArrayLiteral("DEGAMMA_LUT"))
+     , degammaLutSize(this, QByteArrayLiteral("DEGAMMA_LUT_SIZE"))
++    , nvCrtcRegammaTf(this, QByteArrayLiteral("NV_CRTC_REGAMMA_TF"))
+     , m_crtc(drmModeGetCrtc(gpu->fd(), crtcId))
+     , m_pipeIndex(pipeIndex)
+     , m_primaryPlane(primaryPlane)
+@@ -57,6 +58,7 @@ bool DrmCrtc::updateProperties()
+     ctm.update(props);
+     degammaLut.update(props);
+     degammaLutSize.update(props);
++    nvCrtcRegammaTf.update(props);
+
+     if (!postBlendingPipeline) {
+         DrmAbstractColorOp *next = nullptr;
+diff --git a/src/backends/drm/drm_plane.h b/src/backends/drm/drm_plane.h
+index 17007d1e6..clouddeploy 100644
+--- a/src/backends/drm/drm_plane.h
++++ b/src/backends/drm/drm_plane.h
+@@ -92,6 +92,18 @@ public:
+     DrmProperty inFenceFd;
+     DrmProperty sizeHints;
+
++    /*
++     * NVIDIA private HDR properties.
++     *
++     * NV_INPUT_COLORSPACE enum observed:
++     *   None=0, scRGB Linear FP16=1, BT.2100 PQ=2
++     *
++     * NV_PLANE_DEGAMMA_TF enum observed:
++     *   Default=0, Linear=1, PQ=2
++     */
++    DrmProperty nvInputColorspace;
++    DrmProperty nvHdrStaticMetadata;
++    DrmProperty nvPlaneDegammaTf;
++
+ private:
+     std::shared_ptr<DrmFramebuffer> m_current;
+     QList<std::shared_ptr<DrmFramebufferData>> m_lastBuffers;
+diff --git a/src/backends/drm/drm_plane.cpp b/src/backends/drm/drm_plane.cpp
+index 845901a90..clouddeploy 100644
+--- a/src/backends/drm/drm_plane.cpp
++++ b/src/backends/drm/drm_plane.cpp
+@@ -62,6 +62,9 @@ DrmPlane::DrmPlane(DrmGpu *gpu, uint32_t planeId)
+     , vmHotspotY(this, QByteArrayLiteral("HOTSPOT_Y"))
+     , inFenceFd(this, QByteArrayLiteral("IN_FENCE_FD"))
+     , sizeHints(this, QByteArrayLiteral("SIZE_HINTS"))
++    , nvInputColorspace(this, QByteArrayLiteral("NV_INPUT_COLORSPACE"))
++    , nvHdrStaticMetadata(this, QByteArrayLiteral("NV_HDR_STATIC_METADATA"))
++    , nvPlaneDegammaTf(this, QByteArrayLiteral("NV_PLANE_DEGAMMA_TF"))
+ {
+ }
+
+@@ -94,6 +97,9 @@ bool DrmPlane::updateProperties()
+     vmHotspotY.update(props);
+     inFenceFd.update(props);
+     sizeHints.update(props);
++    nvInputColorspace.update(props);
++    nvHdrStaticMetadata.update(props);
++    nvPlaneDegammaTf.update(props);
+
+     if (!type.isValid() || !srcX.isValid() || !srcY.isValid() || !srcW.isValid() || !srcH.isValid()
+         || !crtcX.isValid() || !crtcY.isValid() || !crtcW.isValid() || !crtcH.isValid() || !fbId.isValid()) {
+diff --git a/src/backends/drm/drm_pipeline.cpp b/src/backends/drm/drm_pipeline.cpp
+index c81140c16..clouddeploy 100644
+--- a/src/backends/drm/drm_pipeline.cpp
++++ b/src/backends/drm/drm_pipeline.cpp
+@@ -299,6 +299,10 @@ static const auto s_forceScalingMode = []() -> std::optional<DrmConnector::Scali
+
+ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
+ {
++    const bool cloudDeployNvPrivateHdr =
++        qEnvironmentVariableIsSet("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR") && gpu()->isNVidia();
++    const bool cloudDeployHdrLike = m_pending.hdr || m_pending.wcg;
++
+     commit->addProperty(m_connector->crtcId, m_pending.crtc->id());
+     if (m_connector->broadcastRGB.isValid()) {
+         commit->addEnum(m_connector->broadcastRGB, DrmConnector::rgbRangeToBroadcastRgb(m_pending.rgbRange));
+@@ -316,19 +320,33 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
+     if (m_connector->maxBpc.isValid()) {
+         commit->addProperty(m_connector->maxBpc, std::clamp<uint32_t>(m_pending.maxBpc, m_connector->maxBpc.minValue(), m_connector->maxBpc.maxValue()));
+     }
++
+     if (m_connector->hdrMetadata.isValid()) {
+-        commit->addBlob(m_connector->hdrMetadata, createHdrMetadata(m_pending.hdr ? TransferFunction::PerceptualQuantizer : TransferFunction::gamma22));
+-    } else if (m_pending.hdr) {
++        /*
++         * CloudDeploy NVIDIA private HDR path:
++         * The standard connector HDR_OUTPUT_METADATA blob caused NVIDIA's
++         * atomic check to reject the output configuration on the headless VM.
++         * For NVIDIA private HDR mode, leave connector HDR metadata unset and
++         * drive the private CRTC/plane properties below instead.
++         */
++        if (!cloudDeployNvPrivateHdr) {
++            commit->addBlob(m_connector->hdrMetadata, createHdrMetadata(m_pending.hdr ? TransferFunction::PerceptualQuantizer : TransferFunction::gamma22));
++        }
++    } else if (m_pending.hdr && !cloudDeployNvPrivateHdr) {
+         return false;
+     }
++
+     if (m_pending.wcg) {
+-        if (!m_connector->colorspace.isValid() || !m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB)) {
++        /*
++         * Same story for connector Colorspace=BT2020_RGB: NVIDIA rejected this
++         * on the forced/headless path. Skip it for the CloudDeploy private path.
++         */
++        if (!cloudDeployNvPrivateHdr && (!m_connector->colorspace.isValid() || !m_connector->colorspace.hasEnum(DrmConnector::Colorspace::BT2020_RGB))) {
+             return false;
+         }
+-        commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::BT2020_RGB);
+-    } else if (m_connector->colorspace.isValid()) {
++        if (!cloudDeployNvPrivateHdr) {
++            commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::BT2020_RGB);
++        }
++    } else if (m_connector->colorspace.isValid() && !cloudDeployNvPrivateHdr) {
+         commit->addEnum(m_connector->colorspace, DrmConnector::Colorspace::Default);
+     }
++
+     if (m_connector->scalingMode.isValid()) {
+         if (s_forceScalingMode.has_value()) {
+             if (m_connector->scalingMode.hasEnum(*s_forceScalingMode)) {
+@@ -351,8 +369,40 @@ bool DrmPipeline::prepareAtomicModeset(DrmAtomicCommit *commit)
+     if (m_pending.crtc->degammaLut.isValid()) {
+         commit->addProperty(m_pending.crtc->degammaLut, 0);
+     }
++
++    /*
++     * NVIDIA private CRTC HDR transfer function.
++     *
++     * nvidia-drm exposes NV_CRTC_REGAMMA_TF with values:
++     *   Default=0, Linear=1, PQ=2
++     *
++     * This is part of the empirically working CloudDeploy path:
++     * KScreen HDR/WCG enabled + NV_CRTC_REGAMMA_TF=PQ.
++     */
++    if (cloudDeployNvPrivateHdr && m_pending.crtc->nvCrtcRegammaTf.isValid()) {
++        commit->addProperty(m_pending.crtc->nvCrtcRegammaTf, cloudDeployHdrLike ? 2 : 0);
++    }
+
+     const auto primary = m_pending.crtc->primaryPlane();
++
++    /*
++     * NVIDIA private primary-plane HDR properties.
++     *
++     * nvidia-drm exposes:
++     *   NV_INPUT_COLORSPACE: None=0, scRGB Linear FP16=1, BT.2100 PQ=2
++     *   NV_PLANE_DEGAMMA_TF: Default=0, Linear=1, PQ=2
++     *
++     * The working CloudDeploy state uses:
++     *   NV_INPUT_COLORSPACE=BT.2100 PQ
++     *   NV_PLANE_DEGAMMA_TF=PQ
++     *   NV_HDR_STATIC_METADATA=blob 0
++     */
++    if (cloudDeployNvPrivateHdr
++        && qEnvironmentVariableIsSet("KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS")) {
++        if (primary->nvInputColorspace.isValid()) {
++            commit->addProperty(primary->nvInputColorspace, cloudDeployHdrLike ? 2 : 0);
++        }
++        if (primary->nvPlaneDegammaTf.isValid()) {
++            commit->addProperty(primary->nvPlaneDegammaTf, cloudDeployHdrLike ? 2 : 0);
++        }
++        if (primary->nvHdrStaticMetadata.isValid()) {
++            commit->addProperty(primary->nvHdrStaticMetadata, 0);
++        }
++    }
++
+     commit->addProperty(primary->crtcId, m_pending.crtc->id());
+     if (primary->rotation.isValid()) {
+         commit->addEnum(primary->rotation, {DrmPlane::Transformation::Rotate0});
