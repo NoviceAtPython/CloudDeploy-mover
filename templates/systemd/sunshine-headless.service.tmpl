@@ -1,0 +1,45 @@
+[Unit]
+# CloudDeploy v3 - rendered by internal/systemd from this template.
+#
+# This unit is a Milestone-4 placeholder. The v2 equivalent lives in
+# CloudDeploy-wayland.sh (search for "cat > /etc/systemd/system/sunshine-headless.service").
+# When internal/systemd.Apply lands, it will render this template with
+# the Profile + GPU evidence struct and write the final file.
+#
+# Fields to interpolate:
+#   {{.CompositorService}}    e.g. kwin-realvt.service
+#   {{.HeadlessUser}}         e.g. user
+#   {{.HomeDir}}              e.g. /home/user
+#   {{.RuntimeDir}}           e.g. /run/user/1000
+#   {{.WaylandDisplay}}       e.g. wayland-0
+#   {{.SunshineRuntimeBin}}   e.g. /usr/local/bin/sunshine-clouddeploy
+#   {{.HDREnv}}               rendered Environment= lines for HDR knobs
+Description=Sunshine on CloudDeploy NVIDIA Wayland KMS (v3 template)
+After={{.CompositorService}} network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service {{.CompositorService}}
+
+[Service]
+User={{.HeadlessUser}}
+Group={{.HeadlessUser}}
+SupplementaryGroups=video render input
+WorkingDirectory={{.HomeDir}}
+NoNewPrivileges=no
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
+Environment=HOME={{.HomeDir}}
+Environment=USER={{.HeadlessUser}}
+Environment=LOGNAME={{.HeadlessUser}}
+Environment=XDG_RUNTIME_DIR={{.RuntimeDir}}
+Environment=WAYLAND_DISPLAY={{.WaylandDisplay}}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path={{.RuntimeDir}}/bus
+{{- range .HDREnv}}
+Environment={{.}}
+{{- end}}
+ExecStart={{.SunshineRuntimeBin}} {{.HomeDir}}/.config/sunshine/sunshine.conf
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

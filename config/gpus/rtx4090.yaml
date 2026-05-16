@@ -1,0 +1,21 @@
+# GPU profile: NVIDIA GeForce RTX 4090 (AD102, Ada Lovelace consumer).
+#
+# Works with either the closed module (server / non-server) or the
+# open module (server-open / non-server-open). v2 deploys validated
+# with the closed module on driver 580; we keep that as the default
+# but the selector will keep an installed open driver if it works.
+
+match:
+  pci_ids:
+    - "10de:2684"  # AD102 RTX 4090
+    - "10de:2685"  # AD102 RTX 4090 D
+  name_patterns:
+    - "GeForce RTX 4090"
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "AD102 supports both closed and open kernel modules."
+    - "If server-open is already installed and nvidia-smi works,
+       internal/nvidia.SelectFamily keeps it (does not uninstall)."

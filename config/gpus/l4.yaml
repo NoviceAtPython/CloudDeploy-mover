@@ -1,0 +1,21 @@
+# GPU profile: NVIDIA L4 (AD104GL, Ada Lovelace data-center).
+#
+# L4 is the typical cloud-VM GPU for the Sunshine streaming workload.
+# Either module family works; we lean server family because that's
+# the canonical NVIDIA recommendation for data-center deploys.
+
+match:
+  pci_ids:
+    - "10de:27b8"  # L4
+  name_patterns:
+    - "NVIDIA L4"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "L4 is a data-center GPU."
+    - "Both closed (server) and open (server-open) kernel modules
+       work; CloudDeploy prefers the server closed module by default
+       to match NVIDIA's standard data-center recommendation."

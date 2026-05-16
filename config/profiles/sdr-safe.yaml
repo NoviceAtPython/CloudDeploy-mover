@@ -1,0 +1,31 @@
+# sdr-safe - boring SDR profile.
+#
+# What you want when HDR isn't required and the goal is the
+# lowest-risk deploy. Packaged Sunshine, stock KWin, 1080p60.
+
+profile: sdr-safe
+ubuntu_version: "24.04"
+
+display:
+  resolution: 1920x1080
+  refresh: 60
+  hdr: false
+  forced_connector: ""
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: false
+  prefer_server: false
+
+cuda:
+  mode: none
+
+sunshine:
+  source: deb
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: false
+  synthesize_hdr10_metadata: false
+
+kwin:
+  patched_hdr: false

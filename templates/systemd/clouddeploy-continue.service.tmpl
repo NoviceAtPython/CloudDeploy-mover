@@ -1,0 +1,19 @@
+[Unit]
+# CloudDeploy v3 - rendered by internal/systemd from this template.
+# Resumes `clouddeployctl apply` after a reboot. Owned by
+# internal/reboot.
+Description=CloudDeploy continuation (resume deploy after reboot)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/var/lib/clouddeploy/state.json
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+EnvironmentFile=-/etc/clouddeploy-wayland.env
+ExecStart=/usr/local/bin/clouddeployctl resume
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

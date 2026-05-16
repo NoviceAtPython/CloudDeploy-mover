@@ -1,3 +1,26 @@
+# CloudDeploy
+
+## Branches at a glance
+
+| Branch | Status | What it deploys |
+| --- | --- | --- |
+| [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Currently supported. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
+| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **In development.** | `clouddeployctl` Go orchestrator. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) + [`docs/MIGRATION.md`](docs/MIGRATION.md). First commit is skeleton + docs + tested modules for NVIDIA / CUDA / apt only. |
+
+Until v3 reaches its Milestone 5, the supported deploy command is
+still the v2 entrypoint:
+
+```bash
+sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
+```
+
+v3 design rationale (single-binary Go orchestrator, no Ansible) is in
+[`docs/ADR-0001-orchestrator-language.md`](docs/ADR-0001-orchestrator-language.md)
+and
+[`docs/ADR-0002-ansible-vs-native-go.md`](docs/ADR-0002-ansible-vs-native-go.md).
+
+---
+
 ## This is an automated deployment script for spinning up a headless NVIDIA Linux cloud gaming VM with **KDE Plasma**, **X11**, **Sunshine**, and **Tailscale**.
 
 This project is aimed at making fresh cloud instances usable in minutes instead of hours of manual setup and installs.

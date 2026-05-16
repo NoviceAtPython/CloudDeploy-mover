@@ -1,0 +1,21 @@
+# GPU profile: NVIDIA GeForce RTX 5090 (GB202, Blackwell consumer).
+#
+# Why this exists: GB202 cannot use the closed NVIDIA kernel module
+# on current driver branches. The deploy MUST pick a *-open package.
+# RTX 5090 + driver 580 is the validated combination as of v3 commit.
+
+match:
+  pci_ids:
+    - "10de:2b85"  # GB202 RTX 5090
+    - "10de:2b87"  # GB202 RTX 5090 D
+  name_patterns:
+    - "GeForce RTX 5090"
+
+nvidia:
+  prefer_open_family: true
+  driver_major_min: "580"
+  notes:
+    - "GB202 / Blackwell consumer; closed kernel module unsupported."
+    - "Open kernel module (server-open or non-server-open) is required."
+    - "Driver branch >= 580.
+       Earlier branches do not enumerate GB202."

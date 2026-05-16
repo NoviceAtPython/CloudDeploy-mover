@@ -2,3 +2,25 @@ __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+# Go
+/bin/
+/dist/
+*.test
+*.out
+coverage.out
+
+# Build artefacts
+/clouddeployctl
+
+# Editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# CloudDeploy local state (never committed)
+/var-lib-clouddeploy/
+state.json

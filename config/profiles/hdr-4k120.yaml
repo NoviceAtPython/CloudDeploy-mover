@@ -1,0 +1,50 @@
+# hdr-4k120 - production HDR profile.
+#
+# Equivalent of running v2 with ENABLE_HDR=1, TARGET_WIDTH=3840,
+# TARGET_HEIGHT=2160, TARGET_FPS=120, FORCED_CONNECTOR=DP-1, the
+# patched-KWin NVIDIA private HDR path enabled, the Sunshine fork
+# pinned to the known-good HDR commit, and both HDR env knobs on.
+#
+# See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md for the full
+# state-of-record matching this profile.
+
+profile: hdr-4k120
+ubuntu_version: "25.10"
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  # The HDR-4K120 path is validated on RTX 4090 (closed module fine)
+  # and RTX 5090 (Blackwell consumer, requires open). Setting
+  # prefer_open_family=true is the safe default for both; the
+  # internal/nvidia selector still treats a working installed-server
+  # driver on RTX 4090 as "keep it" rather than uninstalling.
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  # KMS + NVENC + AV1 HDR streaming does not need the CUDA toolkit.
+  # Set to "optional" only if a downstream profile derives from this
+  # one and explicitly needs CUDA (e.g. ML workloads on top of the
+  # gaming VM).
+  mode: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  # The two knobs that flip Moonlight's HDR overlay on:
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
