@@ -145,7 +145,7 @@ run_apply() {
     log "family, and apply the CUDA mode policy. It may also generate"
     log "EDID/GRUB config if requested by display.forced_connector."
     log "It will NOT yet build/patch KWin, NOT yet build Sunshine,"
-    log "NOT yet generate systemd units, and NOT yet validate HDR."
+    log "NOT yet generate KWin/Plasma/Sunshine systemd units, and NOT yet validate HDR."
     log "Those phases land in Milestone 4; for now they remain on v2:"
     log "    sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh"
     log ""
