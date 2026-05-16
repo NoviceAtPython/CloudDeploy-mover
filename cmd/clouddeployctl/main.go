@@ -3,9 +3,9 @@
 // State at Milestone 3 partial: doctor (apt/nvidia/cuda/system) is
 // real and read-only; apply / resume / phase base-packages /
 // nvidia-driver / cuda / edid are real and implemented. The reboot
-// continuation service is implemented. (KWin / Sunshine / 
-// KWin/Plasma/Sunshine systemd units / HDR validation are NOT yet 
-// implemented; apply exits after the implemented phases with a clear 
+// continuation service is implemented. (KWin / Sunshine /
+// KWin/Plasma/Sunshine systemd units / HDR validation are NOT yet
+// implemented; apply exits after the implemented phases with a clear
 // partial-apply banner).
 //
 // See docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
