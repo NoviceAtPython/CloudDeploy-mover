@@ -7,9 +7,11 @@ import (
 )
 
 // allFamiliesAvailable returns an Evidence with every Available* flag
-// set. Used as a base for tests that don't care about apt availability.
+// set and AvailabilityKnown=true. Used as a base for tests that don't
+// care about apt availability (assume everything is installable).
 func allFamiliesAvailable() Evidence {
 	return Evidence{
+		AvailabilityKnown:      true,
 		AvailableServer:        true,
 		AvailableServerOpen:    true,
 		AvailableNonServer:     true,
@@ -32,7 +34,8 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 		ev   Evidence
 		want want
 	}{
-		// ---- v3 brief scenario 1 ----
+		// ---- Original v3-brief scenarios (Milestone 1.1) ----
+
 		{
 			name: "RTX 5090 + server-open available -> server-open",
 			ev: Evidence{
@@ -40,12 +43,12 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				GPUName:             "NVIDIA GeForce RTX 5090",
 				IsBlackwellConsumer: true,
 				PreferOpenFamily:    true,
+				AvailabilityKnown:   true,
 				AvailableServerOpen: true,
 				AvailableServer:     true, // doesn't matter; open is required
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "Blackwell consumer"},
 		},
-		// ---- v3 brief scenario 2 ----
 		{
 			name: "RTX 5090 + only non-server-open available -> non-server-open",
 			ev: Evidence{
@@ -53,11 +56,11 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				GPUName:                "NVIDIA GeForce RTX 5090",
 				IsBlackwellConsumer:    true,
 				PreferOpenFamily:       true,
+				AvailabilityKnown:      true,
 				AvailableNonServerOpen: true,
 			},
 			want: want{family: FamilyNonServerOpen, reasonHas: "non-server-open"},
 		},
-		// ---- v3 brief scenario 3 ----
 		{
 			name: "RTX 5090 + no open packages available -> ErrNoOpenAvailable",
 			ev: Evidence{
@@ -65,26 +68,26 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				GPUName:             "NVIDIA GeForce RTX 5090",
 				IsBlackwellConsumer: true,
 				PreferOpenFamily:    true,
+				AvailabilityKnown:   true,
 				// Only the closed families are available.
 				AvailableServer:    true,
 				AvailableNonServer: true,
 			},
 			want: want{family: FamilyUnknown, err: ErrNoOpenAvailable, reasonHas: "Blackwell consumer"},
 		},
-		// ---- v3 brief scenario 4 ----
 		{
 			name: "L4 + server available + PreferServerFamily -> server",
 			ev: Evidence{
-				PCIID:              "10de:27b8",
-				GPUName:            "NVIDIA L4",
-				IsDataCenter:       true,
-				PreferServerFamily: true,
-				AvailableServer:    true,
+				PCIID:               "10de:27b8",
+				GPUName:             "NVIDIA L4",
+				IsDataCenter:        true,
+				PreferServerFamily:  true,
+				AvailabilityKnown:   true,
+				AvailableServer:     true,
 				AvailableServerOpen: true,
 			},
 			want: want{family: FamilyServer, reasonHas: "data-center"},
 		},
-		// ---- v3 brief scenario 5 ----
 		{
 			name: "L4 + server unavailable + server-open available -> server-open",
 			ev: Evidence{
@@ -92,44 +95,44 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				GPUName:             "NVIDIA L4",
 				IsDataCenter:        true,
 				PreferServerFamily:  true,
-				AvailableServerOpen: true, // closed unavailable
+				AvailabilityKnown:   true,
+				AvailableServerOpen: true,
 			},
-			want: want{family: FamilyServerOpen, reasonHas: "falling back"},
+			want: want{family: FamilyServerOpen, reasonHas: "falling back to server-open"},
 		},
-		// ---- v3 brief scenario 6 ----
 		{
 			name: "RTX 4090 + server installed + nvidia-smi works -> keep server even if prefer_open_family=true",
 			ev: Evidence{
-				PCIID:            "10de:2684",
-				GPUName:          "NVIDIA GeForce RTX 4090",
-				InstalledServer:  true,
-				NvidiaSmiWorks:   true,
-				PreferOpenFamily: true,
-				AvailableServer:  true,
+				PCIID:               "10de:2684",
+				GPUName:             "NVIDIA GeForce RTX 4090",
+				InstalledServer:     true,
+				NvidiaSmiWorks:      true,
+				PreferOpenFamily:    true,
+				AvailabilityKnown:   true,
+				AvailableServer:     true,
 				AvailableServerOpen: true,
 			},
 			want: want{family: FamilyServer, reasonHas: "already loaded"},
 		},
-		// ---- v3 brief scenario 7 ----
 		{
 			name: "Unknown NVIDIA GPU + server-open available -> server-open default",
 			ev: Evidence{
 				PCIID:               "10de:9999",
+				AvailabilityKnown:   true,
 				AvailableServerOpen: true,
 				AvailableServer:     true,
 			},
-			want: want{family: FamilyServerOpen, reasonHas: "safest"},
+			want: want{family: FamilyServerOpen, reasonHas: "server-open"},
 		},
-		// ---- v3 brief scenario 8 ----
 		{
-			name: "Unknown NVIDIA GPU + only server available -> server",
+			name: "Unknown NVIDIA GPU + only server available -> server (fallback from server-open default)",
 			ev: Evidence{
-				PCIID:           "10de:9999",
-				AvailableServer: true,
+				PCIID:             "10de:9999",
+				AvailabilityKnown: true,
+				AvailableServer:   true,
 			},
-			want: want{family: FamilyServer, reasonHas: "safest"},
+			want: want{family: FamilyServer, reasonHas: "falling back to server"},
 		},
-		// ---- v3 brief scenario 9 ----
 		{
 			name: "dmesg requires open + server installed but nvidia-smi broken + server-open available -> server-open",
 			ev: Evidence{
@@ -138,20 +141,23 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				DmesgRequiresOpenKernelModule: true,
 				InstalledServer:               true,
 				NvidiaSmiWorks:                false,
+				AvailabilityKnown:             true,
 				AvailableServer:               true,
 				AvailableServerOpen:           true,
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "dmesg"},
 		},
 
-		// ---- Older coverage retained ----
+		// ---- Existing coverage carried over ----
+
 		{
-			name: "RTX 5090 + dmesg open required + all available -> server-open with dmesg reason",
+			name: "RTX 5090 + dmesg + all available -> server-open with dmesg reason",
 			ev: Evidence{
 				PCIID:                         "10de:2b85",
 				IsBlackwellConsumer:           true,
 				DmesgRequiresOpenKernelModule: true,
 				PreferOpenFamily:              true,
+				AvailabilityKnown:             true,
 				AvailableServerOpen:           true,
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "dmesg"},
@@ -164,6 +170,7 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				InstalledServerOpen: true,
 				NvidiaSmiWorks:      true,
 				PreferOpenFamily:    true,
+				AvailabilityKnown:   true,
 				AvailableServerOpen: true,
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "already loaded"},
@@ -173,16 +180,18 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 			ev: Evidence{
 				PCIID:               "10de:27b8",
 				IsDataCenter:        true,
+				AvailabilityKnown:   true,
 				AvailableServer:     true,
 				AvailableServerOpen: true,
 			},
-			want: want{family: FamilyServerOpen, reasonHas: "safest"},
+			want: want{family: FamilyServerOpen, reasonHas: "default"},
 		},
 		{
 			name: "RTX PRO Blackwell workstation -> server-open (open required)",
 			ev: Evidence{
 				GPUName:             "NVIDIA RTX PRO 6000 Blackwell",
 				IsBlackwellPro:      true,
+				AvailabilityKnown:   true,
 				AvailableServerOpen: true,
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "Blackwell RTX PRO"},
@@ -193,16 +202,101 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 				GPUName:             "NVIDIA B200",
 				IsBlackwellDC:       true,
 				IsDataCenter:        true,
+				AvailabilityKnown:   true,
 				AvailableServerOpen: true,
 			},
 			want: want{family: FamilyServerOpen, reasonHas: "Blackwell datacenter"},
 		},
+
+		// ---- AvailabilityKnown semantics ----
+
 		{
-			name: "No availability info at all -> selector still picks via assume-available fallback",
+			name: "AvailabilityKnown=false + no Available* -> default server-open (optimistic)",
 			ev: Evidence{
 				PCIID: "10de:9999",
+				// AvailabilityKnown deliberately false.
 			},
-			want: want{family: FamilyServerOpen, reasonHas: "safest"},
+			want: want{family: FamilyServerOpen, reasonHas: "default"},
+		},
+		{
+			name: "AvailabilityKnown=true + no Available* + non-Blackwell -> ErrNoFamilyAvailable",
+			ev: Evidence{
+				PCIID:             "10de:9999",
+				AvailabilityKnown: true,
+			},
+			want: want{family: FamilyUnknown, err: ErrNoFamilyAvailable, reasonHas: "no NVIDIA driver family available"},
+		},
+		{
+			name: "AvailabilityKnown=true + Blackwell + no open -> ErrNoOpenAvailable",
+			ev: Evidence{
+				PCIID:               "10de:2b85",
+				IsBlackwellConsumer: true,
+				AvailabilityKnown:   true,
+				AvailableServer:     true, // closed available, open not; Blackwell wants open
+			},
+			want: want{family: FamilyUnknown, err: ErrNoOpenAvailable, reasonHas: "Blackwell consumer"},
+		},
+
+		// ---- Soft PreferOpenFamily on a non-Blackwell GPU ----
+		// These are the scenarios the v3 brief specifically asked us
+		// to handle: PreferOpenFamily must NOT fail when only closed
+		// packages are available on a GPU that does not require open.
+
+		{
+			name: "RTX 4090 + prefer_open_family=true + only server available -> server (no error)",
+			ev: Evidence{
+				PCIID:             "10de:2684",
+				GPUName:           "NVIDIA GeForce RTX 4090",
+				PreferOpenFamily:  true,
+				AvailabilityKnown: true,
+				AvailableServer:   true,
+			},
+			want: want{family: FamilyServer, reasonHas: "falling back to server"},
+		},
+		{
+			name: "RTX 4090 + prefer_open_family=true + only non-server available -> non-server (no error)",
+			ev: Evidence{
+				PCIID:              "10de:2684",
+				GPUName:            "NVIDIA GeForce RTX 4090",
+				PreferOpenFamily:   true,
+				AvailabilityKnown:  true,
+				AvailableNonServer: true,
+			},
+			want: want{family: FamilyNonServer, reasonHas: "falling back to non-server"},
+		},
+		{
+			name: "L4 + prefer_open_family=true + only server available -> server (no error; non-Blackwell so open is soft)",
+			ev: Evidence{
+				PCIID:             "10de:27b8",
+				GPUName:           "NVIDIA L4",
+				IsDataCenter:      true,
+				PreferOpenFamily:  true,
+				AvailabilityKnown: true,
+				AvailableServer:   true,
+			},
+			want: want{family: FamilyServer, reasonHas: "falling back to server"},
+		},
+		{
+			name: "RTX 5090 + only server available -> ErrNoOpenAvailable (hard open requirement)",
+			ev: Evidence{
+				PCIID:               "10de:2b85",
+				GPUName:             "NVIDIA GeForce RTX 5090",
+				IsBlackwellConsumer: true,
+				AvailabilityKnown:   true,
+				AvailableServer:     true,
+			},
+			want: want{family: FamilyUnknown, err: ErrNoOpenAvailable, reasonHas: "Blackwell consumer"},
+		},
+		{
+			name: "dmesg open required + only server available -> ErrNoOpenAvailable",
+			ev: Evidence{
+				PCIID:                         "10de:2684",
+				GPUName:                       "NVIDIA GeForce RTX 4090",
+				DmesgRequiresOpenKernelModule: true,
+				AvailabilityKnown:             true,
+				AvailableServer:               true,
+			},
+			want: want{family: FamilyUnknown, err: ErrNoOpenAvailable, reasonHas: "dmesg"},
 		},
 	}
 
@@ -311,30 +405,48 @@ func TestFamilyClassifiers(t *testing.T) {
 }
 
 func TestEvidenceAvailability(t *testing.T) {
-	// No availability info populated -> every family looks available
-	// (selector still has a reasonable answer on hosts where
-	// apt-cache hasn't run).
-	none := Evidence{}
-	if none.HasAvailabilityInfo() {
-		t.Error("empty Evidence should report HasAvailabilityInfo=false")
-	}
-	for _, f := range AllFamilies() {
-		if !none.IsAvailable(f) {
-			t.Errorf("%s should be considered available with no info", f)
+	// AvailabilityKnown=false -> every family looks available
+	// (optimistic mode; doctor against a developer host).
+	t.Run("availability unknown -> optimistic", func(t *testing.T) {
+		none := Evidence{}
+		if none.HasAvailabilityInfo() {
+			t.Error("empty Evidence should report HasAvailabilityInfo=false")
 		}
-	}
+		for _, f := range AllFamilies() {
+			if !none.IsAvailable(f) {
+				t.Errorf("%s should be considered available with AvailabilityKnown=false", f)
+			}
+		}
+	})
 
-	// Partial info -> only the marked families are available.
-	some := Evidence{AvailableServer: true}
-	if !some.HasAvailabilityInfo() {
-		t.Error("Evidence with AvailableServer=true should report HasAvailabilityInfo=true")
-	}
-	if !some.IsAvailable(FamilyServer) {
-		t.Error("FamilyServer should be reported available")
-	}
-	if some.IsAvailable(FamilyServerOpen) {
-		t.Error("FamilyServerOpen should not be reported available")
-	}
+	// AvailabilityKnown=true + nothing flagged -> nothing available.
+	// This is the new trinary state the v3 brief asked for.
+	t.Run("availability known + all-false -> nothing available", func(t *testing.T) {
+		known := Evidence{AvailabilityKnown: true}
+		if !known.HasAvailabilityInfo() {
+			t.Error("Evidence with AvailabilityKnown=true should report HasAvailabilityInfo=true")
+		}
+		for _, f := range AllFamilies() {
+			if known.IsAvailable(f) {
+				t.Errorf("%s must NOT be considered available with AvailabilityKnown=true + all flags false", f)
+			}
+		}
+	})
+
+	// AvailabilityKnown=true + partial info -> only the marked
+	// families are available.
+	t.Run("availability known + partial info", func(t *testing.T) {
+		some := Evidence{AvailabilityKnown: true, AvailableServer: true}
+		if !some.HasAvailabilityInfo() {
+			t.Error("Evidence should report HasAvailabilityInfo=true")
+		}
+		if !some.IsAvailable(FamilyServer) {
+			t.Error("FamilyServer should be reported available")
+		}
+		if some.IsAvailable(FamilyServerOpen) {
+			t.Error("FamilyServerOpen should not be reported available")
+		}
+	})
 }
 
 func TestIsBlackwellConsumerPCIID(t *testing.T) {

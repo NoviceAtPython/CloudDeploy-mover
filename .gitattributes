@@ -28,23 +28,36 @@ Makefile text eol=lf
 
 # ---- GitHub Linguist overrides (v3 presentation) ----
 #
-# The v2 monolith is on disk for fallback and bisect, not as the active
-# codebase. Mark it vendored so it stops dominating the language pie:
+# v3 is a Go orchestrator with a small Bash bootstrap. The v2 monolith
+# stays on disk for fallback and bisect but should NOT count toward
+# language stats. Stack three signals so Linguist actually obeys:
+#
+#   linguist-vendored      - mark as third-party / not part of the
+#                            primary codebase. Excluded from stats.
+#   linguist-generated     - mark as generated. Excluded from stats
+#                            and from diff/blame views.
+#   linguist-detectable=false - prevent Linguist from sniffing the
+#                            file at all (last-resort opt-out).
+#
+# Together these three remove the file from the pie. Linguist will
+# cache the result for a while; pushing this is the explicit signal.
 
-CloudDeploy-wayland.sh              linguist-vendored
-CloudDeploy.ps1                     linguist-vendored
-clouddeploy-run-rootless-systemd.sh linguist-vendored
+CloudDeploy-wayland.sh              linguist-vendored linguist-generated linguist-detectable=false
+CloudDeploy.ps1                     linguist-vendored linguist-generated linguist-detectable=false
+clouddeploy-run-rootless-systemd.sh linguist-vendored linguist-generated linguist-detectable=false
+main.py                             linguist-vendored linguist-detectable=false
+*.ps1                               linguist-vendored linguist-detectable=false
 
 # Anything we eventually move under legacy/ also does not count.
-legacy/**   linguist-vendored
+legacy/**   linguist-vendored linguist-detectable=false
 
 # Existing v2 helper scripts/patches: data, not active code.
-scripts/**  linguist-vendored
-patches/**  linguist-vendored
+scripts/**  linguist-vendored linguist-detectable=false
+patches/**  linguist-vendored linguist-detectable=false
 
 # Future third-party submodule trees (Sunshine fork, KWin source, etc.).
 # Harmless until they exist; prevents future drift in stats.
-third-party/** linguist-vendored
+third-party/** linguist-vendored linguist-detectable=false
 
 # v3 entrypoint: small Bash bootstrap is intentional and should stay visible.
 bootstrap.sh   linguist-language=Shell

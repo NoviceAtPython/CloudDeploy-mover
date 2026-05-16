@@ -97,7 +97,12 @@ ensure_go() {
     tar -C /usr/local -xzf "/tmp/${tarball}"
     rm -f "/tmp/${tarball}"
     install -d -m 0755 /etc/profile.d
-    printf 'export PATH="/usr/local/go/bin:%s"\n' '${PATH}' > /etc/profile.d/clouddeploy-go.sh
+    # Use a quoted heredoc so the ${PATH} reference stays literal in the
+    # generated profile.d snippet (it expands on the *target* shell at
+    # login, not here). Quoted heredoc is shellcheck-clean (SC2016).
+    cat > /etc/profile.d/clouddeploy-go.sh <<'CLOUDDEPLOY_GO_PROFILE'
+export PATH="/usr/local/go/bin:${PATH}"
+CLOUDDEPLOY_GO_PROFILE
     chmod 0644 /etc/profile.d/clouddeploy-go.sh
     export PATH="/usr/local/go/bin:${PATH}"
     log "Installed Go $(/usr/local/go/bin/go version)"
