@@ -135,9 +135,21 @@ build_binary() {
 run_apply() {
     if [[ "${CLOUDDEPLOY_RUN}" != "1" ]]; then
         log "CLOUDDEPLOY_RUN=0; built clouddeployctl but not running apply."
-        log "Next: /usr/local/bin/clouddeployctl apply --profile ${PROFILE}"
+        log "Next: sudo /usr/local/bin/clouddeployctl apply --profile ${PROFILE}"
         return 0
     fi
+    log "============================================================"
+    log "v3 Milestone 3 partial apply"
+    log ""
+    log "This run will install base packages, the NVIDIA driver"
+    log "family, and apply the CUDA mode policy. It will NOT yet"
+    log "build/patch KWin, NOT yet build Sunshine, NOT yet generate"
+    log "systemd units, and NOT yet validate HDR. Those phases land"
+    log "in Milestone 4; for now they remain on the v2 path:"
+    log "    sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh"
+    log ""
+    log "See docs/V3-ROADMAP.md."
+    log "============================================================"
     log "Invoking clouddeployctl apply --profile ${PROFILE}"
     exec /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
 }
