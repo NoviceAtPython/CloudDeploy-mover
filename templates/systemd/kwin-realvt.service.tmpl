@@ -1,0 +1,39 @@
+[Unit]
+# CloudDeploy v3 - rendered by internal/systemd from this template.
+# Milestone-4 placeholder. See v2 install_clouddeploy_systemd_units
+# for the producing logic in CloudDeploy-wayland.sh.
+Description=KWin Wayland on real VT for CloudDeploy (v3 template)
+After=systemd-user-sessions.service multi-user.target
+Wants=systemd-user-sessions.service
+
+[Service]
+User={{.HeadlessUser}}
+Group={{.HeadlessUser}}
+SupplementaryGroups=video render input tty
+WorkingDirectory={{.HomeDir}}
+TTYPath=/dev/tty{{.VTNumber}}
+StandardInput=tty-force
+StandardOutput=tty
+StandardError=tty
+UtmpIdentifier=tty{{.VTNumber}}
+UtmpMode=user
+Environment=HOME={{.HomeDir}}
+Environment=USER={{.HeadlessUser}}
+Environment=LOGNAME={{.HeadlessUser}}
+Environment=XDG_RUNTIME_DIR={{.RuntimeDir}}
+Environment=WAYLAND_DISPLAY={{.WaylandDisplay}}
+Environment=XDG_SESSION_TYPE=wayland
+Environment=XDG_SEAT=seat0
+Environment=XDG_VTNR={{.VTNumber}}
+{{- range .HDRKWinEnv}}
+Environment={{.}}
+{{- end}}
+ExecStartPre=/bin/sh -c 'chvt {{.VTNumber}}; sleep 1'
+ExecStart={{.KWinWrapper}} --drm --no-lockscreen
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

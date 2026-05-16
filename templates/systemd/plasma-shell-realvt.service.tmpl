@@ -1,0 +1,28 @@
+[Unit]
+# CloudDeploy v3 - rendered by internal/systemd from this template.
+# Milestone-4 placeholder.
+Description=Plasma shell on KWin Wayland (v3 template)
+After=kwin-realvt.service
+Requires=kwin-realvt.service
+PartOf=kwin-realvt.service
+
+[Service]
+User={{.HeadlessUser}}
+Group={{.HeadlessUser}}
+SupplementaryGroups=video render input
+WorkingDirectory={{.HomeDir}}
+Environment=HOME={{.HomeDir}}
+Environment=USER={{.HeadlessUser}}
+Environment=LOGNAME={{.HeadlessUser}}
+Environment=XDG_RUNTIME_DIR={{.RuntimeDir}}
+Environment=WAYLAND_DISPLAY={{.WaylandDisplay}}
+Environment=DBUS_SESSION_BUS_ADDRESS=unix:path={{.RuntimeDir}}/bus
+ExecStartPre=/usr/local/bin/clouddeploy-wait-kwin-ready.sh
+ExecStart=/usr/bin/plasmashell
+Restart=on-failure
+RestartSec=3
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
