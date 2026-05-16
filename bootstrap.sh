@@ -151,7 +151,29 @@ run_apply() {
     log "See docs/V3-ROADMAP.md."
     log "============================================================"
     log "Invoking clouddeployctl apply --profile ${PROFILE}"
-    exec /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
+    
+    set +e
+    /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
+    local apply_ec=$?
+    set -e
+    
+    case ${apply_ec} in
+        0)
+            log "Apply completed successfully (all implemented phases done)."
+            ;;
+        2)
+            log "Apply requires a reboot to continue."
+            log "Please reboot and run 'sudo clouddeployctl resume'."
+            exit 2
+            ;;
+        10)
+            log "Partial apply complete. Unimplemented phases skipped."
+            exit 10
+            ;;
+        *)
+            die "Apply failed with exit code ${apply_ec}."
+            ;;
+    esac
 }
 
 main() {
