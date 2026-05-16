@@ -4,20 +4,33 @@
 
 | Branch | Status | What it deploys |
 | --- | --- | --- |
-| [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Currently supported. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
-| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **In development.** | `clouddeployctl` Go orchestrator. See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) + [`docs/MIGRATION.md`](docs/MIGRATION.md). First commit is skeleton + docs + tested modules for NVIDIA / CUDA / apt only. |
+| [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Production. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of v2 commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
+| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **In development — does not deploy yet.** | `clouddeployctl` Go orchestrator. Architecture + tested NVIDIA / CUDA / apt modules + GPU compatibility coverage are in. End-to-end deploy is Milestone 3+. |
 
-Until v3 reaches its Milestone 5, the supported deploy command is
-still the v2 entrypoint:
-
-```bash
-sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
-```
+> **Heads up.** v3 is at Milestone 1.1: architecture, tests, GPU
+> compatibility, and CI scaffolding. The `apply` / `phase` subcommands
+> are stubs that point at the migration plan. The only real v3
+> commands today are `clouddeployctl doctor nvidia` and `doctor cuda`
+> (read-only). For real deploys, keep using v2:
+>
+> ```bash
+> sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
+> ```
+>
+> See [`docs/V3-ROADMAP.md`](docs/V3-ROADMAP.md) for the milestone
+> plan. Milestone 2 lands the apt transaction wrapper, structured
+> `runner` logs, and real `doctor` subcommands. Milestone 3 makes
+> `clouddeployctl apply` actually deploy (with delegation to the v2
+> script for phases not yet ported).
 
 v3 design rationale (single-binary Go orchestrator, no Ansible) is in
 [`docs/ADR-0001-orchestrator-language.md`](docs/ADR-0001-orchestrator-language.md)
 and
 [`docs/ADR-0002-ansible-vs-native-go.md`](docs/ADR-0002-ansible-vs-native-go.md).
+
+GPU compatibility expectations (which families v3 prefers per
+architecture, where AV1/HDR is supported and where it isn't) live in
+[`docs/GPU-COMPATIBILITY.md`](docs/GPU-COMPATIBILITY.md).
 
 ---
 

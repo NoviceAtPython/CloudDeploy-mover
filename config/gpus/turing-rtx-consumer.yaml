@@ -1,0 +1,19 @@
+# Consumer GeForce Turing RTX (RTX 20-series).
+#
+# Same generation as Ampere from the AV1 perspective: NVENC supports
+# H.264 and HEVC, no AV1. v3 doctor surfaces the limitation.
+
+match:
+  name_patterns:
+    - "GeForce RTX 20"
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "Turing RTX supports closed and open kernel modules."
+    - "No NVENC AV1 encoder; HDR streaming is HEVC only or SDR."
+
+streaming:
+  av1_encode: no
+  hdr: limited

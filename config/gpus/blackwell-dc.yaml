@@ -1,0 +1,23 @@
+# Datacenter Blackwell (B100 / B200 / GB200 Grace-Blackwell).
+#
+# Same hard rule as the consumer / pro Blackwell: closed kernel module
+# is unsupported. Server-open preferred. Standard server packages will
+# refuse to load.
+
+match:
+  name_patterns:
+    - "B100"
+    - "B200"
+    - "GB200"
+
+nvidia:
+  prefer_open_family: true
+  prefer_server: true
+  driver_major_min: "580"
+  notes:
+    - "Blackwell data-center requires the open kernel module."
+    - "server-open preferred; non-server-open as fallback."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

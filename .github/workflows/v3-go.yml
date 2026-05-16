@@ -1,0 +1,96 @@
+name: v3-go
+
+# CI for the v3 Go orchestrator. Only runs on the v3 branch (push) and
+# on pull requests targeting v3. The v2 branch is intentionally not
+# covered here - v2 has no Go code and runs on real hardware, not CI.
+
+on:
+  push:
+    branches: [v3]
+  pull_request:
+    branches: [v3]
+
+# Cancel an in-flight run if a new commit lands on the same ref.
+concurrency:
+  group: v3-go-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go build + test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+
+    strategy:
+      matrix:
+        go-version: ['1.22.x']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go ${{ matrix.go-version }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+
+      - name: Download modules
+        run: go mod download
+
+      - name: Verify go.sum is up to date
+        run: |
+          # go mod tidy -diff would be ideal but is Go 1.23+. Use the
+          # "do tidy; bail if files changed" pattern instead. If this
+          # step fails, run `go mod tidy` locally and commit go.mod /
+          # go.sum.
+          go mod tidy
+          if ! git diff --exit-code -- go.mod go.sum; then
+            echo "::error::go.mod or go.sum is stale. Run 'go mod tidy' and commit."
+            exit 1
+          fi
+
+      - name: gofmt check
+        run: |
+          unformatted="$(gofmt -s -l . 2>/dev/null | grep -v '^vendor/' || true)"
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt would reformat the following files:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test -race -count=1 -v ./...
+
+      - name: go build
+        run: |
+          mkdir -p bin
+          go build -o bin/clouddeployctl ./cmd/clouddeployctl
+          ./bin/clouddeployctl --help
+
+  shell:
+    name: Shell lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: bash -n bootstrap.sh
+        run: bash -n bootstrap.sh
+
+      - name: shellcheck bootstrap.sh
+        # bootstrap.sh is the only v3 Bash. The v2 monolith is vendored.
+        run: shellcheck bootstrap.sh

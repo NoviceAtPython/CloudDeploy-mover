@@ -1,0 +1,24 @@
+# L40 / L40S datacenter Ada.
+#
+# Same architecture family as the L4 but higher TDP / VRAM. Server
+# family preferred; server-open accepted if installed and working.
+
+match:
+  pci_ids:
+    - "10de:26b5"  # L40
+    - "10de:26b9"  # L40S
+  name_patterns:
+    - "L40S"
+    - "L40"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "L40 / L40S: data-center Ada."
+    - "server preferred. server-open accepted if working."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

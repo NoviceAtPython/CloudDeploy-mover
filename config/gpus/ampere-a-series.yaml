@@ -1,0 +1,24 @@
+# Workstation Ampere (RTX A-series: A4000 / A5000 / A6000, etc.).
+#
+# Pre-AV1 generation: NVENC supports H.264 / HEVC only. HDR streaming
+# possible via HEVC Main10. v3 doctor surfaces the AV1 limitation.
+
+match:
+  name_patterns:
+    - "RTX A6000"
+    - "RTX A5500"
+    - "RTX A5000"
+    - "RTX A4500"
+    - "RTX A4000"
+    - "RTX A2000"
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "RTX A-series supports closed and open kernel modules."
+    - "No NVENC AV1 encoder; HDR streaming is HEVC only."
+
+streaming:
+  av1_encode: no
+  hdr: limited

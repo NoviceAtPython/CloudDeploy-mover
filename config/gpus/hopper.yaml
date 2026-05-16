@@ -1,0 +1,25 @@
+# Datacenter Hopper (H100 / H200).
+#
+# Closed module is the canonical NVIDIA path. Open module is also
+# supported and tends to be the better choice on newer Ubuntu builds.
+
+match:
+  pci_ids:
+    - "10de:2330"  # H100 80GB SXM5
+    - "10de:2331"  # H100 80GB PCIe
+    - "10de:2335"  # H200
+  name_patterns:
+    - "H100"
+    - "H200"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "Hopper data-center: server preferred."
+    - "server-open is also supported; selector keeps it if installed."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

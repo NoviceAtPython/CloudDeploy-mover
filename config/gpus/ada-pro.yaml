@@ -1,0 +1,25 @@
+# Workstation Professional Ada (RTX 6000 Ada Generation, RTX 5000 Ada,
+# RTX 4500 Ada, RTX 4000 Ada, etc.).
+#
+# Works on closed or open kernel module. Either family is fine.
+
+match:
+  name_patterns:
+    - "RTX 6000 Ada"
+    - "RTX 5000 Ada"
+    - "RTX 4500 Ada"
+    - "RTX 4000 Ada"
+    - "RTX 2000 Ada"
+    - "Ada Generation"   # broad fallback
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "Ada professional cards: closed module is the canonical NVIDIA"
+    - "recommendation; open module also works."
+    - "If an open driver is installed and working, keep it."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

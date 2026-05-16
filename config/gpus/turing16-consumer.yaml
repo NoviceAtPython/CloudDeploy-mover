@@ -1,0 +1,22 @@
+# Consumer GeForce Turing non-RTX (GTX 16-series).
+#
+# Encode caveats: GTX 1650 (TU117) has no NVENC at all on Turing
+# launch silicon; later TU116 / TU117-based 1650 Super and 1660 do
+# have NVENC. Treat 16-series as "supported with caution" and surface
+# the warning in doctor.
+
+match:
+  name_patterns:
+    - "GeForce GTX 16"
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "Some Turing 16-series SKUs ship without NVENC at all."
+    - "v3 doctor must check NVENC presence before attempting an"
+    - "HDR-streaming profile on a 16-series host."
+
+streaming:
+  av1_encode: no
+  hdr: no

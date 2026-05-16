@@ -1,0 +1,25 @@
+# Datacenter A100 (Ampere flagship).
+#
+# Compute-oriented data-center card. NVENC is present on A100 but its
+# encoder block is limited; AV1 is not supported. HDR streaming is
+# possible via HEVC Main10 if the deploy chooses to support that.
+# Server family preferred.
+
+match:
+  pci_ids:
+    - "10de:20b5"  # A100 80GB PCIe
+    - "10de:20f1"  # A100 40GB SXM4
+  name_patterns:
+    - "A100"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "A100 is the Ampere data-center flagship; closed module fine."
+    - "No NVENC AV1 encoder; HDR via HEVC Main10 only."
+
+streaming:
+  av1_encode: no
+  hdr: limited
