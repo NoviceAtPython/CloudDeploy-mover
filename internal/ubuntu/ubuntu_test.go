@@ -57,7 +57,7 @@ func TestGate_SupportedVersions(t *testing.T) {
 	}
 	for _, c := range cases {
 		r := Release{ID: "ubuntu", VersionID: c.version}
-		g := Gate(r)
+		g := Gate(r, "")
 		if g.Supported != c.want {
 			t.Errorf("version %q: Supported got %v want %v (reason=%q)", c.version, g.Supported, c.want, g.Reason)
 		}
@@ -66,7 +66,7 @@ func TestGate_SupportedVersions(t *testing.T) {
 
 func TestGate_NonUbuntu(t *testing.T) {
 	r := Release{ID: "fedora", VersionID: "40"}
-	g := Gate(r)
+	g := Gate(r, "")
 	if g.Supported {
 		t.Errorf("Fedora should not be supported")
 	}

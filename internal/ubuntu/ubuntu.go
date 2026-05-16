@@ -125,8 +125,8 @@ type GateResult struct {
 }
 
 // Gate is the verdict the doctor + apply consult. Pure function of
-// Release; tests pass synthetic Release records.
-func Gate(r Release) GateResult {
+// Release; tests pass synthetic Release records. targetVersion is optional.
+func Gate(r Release, targetVersion string) GateResult {
 	out := GateResult{Release: r}
 	if !r.IsUbuntu() {
 		out.Reason = fmt.Sprintf("not Ubuntu (ID=%q, ID_LIKE=%q); v3 is Ubuntu-only", r.ID, r.IDLike)
@@ -136,6 +136,17 @@ func Gate(r Release) GateResult {
 		out.Reason = "Ubuntu reported no VERSION_ID; cannot gate"
 		return out
 	}
+
+	if targetVersion != "" {
+		if r.VersionID == targetVersion {
+			out.Supported = true
+			out.Reason = fmt.Sprintf("matches profile target Ubuntu %s", targetVersion)
+			return out
+		}
+		out.Reason = fmt.Sprintf("found Ubuntu %s but profile requires Ubuntu %s; use --allow-unsupported to override", r.VersionID, targetVersion)
+		return out
+	}
+
 	if note, ok := supportedVersions[r.VersionID]; ok {
 		out.Supported = true
 		out.Reason = note
@@ -146,10 +157,10 @@ func Gate(r Release) GateResult {
 }
 
 // ReadAndGate is the convenience the CLI uses.
-func ReadAndGate(path string) (GateResult, error) {
+func ReadAndGate(path string, targetVersion string) (GateResult, error) {
 	r, err := Read(path)
 	if err != nil {
 		return GateResult{}, err
 	}
-	return Gate(r), nil
+	return Gate(r, targetVersion), nil
 }
