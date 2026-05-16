@@ -1,5 +1,0 @@
-[33m6db3020[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mv3[m[33m)[m v3 Milestone 2 + Milestone 3 partial: real runner / apt tx / phases
-[33m641445e[m v3 CI: gofmt -s -w across 6 files (no logic changes)
-[33m4dd4cab[m v3 Milestone 1.1 cleanup: fix CI, soften PreferOpenFamily, driver-major scoping
-[33m94fa4e1[m v3 Milestone 1.1: CI, language stats, broad NVIDIA compatibility
-[33m2fd6879[m v3 Milestone 1: architecture, skeleton, tested NVIDIA/CUDA/apt modules
