@@ -142,16 +142,39 @@ run_apply() {
     log "v3 Milestone 3 partial apply"
     log ""
     log "This run will install base packages, the NVIDIA driver"
-    log "family, and apply the CUDA mode policy. It will NOT yet"
-    log "build/patch KWin, NOT yet build Sunshine, NOT yet generate"
-    log "systemd units, and NOT yet validate HDR. Those phases land"
-    log "in Milestone 4; for now they remain on the v2 path:"
+    log "family, and apply the CUDA mode policy. It may also generate"
+    log "EDID/GRUB config if requested by display.forced_connector."
+    log "It will NOT yet build/patch KWin, NOT yet build Sunshine,"
+    log "NOT yet generate KWin/Plasma/Sunshine systemd units, and NOT yet validate HDR."
+    log "Those phases land in Milestone 4; for now they remain on v2:"
     log "    sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh"
     log ""
     log "See docs/V3-ROADMAP.md."
     log "============================================================"
     log "Invoking clouddeployctl apply --profile ${PROFILE}"
-    exec /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
+    
+    set +e
+    /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
+    local apply_ec=$?
+    set -e
+    
+    case ${apply_ec} in
+        0)
+            log "Apply completed successfully (all implemented phases done)."
+            ;;
+        2)
+            log "Apply requires a reboot to continue."
+            log "Please reboot and run 'sudo clouddeployctl resume'."
+            exit 2
+            ;;
+        10)
+            log "Partial apply complete. Unimplemented phases skipped."
+            exit 10
+            ;;
+        *)
+            die "Apply failed with exit code ${apply_ec}."
+            ;;
+    esac
 }
 
 main() {
