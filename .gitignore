@@ -24,3 +24,8 @@ coverage.out
 # CloudDeploy local state (never committed)
 /var-lib-clouddeploy/
 state.json
+
+# Local build outputs
+/clouddeployctl
+/clouddeployctl.exe
+/bin/
