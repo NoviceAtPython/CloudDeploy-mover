@@ -1,16 +1,134 @@
-// Package edid generates and installs forced-mode EDID binaries for
-// CloudDeploy's headless / forced-connector path.
+// Package edid owns the forced-EDID + GRUB cmdline part of the
+// deploy. For v3.0 we keep the existing v2 EDID-generation script
+// (helpers/write-edids.py / scripts/write-edids.py) and just wrap it
+// in a typed Go interface so the EDID phase can call it and so tests
+// can exercise the GRUB cmdline planner without touching disk.
 //
-// Milestone-4 scope: invoke helpers/write-edids.py, write to
-// /lib/firmware/edid/, wire into /etc/default/grub via
-// drm.edid_firmware=...
-//
-// A v3.1+ candidate is to port helpers/write-edids.py to Rust using
-// edid-rs (see docs/ARCHITECTURE.md). Not now.
-//
-// Stub for Milestone 1.
+// What this package does NOT do:
+//   - It does not parse EDID binaries (drm_info / scripts/validate-
+//     hdr-drm-state.py already do that).
+//   - It does not invoke update-grub / update-initramfs directly.
+//     The EDID phase invokes them via the runner; this package just
+//     produces the data those tools need.
 package edid
 
-// Write generates the requested EDID + drops it under /lib/firmware/edid/.
-// NOT YET IMPLEMENTED.
-func Write() error { return nil }
+import (
+	"fmt"
+	"sort"
+	"strings"
+)
+
+// Profile names map to EDID filenames under /lib/firmware/edid/.
+// These names match what scripts/write-edids.py writes.
+var profileToFilename = map[string]string{
+	"virtual-1080p-sdr": "virtual-1080p-sdr.bin",
+	"virtual-4k60-sdr":  "virtual-4k60-sdr.bin",
+	"virtual-4k120-sdr": "virtual-4k120-sdr.bin",
+	"virtual-4k120-hdr": "virtual-4k120-hdr.bin",
+}
+
+// FilenameFor returns the EDID filename a given profile uses.
+// Returns "" if the profile name isn't recognised.
+func FilenameFor(profile string) string {
+	return profileToFilename[profile]
+}
+
+// SelectFilename picks the EDID filename appropriate for the deploy
+// profile's display config. Returns "" when the display config does
+// not demand a forced EDID (no forced_connector / SDR profile etc.).
+//
+// Rules:
+//   - HDR profile + 3840x2160 + 120hz -> virtual-4k120-hdr.bin
+//   - HDR profile + 3840x2160 + 60hz  -> virtual-4k120-hdr.bin (we
+//     don't ship a 4k60-hdr SKU; 4k120 EDID supports 4k60 too)
+//   - SDR + 3840x2160 + 120hz         -> virtual-4k120-sdr.bin
+//   - SDR + 3840x2160 + 60hz          -> virtual-4k60-sdr.bin
+//   - SDR + 1920x1080                 -> virtual-1080p-sdr.bin
+//   - anything else                   -> "" (no forced EDID)
+func SelectFilename(resolution string, refresh int, hdr bool) string {
+	res := strings.ToLower(strings.TrimSpace(resolution))
+	switch res {
+	case "3840x2160":
+		if hdr {
+			return "virtual-4k120-hdr.bin"
+		}
+		if refresh >= 120 {
+			return "virtual-4k120-sdr.bin"
+		}
+		return "virtual-4k60-sdr.bin"
+	case "1920x1080":
+		return "virtual-1080p-sdr.bin"
+	}
+	return ""
+}
+
+// GrubArgs are the kernel cmdline tokens the deploy adds to
+// GRUB_CMDLINE_LINUX_DEFAULT. The order is stable for diffing.
+type GrubArgs struct {
+	EDIDFirmware    string   // drm.edid_firmware=DP-1:edid/virtual-4k120-hdr.bin
+	VideoEnable     string   // video=DP-1:e
+	VideoDisableAll []string // video=DP-2:d, video=DP-3:d, etc.
+	NvidiaModeset   string   // nvidia-drm.modeset=1
+	NvidiaFbdev     string   // nvidia-drm.fbdev=1
+}
+
+// PlanGrubArgs assembles the cmdline tokens for the given connector
+// + EDID filename. `disableConnectors` is the list of other connectors
+// to disable (e.g. all DP-N where N != the forced connector).
+//
+// Pure function; takes no I/O. Tests exercise it directly.
+func PlanGrubArgs(connector, edidFile string, disableConnectors []string) GrubArgs {
+	out := GrubArgs{
+		EDIDFirmware:  fmt.Sprintf("drm.edid_firmware=%s:edid/%s", connector, edidFile),
+		VideoEnable:   fmt.Sprintf("video=%s:e", connector),
+		NvidiaModeset: "nvidia-drm.modeset=1",
+		NvidiaFbdev:   "nvidia-drm.fbdev=1",
+	}
+	// Sort for stable output.
+	d := append([]string(nil), disableConnectors...)
+	sort.Strings(d)
+	for _, c := range d {
+		if c == connector || c == "" {
+			continue
+		}
+		out.VideoDisableAll = append(out.VideoDisableAll, fmt.Sprintf("video=%s:d", c))
+	}
+	return out
+}
+
+// Tokens returns the cmdline tokens in a deterministic order.
+func (a GrubArgs) Tokens() []string {
+	out := []string{a.EDIDFirmware, a.VideoEnable}
+	out = append(out, a.VideoDisableAll...)
+	out = append(out, a.NvidiaModeset, a.NvidiaFbdev)
+	return out
+}
+
+// CmdlineFragment returns the tokens joined with a single space.
+// Suitable for embedding inside `GRUB_CMDLINE_LINUX_DEFAULT="..."`.
+func (a GrubArgs) CmdlineFragment() string {
+	return strings.Join(a.Tokens(), " ")
+}
+
+// GrubDropIn renders the /etc/default/grub.d/<name>.cfg content.
+// Stable across runs (no timestamps, no random IDs) so re-running
+// the EDID phase is idempotent.
+func GrubDropIn(a GrubArgs) string {
+	return fmt.Sprintf(`# Generated by CloudDeploy v3 EDID phase.
+# Adds forced-EDID + NVIDIA-DRM modeset kernel cmdline tokens. Do not
+# edit by hand; re-run `+"`clouddeployctl phase edid`"+` to regenerate.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT %s"
+`, a.CmdlineFragment())
+}
+
+// CmdlinePresent returns true iff every token in a appears in the
+// supplied /proc/cmdline-style text. Used by doctor and the EDID
+// phase to decide whether a reboot is still needed.
+func CmdlinePresent(cmdline string, a GrubArgs) bool {
+	for _, tok := range a.Tokens() {
+		if !strings.Contains(cmdline, tok) {
+			return false
+		}
+	}
+	return true
+}

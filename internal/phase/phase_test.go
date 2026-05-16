@@ -145,22 +145,33 @@ func TestBasePackages_SkipsWhenDone(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 func TestNvidiaDriver_RTX5090_ChoosesServerOpen(t *testing.T) {
+	// Pre-install evidence has no installed family. Post-install
+	// evidence has the target installed but nvidia-smi still failing
+	// (the dkms module isn't loaded into the running kernel yet).
+	// We model this by injecting an Evidence that already lists the
+	// target as installed - the phase's pre-install selector still
+	// hits the "install needed" branch because nvidia-smi is broken.
 	ev := nvidia.Evidence{
 		PCIID:               "10de:2b85",
 		GPUName:             "NVIDIA GeForce RTX 5090",
 		IsBlackwellConsumer: true,
+		// Treat the package as already on dpkg (typical of a
+		// re-run where the install happened but the module is not
+		// loaded). nvidia-smi still fails -> RebootRequired.
+		InstalledServerOpen: true,
+		NvidiaSmiWorks:      false,
 		AvailabilityKnown:   true,
 		AvailableServerOpen: true,
-		// closed module DKMS also "installable" in apt; the
-		// selector must NOT pick it.
-		AvailableServer: true,
+		AvailableServer:     true,
 	}
 	deps := newDeps(t, hdrProfile(), nil)
-	phase := NvidiaDriver{EvidenceFn: nvidiaEvidenceFn(ev)}
+	phase := NvidiaDriver{
+		EvidenceFn: nvidiaEvidenceFn(ev),
+		// Empty dmesg = no wrong-flavor signal; the post-install
+		// verdict will be RebootRequired.
+		DmesgFn: func(context.Context, *Deps) string { return "" },
+	}
 	err := phase.Run(context.Background(), deps)
-	// nvidia-smi will not work in DryRun apt; the phase therefore
-	// sets RebootNeeded and returns ErrRebootRequired. That's the
-	// correct outcome for the live VM path too.
 	if !errors.Is(err, ErrRebootRequired) {
 		t.Fatalf("expected ErrRebootRequired, got: %v", err)
 	}

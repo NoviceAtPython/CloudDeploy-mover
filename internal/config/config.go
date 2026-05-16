@@ -35,6 +35,17 @@ type Profile struct {
 	CUDA          CUDAConfig     `yaml:"cuda"`
 	Sunshine      SunshineConfig `yaml:"sunshine"`
 	KWin          KWinConfig     `yaml:"kwin"`
+	Deploy        DeployConfig   `yaml:"deploy"`
+}
+
+// DeployConfig is operator-knob territory: how the deploy itself
+// behaves, independent of the streaming target.
+type DeployConfig struct {
+	// AutoReboot, when true, lets clouddeployctl apply call
+	// `systemctl reboot` automatically after installing the
+	// continuation service. Off by default - the operator opts in
+	// because rebooting a cloud VM is a destructive action.
+	AutoReboot bool `yaml:"auto_reboot"`
 }
 
 // DisplayConfig is the target output mode + HDR flag.
@@ -54,7 +65,8 @@ type NVIDIAConfig struct {
 
 // CUDAConfig governs CUDA installation policy.
 type CUDAConfig struct {
-	Mode string `yaml:"mode"` // "none" | "optional" | "required"
+	Mode        string `yaml:"mode"`         // "none" | "optional" | "required"
+	PackageName string `yaml:"package_name"` // explicit apt package; empty = auto-discover
 }
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
