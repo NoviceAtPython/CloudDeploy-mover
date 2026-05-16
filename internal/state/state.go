@@ -64,20 +64,23 @@ func (s PhaseStatus) IsTerminal() bool {
 // Details (free-form map so we don't have to bump CurrentVersion every
 // time a phase adds a field).
 type Phase struct {
-	Status      PhaseStatus            `json:"status"`
-	StartedAt   *time.Time             `json:"started_at,omitempty"`
-	CompletedAt *time.Time             `json:"completed_at,omitempty"`
-	Reason      string                 `json:"reason,omitempty"`
-	Details     map[string]interface{} `json:"details,omitempty"`
+	Status      PhaseStatus    `json:"status"`
+	StartedAt   *time.Time     `json:"started_at,omitempty"`
+	CompletedAt *time.Time     `json:"completed_at,omitempty"`
+	Reason      string         `json:"reason,omitempty"`
+	LastError   string         `json:"last_error,omitempty"`
+	Details     map[string]any `json:"details,omitempty"`
 }
 
 // State is the on-disk schema.
 type State struct {
-	Version    int               `json:"version"`
-	Profile    string            `json:"profile,omitempty"`
-	StartedAt  *time.Time        `json:"started_at,omitempty"`
-	FinishedAt *time.Time        `json:"finished_at,omitempty"`
-	Phases     map[string]*Phase `json:"phases"`
+	Version      int               `json:"version"`
+	Profile      string            `json:"profile,omitempty"`
+	StartedAt    *time.Time        `json:"started_at,omitempty"`
+	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
+	Phases       map[string]*Phase `json:"phases"`
+	RebootNeeded bool              `json:"reboot_needed,omitempty"`
+	ResumeTarget string            `json:"resume_target,omitempty"`
 }
 
 // New returns an empty state for a fresh deploy.
@@ -209,12 +212,13 @@ func (s *State) MarkRunning(name string) *Phase {
 
 // MarkDone marks a phase complete with the supplied details map. A nil
 // map is allowed.
-func (s *State) MarkDone(name string, details map[string]interface{}) *Phase {
+func (s *State) MarkDone(name string, details map[string]any) *Phase {
 	now := time.Now().UTC()
 	p := s.Get(name)
 	p.Status = StatusDone
 	p.CompletedAt = &now
 	p.Reason = ""
+	p.LastError = ""
 	p.Details = details
 	return p
 }
@@ -231,8 +235,9 @@ func (s *State) MarkSkipped(name, reason string) *Phase {
 }
 
 // MarkFailed marks a phase failed. fatal=true is the deploy-killing
-// case; fatal=false lets the next phase run.
-func (s *State) MarkFailed(name, reason string, fatal bool) *Phase {
+// case; fatal=false lets the next phase run. The error message is
+// surfaced in LastError so `state show` and `doctor` can print it.
+func (s *State) MarkFailed(name, reason string, err error, fatal bool) *Phase {
 	now := time.Now().UTC()
 	p := s.Get(name)
 	if fatal {
@@ -242,7 +247,34 @@ func (s *State) MarkFailed(name, reason string, fatal bool) *Phase {
 	}
 	p.CompletedAt = &now
 	p.Reason = reason
+	if err != nil {
+		p.LastError = err.Error()
+	}
 	return p
+}
+
+// Reset clears a single phase's status back to pending. Used by
+// `clouddeployctl state reset --phase <name>` to opt the operator
+// into a re-run after a manual intervention.
+func (s *State) Reset(name string) bool {
+	if _, ok := s.Phases[name]; !ok {
+		return false
+	}
+	delete(s.Phases, name)
+	return true
+}
+
+// SetRebootNeeded toggles the reboot marker.
+func (s *State) SetRebootNeeded(needed bool, target string) {
+	s.RebootNeeded = needed
+	s.ResumeTarget = target
+}
+
+// ClearRebootNeeded is the post-reboot side: resume calls this after
+// it actually starts running again.
+func (s *State) ClearRebootNeeded() {
+	s.RebootNeeded = false
+	s.ResumeTarget = ""
 }
 
 // MarkPendingMoonlightConnect is the "wait for client" sentinel. The

@@ -5,23 +5,28 @@
 | Branch | Status | What it deploys |
 | --- | --- | --- |
 | [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Production. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of v2 commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
-| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **In development — does not deploy yet.** | `clouddeployctl` Go orchestrator. Architecture + tested NVIDIA / CUDA / apt modules + GPU compatibility coverage are in. End-to-end deploy is Milestone 3+. |
+| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **Milestone 3 partial — Ubuntu-only.** | `clouddeployctl` Go orchestrator. Real `doctor apt / nvidia / cuda / system` + real `phase base-packages / nvidia-driver / cuda` + `apply` / `resume`. KWin / Sunshine / EDID / systemd / HDR validation are NOT yet implemented; `apply` exits after the three implemented phases with a clear partial-apply banner. |
 
-> **Heads up.** v3 is at Milestone 1.1: architecture, tests, GPU
-> compatibility, and CI scaffolding. The `apply` / `phase` subcommands
-> are stubs that point at the migration plan. The only real v3
-> commands today are `clouddeployctl doctor nvidia` and `doctor cuda`
-> (read-only). For real deploys, keep using v2:
+> **`clouddeployctl apply` is NOT a full deploy yet.** Milestone 3
+> partial covers base-packages, NVIDIA driver family selection +
+> install, CUDA mode policy, and reboot/resume. It does **not** build
+> patched KWin, build Sunshine, generate systemd units, generate EDID,
+> or run HDR validation. The `apply` command prints a banner saying so
+> when it finishes.
+>
+> For a full deploy that reaches Moonlight `AV1 10-bit HDR`, keep
+> using v2:
 >
 > ```bash
 > sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 > ```
 >
-> See [`docs/V3-ROADMAP.md`](docs/V3-ROADMAP.md) for the milestone
-> plan. Milestone 2 lands the apt transaction wrapper, structured
-> `runner` logs, and real `doctor` subcommands. Milestone 3 makes
-> `clouddeployctl apply` actually deploy (with delegation to the v2
-> script for phases not yet ported).
+> v3 is **Ubuntu-only**; see
+> [`docs/UBUNTU-ONLY.md`](docs/UBUNTU-ONLY.md).
+> Milestone 4 ports the remaining phases. See
+> [`docs/V3-ROADMAP.md`](docs/V3-ROADMAP.md) and the deployment-
+> readiness audit at
+> [`docs/V3-DEPLOYMENT-READINESS.md`](docs/V3-DEPLOYMENT-READINESS.md).
 
 v3 design rationale (single-binary Go orchestrator, no Ansible) is in
 [`docs/ADR-0001-orchestrator-language.md`](docs/ADR-0001-orchestrator-language.md)

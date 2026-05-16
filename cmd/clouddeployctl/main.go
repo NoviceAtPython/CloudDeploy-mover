@@ -1,39 +1,42 @@
 // Command clouddeployctl is the v3 CloudDeploy orchestrator entry point.
 //
-// CloudDeploy turns a freshly-provisioned Ubuntu VM into a Sunshine
-// streaming host with KMS capture, AV1 NVENC, and (optionally) the
-// patched-KWin NVIDIA private HDR path documented in
-// docs/HDR-NVIDIA-PRIVATE.md.
+// State at Milestone 3 partial: doctor (apt/nvidia/cuda/system) is
+// real and read-only; apply / resume / phase base-packages /
+// nvidia-driver / cuda are real but limited (KWin / Sunshine / EDID /
+// systemd / HDR validation are NOT yet implemented; apply exits
+// after the three implemented phases with a clear partial-apply
+// banner).
 //
-// This binary is the v3 replacement for the v2
-// CloudDeploy-wayland.sh monolith. See docs/ARCHITECTURE.md for the
-// design rationale and docs/MIGRATION.md for the v2 -> v3 plan.
-//
-// First-pass scope: this binary exposes the full subcommand surface
-// from the v3 brief but most subcommands are stubs that explain what
-// they will do in subsequent milestones. The three modules with real
-// logic in this commit are internal/nvidia, internal/cuda, and
-// internal/apt (each with their own unit tests).
+// See docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
+// docs/V3-ROADMAP.md for milestone-by-milestone status.
 package main
 
 import (
+	"context"
+	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 
 	"github.com/spf13/cobra"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/nvidia"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/phase"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
 // Version is overridden via -ldflags '-X main.Version=...'.
 var Version = "v3.0.0-dev"
 
+// defaultConfigDir is where bootstrap.sh deploys the repo.
+const defaultConfigDir = "/opt/clouddeploy-mover/config"
+
 func main() {
 	if err := newRoot().Execute(); err != nil {
-		// Cobra prints its own errors. Exit with non-zero so callers
-		// (bootstrap.sh, CI, systemd) can detect failure.
 		os.Exit(1)
 	}
 }
@@ -41,18 +44,16 @@ func main() {
 func newRoot() *cobra.Command {
 	root := &cobra.Command{
 		Use:           "clouddeployctl",
-		Short:         "CloudDeploy v3 orchestrator",
+		Short:         "CloudDeploy v3 orchestrator (Ubuntu-only)",
 		Long:          longDescription,
 		Version:       Version,
 		SilenceUsage:  true,
 		SilenceErrors: false,
 	}
-
-	// Persistent flags live on the root command.
 	root.PersistentFlags().String("profile", "hdr-4k120", "deploy profile from config/profiles/<name>.yaml")
 	root.PersistentFlags().String("state-path", state.DefaultPath, "path to the CloudDeploy state file")
 	root.PersistentFlags().String("config-dir", defaultConfigDir, "path to the config/ directory")
-	root.PersistentFlags().Bool("dry-run", false, "do not make destructive changes; show what would happen")
+	root.PersistentFlags().Bool("dry-run", false, "do not make destructive changes; print what would happen")
 	root.PersistentFlags().Bool("verbose", false, "verbose logging")
 
 	root.AddCommand(newApplyCmd())
@@ -65,57 +66,187 @@ func newRoot() *cobra.Command {
 	return root
 }
 
-// defaultConfigDir is the install-time default. bootstrap.sh deploys
-// the repo under /opt/clouddeploy-mover, so config/ lives at
-// /opt/clouddeploy-mover/config. Developers running `go run` from the
-// repo root get the current directory.
-const defaultConfigDir = "/opt/clouddeploy-mover/config"
-
 const longDescription = `clouddeployctl is the v3 CloudDeploy orchestrator.
 
-It owns: NVIDIA driver package-family selection, CUDA policy, apt
-transaction wrapping, KWin patch pinning, Sunshine fork build, EDID /
-GRUB / systemd unit management, and HDR streaming validation.
+Ubuntu-only. See docs/UBUNTU-ONLY.md.
 
 State is persisted in /var/lib/clouddeploy/state.json. Logs go under
-/var/log/clouddeploy/. See docs/ARCHITECTURE.md for the design and
-docs/MIGRATION.md for the migration from the v2 Bash script.
+/var/log/clouddeploy/. See docs/ARCHITECTURE.md for the design,
+docs/V3-ROADMAP.md for milestone status, and
+docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
-In this milestone (1), apply / resume / phase are stubs. doctor
-nvidia and doctor cuda use real selectors from internal/nvidia and
-internal/cuda. State, config, and apt transaction wrappers are
-implemented and unit-tested.
+Milestone 3 partial:
+  doctor apt | nvidia | cuda | system                read-only checks
+  phase base-packages | nvidia-driver | cuda          implemented
+  apply                                                runs the three
+                                                       phases above
+                                                       then exits with
+                                                       a partial-apply
+                                                       banner
+  resume                                               continues after
+                                                       a reboot
+  phase kwin-patch | sunshine-build | services         NOT implemented;
+                                                       use the v2
+                                                       CloudDeploy-
+                                                       wayland.sh entry
+                                                       for now.`
 
-The v2 entrypoint, CloudDeploy-wayland.sh at the repo root, is
-unaffected by this binary and remains the validated deploy path
-until v3 reaches Milestone 5.`
+// -----------------------------------------------------------------------------
+// helpers shared across commands
+// -----------------------------------------------------------------------------
+
+// loadDeps builds the shared phase Deps from CLI flags. profileRequired
+// = true means we must have a parseable profile; false = best-effort
+// (used by doctor commands that should still print something when no
+// profile is configured).
+func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Lock, error) {
+	profileName, _ := cmd.Flags().GetString("profile")
+	statePath, _ := cmd.Flags().GetString("state-path")
+	configDir, _ := cmd.Flags().GetString("config-dir")
+	dryRun, _ := cmd.Flags().GetBool("dry-run")
+	verbose, _ := cmd.Flags().GetBool("verbose")
+
+	level := slog.LevelInfo
+	if verbose {
+		level = slog.LevelDebug
+	}
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	var profile *config.Profile
+	if configDir != "" && profileName != "" {
+		p, err := config.LoadProfile(configDir, profileName)
+		if err != nil {
+			if profileRequired {
+				return nil, nil, fmt.Errorf("load profile %q from %s: %w", profileName, configDir, err)
+			}
+			logger.Warn("could not load profile (continuing)",
+				"profile", profileName, "config_dir", configDir, "err", err)
+		} else {
+			if err := config.ValidateProfile(p); err != nil {
+				if profileRequired {
+					return nil, nil, fmt.Errorf("invalid profile %q: %w", profileName, err)
+				}
+				logger.Warn("profile validation failed (continuing)",
+					"profile", profileName, "err", err)
+			}
+			profile = p
+		}
+	}
+
+	st, err := state.Load(statePath)
+	if err != nil {
+		if !os.IsNotExist(err) && profileRequired {
+			return nil, nil, fmt.Errorf("load state %s: %w", statePath, err)
+		}
+		// Fresh state.
+		profileNameForState := profileName
+		if profile != nil {
+			profileNameForState = profile.Profile
+		}
+		st = state.New(profileNameForState)
+	}
+
+	// Acquire the process lock if this is a mutating command. Doctor
+	// / state-show callers can skip it; we surface a lock holder in
+	// the error returned from this helper.
+	var lock *state.Lock
+	if profileRequired {
+		l, err := state.Acquire("")
+		if err != nil {
+			return nil, nil, fmt.Errorf("acquire process lock: %w", err)
+		}
+		lock = l
+	}
+
+	r := runner.New()
+	r.PrintToStdout = false
+
+	tx := &apt.Transaction{
+		Env:       &apt.Env{FS: apt.RealFS{}},
+		Runner:    r,
+		AssumeYes: true,
+		DryRun:    dryRun,
+	}
+
+	deps := &phase.Deps{
+		Runner:    r,
+		APT:       tx,
+		State:     st,
+		Profile:   profile,
+		Logger:    logger,
+		DryRun:    dryRun,
+		StatePath: statePath,
+	}
+	return deps, lock, nil
+}
 
 // -----------------------------------------------------------------------------
 // apply
 // -----------------------------------------------------------------------------
 
+const partialApplyBanner = `
+================================================================================
+  Milestone 3 partial apply complete.
+
+  Implemented:   base-packages, nvidia-driver, cuda
+  NOT yet:       kwin-patch, sunshine-build, services,
+                 EDID/GRUB, HDR DRM validation, HDR stream validation
+
+  For a full deploy that reaches "AV1 10-bit HDR" in Moonlight today,
+  use the v2 entrypoint:
+
+      sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
+
+  v3 will own the remaining phases in Milestone 4. See docs/V3-ROADMAP.md.
+================================================================================
+`
+
 func newApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
-		Short: "Run all required phases for the selected profile",
-		Long: `Run all deploy phases (base-packages, nvidia-driver, cuda,
-kwin-patch, sunshine-build, services, validate) for the selected
-profile. Phases already marked done in state.json are skipped.
+		Short: "Run the implemented phases (Milestone 3 partial)",
+		Long: `Run base-packages, nvidia-driver, and cuda in order, then exit
+with a clear partial-apply banner. Each phase is idempotent: re-running
+apply on the same VM skips phases already marked done.
 
-Milestone 1: stub. See docs/MIGRATION.md for the rollout plan.`,
+When nvidia-driver requests a reboot, apply writes state, schedules a
+reboot via the clouddeploy-continue.service, and exits 0. After the
+reboot the continuation service invokes 'clouddeployctl resume' which
+picks up where apply left off.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			profile, _ := cmd.Flags().GetString("profile")
-			fmt.Printf("clouddeployctl apply --profile %s\n", profile)
-			fmt.Println()
-			fmt.Println("This subcommand is a Milestone-1 stub. Production deploys")
-			fmt.Println("should keep using the v2 entry point:")
-			fmt.Println()
-			fmt.Println("    sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh")
-			fmt.Println()
-			fmt.Println("See docs/MIGRATION.md.")
-			return nil
+			ctx := context.Background()
+			deps, lock, err := loadDeps(cmd, true)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+
+			return runPhasesAndBanner(ctx, deps)
 		},
 	}
+}
+
+// runPhasesAndBanner is shared between apply and resume.
+func runPhasesAndBanner(ctx context.Context, deps *phase.Deps) error {
+	phases := []phase.Phase{
+		phase.BasePackages{},
+		phase.NvidiaDriver{},
+		phase.Cuda{},
+	}
+	for _, p := range phases {
+		fmt.Printf("\n=== phase %s ===\n", p.Name())
+		if err := p.Run(ctx, deps); err != nil {
+			if errors.Is(err, phase.ErrRebootRequired) {
+				fmt.Println("\nphase requested a reboot to continue.")
+				fmt.Println("(Reboot scheduling is a Milestone 4 deliverable; for now the operator")
+				fmt.Println(" should run `sudo reboot` and then `sudo clouddeployctl resume`.)")
+				return nil
+			}
+			return err
+		}
+	}
+	fmt.Print(partialApplyBanner)
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -126,17 +257,20 @@ func newResumeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "resume",
 		Short: "Resume a deploy after a reboot",
-		Long: `resume reads /var/lib/clouddeploy/state.json, identifies the
-last-completed phase, and continues from the next pending phase.
-
-The continuation systemd service calls this on boot. It is functionally
-equivalent to 'apply' after a reboot but assumes the profile from
-state.json rather than --profile.
-
-Milestone 1: stub.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("resume is a Milestone-1 stub. See docs/MIGRATION.md.")
-			return nil
+			ctx := context.Background()
+			deps, lock, err := loadDeps(cmd, true)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+
+			if deps.State.RebootNeeded {
+				deps.State.ClearRebootNeeded()
+				_ = deps.PersistState()
+				fmt.Println("resume: clearing RebootNeeded marker")
+			}
+			return runPhasesAndBanner(ctx, deps)
 		},
 	}
 }
@@ -149,34 +283,60 @@ func newDoctorCmd() *cobra.Command {
 	doctor := &cobra.Command{
 		Use:   "doctor [subsystem]",
 		Short: "Print a per-subsystem readiness report (read-only)",
-		Long: `doctor runs the same idempotency checks each phase uses, but
-read-only. It never installs, removes, or modifies anything; it
-reports what the system looks like and what the next 'apply' would do.
-
-With no subsystem argument, doctor runs every check and prints a
-summary.
-
-Subsystems:
-
-  doctor nvidia    GPU detection, driver package family, dkms, nvidia-smi.
-  doctor cuda      CUDA toolkit policy + presence + version.
-  doctor apt       dpkg state, lock holders, policy-rc.d.
-  doctor kwin      Patched-KWin marker + apt pinning + private HDR props.
-  doctor sunshine  Sunshine binary, capabilities, fork-commit pin, env.
-
-Milestone 1: nvidia and cuda are implemented; the rest are stubs.`,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			// No subsystem: print a summary.
-			fmt.Println("Run a subsystem: clouddeployctl doctor [nvidia|cuda|apt|kwin|sunshine]")
-			return nil
-		},
 	}
+	doctor.AddCommand(newDoctorAptCmd())
 	doctor.AddCommand(newDoctorNvidiaCmd())
 	doctor.AddCommand(newDoctorCudaCmd())
-	doctor.AddCommand(newDoctorAptCmd())
+	doctor.AddCommand(newDoctorSystemCmd())
 	doctor.AddCommand(newDoctorKwinCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
 	return doctor
+}
+
+func newDoctorAptCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "apt",
+		Short: "Report dpkg / apt state (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			st, _ := apt.InspectPolicyRcD(deps.APT.Env)
+			holders := deps.APT.LockHolders(ctx)
+			fmt.Println("doctor apt:")
+			fmt.Printf("  policy-rc.d path        : %s\n", st.Path)
+			fmt.Printf("  policy-rc.d exists      : %v\n", st.Exists)
+			fmt.Printf("  CloudDeploy-owned       : %v\n", st.IsClouddeploy)
+			fmt.Printf("  backup file present     : %v\n", st.BackupExists)
+			if len(holders) == 0 {
+				fmt.Printf("  Lock holders            : (none)\n")
+			} else {
+				fmt.Printf("  Lock holders            :\n")
+				for _, h := range holders {
+					fmt.Printf("    %s\n", h)
+				}
+			}
+			// dpkg --audit via a quick runner call (read-only). On a
+			// developer host without dpkg this just prints "(missing)".
+			if _, err := lookExecutable("dpkg"); err == nil {
+				res := deps.Runner.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"dpkg", "--audit"},
+					LogFile: "-",
+				})
+				out := res.Stdout
+				if out == "" {
+					fmt.Printf("  dpkg --audit            : (no findings)\n")
+				} else {
+					fmt.Printf("  dpkg --audit            :\n%s\n", indent(out, "    "))
+				}
+			} else {
+				fmt.Printf("  dpkg --audit            : (dpkg not on PATH)\n")
+			}
+			return nil
+		},
+	}
 }
 
 func newDoctorNvidiaCmd() *cobra.Command {
@@ -184,17 +344,31 @@ func newDoctorNvidiaCmd() *cobra.Command {
 		Use:   "nvidia",
 		Short: "Report NVIDIA driver readiness (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+
+			// Driver major: flag overrides profile.
 			driverMajor, _ := cmd.Flags().GetString("driver-major")
+			if driverMajor == "" && deps.Profile != nil {
+				driverMajor = deps.Profile.NVIDIA.DriverMajor
+			}
 			opts := nvidia.EvidenceOptions{DriverMajor: driverMajor}
 			ev, err := nvidia.GatherEvidenceFromHost(opts)
 			if err != nil {
 				fmt.Printf("doctor nvidia: could not gather evidence: %v\n", err)
 				return nil
 			}
+			if deps.Profile != nil {
+				ev.PreferOpenFamily = ev.PreferOpenFamily || deps.Profile.NVIDIA.PreferOpenFamily
+				ev.PreferServerFamily = ev.PreferServerFamily || deps.Profile.NVIDIA.PreferServer
+			}
 			cls := nvidia.Classify(ev.GPUName, ev.PCIID)
 			fam, reason, selErr := nvidia.SelectFamily(ev)
 			scanned := nvidia.ScannedMajors(opts)
-			fmt.Printf("doctor nvidia:\n")
+
+			fmt.Println("doctor nvidia:")
 			fmt.Printf("  Detected GPU            : %s\n", evOrUnknown(ev.GPUName))
 			fmt.Printf("  PCI ID                  : %s\n", evOrUnknown(ev.PCIID))
 			fmt.Printf("  Classification          : %s / %s\n", cls.Category, cls.Kind)
@@ -218,20 +392,41 @@ func newDoctorNvidiaCmd() *cobra.Command {
 			fmt.Printf("  AV1 encode supported    : %v\n", cls.Kind.SupportsAV1Encode())
 			fmt.Printf("  HDR streaming supported : %v\n", cls.Kind.SupportsHDRStreaming())
 			fmt.Printf("  Selected family         : %s\n", fam)
+			if fam != nvidia.FamilyUnknown {
+				major := driverMajor
+				if major == "" {
+					major = "580"
+				}
+				fmt.Printf("  Suggested driver pkg    : %s\n", fam.DriverPackage(major))
+				fmt.Printf("  Suggested dkms pkg      : %s\n", fam.DkmsPackage(major))
+				fmt.Printf("  Open module required    : %v\n", ev.IsBlackwellConsumer || ev.IsBlackwellPro || ev.IsBlackwellDC || ev.DmesgRequiresOpenKernelModule)
+			}
 			fmt.Printf("  Reason                  : %s\n", reason)
 			if selErr != nil {
 				fmt.Printf("  Error                   : %v\n", selErr)
 			}
 			if !ev.AvailabilityKnown {
-				fmt.Printf("  Note                    : apt-cache was not consulted; availability is approximate.\n")
+				fmt.Println("  Note                    : apt-cache was not consulted; availability is approximate.")
 			}
 			if driverMajor == "" {
-				fmt.Printf("  Note                    : --driver-major not supplied; scanned %v as a best-effort guess.\n", scanned)
+				fmt.Printf("  Note                    : no --driver-major and no profile.nvidia.driver_major; scanned %v as a best-effort guess.\n", scanned)
+			}
+
+			// Suggested action.
+			fmt.Println()
+			fmt.Println("Suggested action:")
+			switch {
+			case ev.AlreadyInstalled() == fam && ev.NvidiaSmiWorks:
+				fmt.Printf("  Keep installed family %q. No action needed.\n", fam)
+			case selErr != nil:
+				fmt.Printf("  Fix: %v.\n", selErr)
+			default:
+				fmt.Printf("  Run: clouddeployctl phase nvidia-driver --profile %s\n", profileName(cmd))
 			}
 			return nil
 		},
 	}
-	c.Flags().String("driver-major", "", "NVIDIA driver major version to scan (e.g. 580); defaults to a fallback set when empty")
+	c.Flags().String("driver-major", "", "NVIDIA driver major version to scan (e.g. 580); falls back to profile.nvidia.driver_major")
 	return c
 }
 
@@ -240,30 +435,68 @@ func newDoctorCudaCmd() *cobra.Command {
 		Use:   "cuda",
 		Short: "Report CUDA toolkit readiness (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Milestone 1: print the configured CUDA mode and what
-			// that means for the deploy.
-			mode := cuda.ModeNone // default for hdr-4k120
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			mode := cuda.ModeNone
+			if deps.Profile != nil {
+				if m, perr := cuda.ParseMode(deps.Profile.CUDA.Mode); perr == nil {
+					mode = m
+				}
+			}
 			plan := cuda.Plan(mode)
-			fmt.Printf("doctor cuda:\n")
-			fmt.Printf("  Configured mode      : %s\n", plan.Mode)
-			fmt.Printf("  Will attempt install : %v\n", plan.WillAttemptInstall)
-			fmt.Printf("  Fails deploy on err  : %v\n", plan.FailsDeployOnError)
-			fmt.Printf("  Rationale            : %s\n", plan.Rationale)
+
+			// Probe the host for nvcc.
+			_, nvccErr := lookExecutable("nvcc")
+			nvccPresent := nvccErr == nil
+
+			fmt.Println("doctor cuda:")
+			if deps.Profile != nil {
+				fmt.Printf("  Profile                 : %s\n", deps.Profile.Profile)
+			} else {
+				fmt.Printf("  Profile                 : (no profile loaded)\n")
+			}
+			fmt.Printf("  cuda.mode               : %s\n", plan.Mode)
+			fmt.Printf("  Will attempt install    : %v\n", plan.WillAttemptInstall)
+			fmt.Printf("  Fails deploy on error   : %v\n", plan.FailsDeployOnError)
+			fmt.Printf("  Sunshine CUDA module    : %v\n", plan.WillAttemptInstall)
+			fmt.Printf("  nvcc on PATH            : %v\n", nvccPresent)
+			fmt.Println()
+			fmt.Println("Rationale:")
+			fmt.Printf("  %s\n", plan.Rationale)
+			fmt.Println()
+			fmt.Println("Runfile retry policy (when runfile install lands in Milestone 4):")
+			fmt.Println("  - same (sha256, size) that already failed --check => refuse to redownload.")
+			fmt.Println("  - 3 consecutive --check failures => give up.")
+			fmt.Println("  - mode=optional => mark phase failed_nonfatal and continue.")
+			fmt.Println("  - mode=required => mark phase failed_fatal.")
 			return nil
 		},
 	}
 }
 
-func newDoctorAptCmd() *cobra.Command {
+func newDoctorSystemCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "apt",
-		Short: "Report dpkg/apt state (read-only)",
+		Use:   "system",
+		Short: "Report OS / kernel / state summary (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("doctor apt: Milestone-2 stub. Will report:")
-			fmt.Println("  - dpkg lock holders")
-			fmt.Println("  - pending postinst")
-			fmt.Println("  - policy-rc.d presence + provenance")
-			fmt.Println("  - any service-start postinst that could deadlock")
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			fmt.Println("doctor system:")
+			fmt.Printf("  Kernel                  : %s\n", readSmall("/proc/sys/kernel/osrelease"))
+			fmt.Printf("  OS release id           : %s\n", lsbRelease("ID"))
+			fmt.Printf("  OS version              : %s\n", lsbRelease("VERSION_ID"))
+			fmt.Printf("  PID 1 / init            : %s\n", readSmall("/proc/1/comm"))
+			fmt.Printf("  State file              : %s\n", deps.StatePath)
+			fmt.Printf("  Profile loaded          : %v\n", deps.Profile != nil)
+			fmt.Printf("  State.RebootNeeded      : %v\n", deps.State.RebootNeeded)
+			fmt.Printf("  State.ResumeTarget      : %s\n", deps.State.ResumeTarget)
+			for name, p := range deps.State.Phases {
+				fmt.Printf("  Phase %-18s : %s\n", name, p.Status)
+			}
 			return nil
 		},
 	}
@@ -274,11 +507,15 @@ func newDoctorKwinCmd() *cobra.Command {
 		Use:   "kwin",
 		Short: "Report patched-KWin / NVIDIA private HDR state (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("doctor kwin: Milestone-4 stub. Will report:")
-			fmt.Println("  - patched-KWin marker presence")
-			fmt.Println("  - apt pinning state")
-			fmt.Println("  - kscreen-doctor HDR + WCG state")
-			fmt.Println("  - NV_CRTC_REGAMMA_TF / NV_INPUT_COLORSPACE / NV_PLANE_DEGAMMA_TF")
+			fmt.Println("doctor kwin: NOT IMPLEMENTED in Milestone 3 partial.")
+			fmt.Println("Will check (Milestone 4):")
+			fmt.Println("  - /var/lib/clouddeploy/patched-kwin-installed marker")
+			fmt.Println("  - apt-mark hold status for kwin packages")
+			fmt.Println("  - kscreen-doctor -o HDR + Wide Color Gamut state")
+			fmt.Println("  - NV_CRTC_REGAMMA_TF / NV_INPUT_COLORSPACE / NV_PLANE_DEGAMMA_TF via drm_info")
+			fmt.Println()
+			fmt.Println("For HDR-side validation today, run scripts/validate-hdr-drm-state.py")
+			fmt.Println("(invoked by v2's validate_hdr_final_state).")
 			return nil
 		},
 	}
@@ -289,11 +526,13 @@ func newDoctorSunshineCmd() *cobra.Command {
 		Use:   "sunshine",
 		Short: "Report Sunshine fork build/install state (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("doctor sunshine: Milestone-4 stub. Will report:")
-			fmt.Println("  - /usr/local/bin/sunshine-clouddeploy presence + caps")
-			fmt.Println("  - /usr/local/bin/sunshine shadow presence + caps")
-			fmt.Println("  - source tree HEAD vs profile-pinned fork commit")
-			fmt.Println("  - SUNSHINE_FORCE_AV1_HDR10 / SUNSHINE_SYNTHESIZE_HDR10_METADATA env")
+			fmt.Println("doctor sunshine: NOT IMPLEMENTED in Milestone 3 partial.")
+			fmt.Println("Will check (Milestone 4):")
+			fmt.Println("  - /usr/local/bin/sunshine-clouddeploy presence")
+			fmt.Println("  - /usr/local/bin/sunshine shadow presence")
+			fmt.Println("  - getcap on both binaries (cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep)")
+			fmt.Println("  - /opt/sunshine-src HEAD vs profile-pinned fork_commit")
+			fmt.Println("  - SUNSHINE_FORCE_AV1_HDR10 + SUNSHINE_SYNTHESIZE_HDR10_METADATA env in sunshine-headless.service")
 			return nil
 		},
 	}
@@ -304,25 +543,13 @@ func newDoctorSunshineCmd() *cobra.Command {
 // -----------------------------------------------------------------------------
 
 func newValidateCmd() *cobra.Command {
-	v := &cobra.Command{
-		Use:   "validate [check]",
-		Short: "Run validators (read-only)",
-		Long: `validate runs an end-to-end check.
-
-Checks:
-
-  validate hdr-stream    Grep the Sunshine journal for the HDR success
-                         markers. Equivalent to v2's
-                         clouddeploy-validate-hdr-stream helper.
-
-Milestone 1: stub.`,
-	}
+	v := &cobra.Command{Use: "validate [check]"}
 	v.AddCommand(&cobra.Command{
 		Use:   "hdr-stream",
 		Short: "Confirm Sunshine emitted the HDR control packet to Moonlight",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("validate hdr-stream: Milestone-4 stub. Will run the same checks as")
-			fmt.Println("/usr/local/sbin/clouddeploy-validate-hdr-stream (v2 helper).")
+			fmt.Println("validate hdr-stream: NOT IMPLEMENTED (Milestone 4).")
+			fmt.Println("v2 helper: /usr/local/sbin/clouddeploy-validate-hdr-stream.")
 			return nil
 		},
 	})
@@ -334,42 +561,44 @@ Milestone 1: stub.`,
 // -----------------------------------------------------------------------------
 
 func newPhaseCmd() *cobra.Command {
-	p := &cobra.Command{
-		Use:   "phase [name]",
-		Short: "Run a single phase (development tool)",
-		Long: `Run exactly one deploy phase. Used during development when
-iterating on a single module.
-
-Phases:
-
-  base-packages    apt update + base package install
-  nvidia-driver    select family + install driver + dkms
-  cuda             apply cuda.mode policy
-  kwin-patch       apply + build patched KWin
-  sunshine-build   pin + build + install Sunshine fork
-  services         generate + start systemd units
-
-Milestone 1: stubs.`,
-	}
-	for _, name := range []string{
-		"base-packages",
-		"nvidia-driver",
-		"cuda",
-		"kwin-patch",
-		"sunshine-build",
-		"services",
-	} {
+	p := &cobra.Command{Use: "phase [name]"}
+	p.AddCommand(newPhaseImplCmd("base-packages", phase.BasePackages{}))
+	p.AddCommand(newPhaseImplCmd("nvidia-driver", phase.NvidiaDriver{}))
+	p.AddCommand(newPhaseImplCmd("cuda", phase.Cuda{}))
+	for _, name := range []string{"kwin-patch", "sunshine-build", "services"} {
 		n := name
 		p.AddCommand(&cobra.Command{
 			Use:   n,
-			Short: fmt.Sprintf("Run the %s phase", n),
+			Short: fmt.Sprintf("Run the %s phase (NOT IMPLEMENTED)", n),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				fmt.Printf("phase %s: Milestone-1 stub. See docs/MIGRATION.md.\n", n)
-				return nil
+				return fmt.Errorf("phase %s: NOT IMPLEMENTED in Milestone 3 partial. Use v2 CloudDeploy-wayland.sh for now", n)
 			},
 		})
 	}
 	return p
+}
+
+func newPhaseImplCmd(name string, ph phase.Phase) *cobra.Command {
+	return &cobra.Command{
+		Use:   name,
+		Short: fmt.Sprintf("Run the %s phase", name),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, lock, err := loadDeps(cmd, true)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			if err := ph.Run(ctx, deps); err != nil {
+				if errors.Is(err, phase.ErrRebootRequired) {
+					fmt.Println("phase requested reboot.")
+					return nil
+				}
+				return err
+			}
+			return nil
+		},
+	}
 }
 
 // -----------------------------------------------------------------------------
@@ -377,10 +606,7 @@ Milestone 1: stubs.`,
 // -----------------------------------------------------------------------------
 
 func newStateCmd() *cobra.Command {
-	s := &cobra.Command{
-		Use:   "state",
-		Short: "Inspect / reset the CloudDeploy state file",
-	}
+	s := &cobra.Command{Use: "state"}
 	s.AddCommand(&cobra.Command{
 		Use:   "show",
 		Short: "Print state.json with formatting",
@@ -394,19 +620,36 @@ func newStateCmd() *cobra.Command {
 			return st.WriteIndented(os.Stdout)
 		},
 	})
-	s.AddCommand(&cobra.Command{
+	reset := &cobra.Command{
 		Use:   "reset",
 		Short: "Force a phase back to pending",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("state reset: Milestone-1 stub.")
+			phaseName, _ := cmd.Flags().GetString("phase")
+			if phaseName == "" {
+				return fmt.Errorf("state reset: --phase is required")
+			}
+			path, _ := cmd.Flags().GetString("state-path")
+			st, err := state.Load(path)
+			if err != nil {
+				return fmt.Errorf("load state: %w", err)
+			}
+			if !st.Reset(phaseName) {
+				return fmt.Errorf("state reset: phase %q not found in state", phaseName)
+			}
+			if err := st.Save(path); err != nil {
+				return fmt.Errorf("save state: %w", err)
+			}
+			fmt.Printf("state reset: phase %q cleared\n", phaseName)
 			return nil
 		},
-	})
+	}
+	reset.Flags().String("phase", "", "phase name to reset (e.g. nvidia_driver)")
+	s.AddCommand(reset)
 	return s
 }
 
 // -----------------------------------------------------------------------------
-// helpers
+// small helpers
 // -----------------------------------------------------------------------------
 
 func evOrUnknown(s string) string {
@@ -414,4 +657,43 @@ func evOrUnknown(s string) string {
 		return "(unknown)"
 	}
 	return s
+}
+
+func profileName(cmd *cobra.Command) string {
+	p, _ := cmd.Flags().GetString("profile")
+	if p == "" {
+		return "hdr-4k120"
+	}
+	return p
+}
+
+func lookExecutable(name string) (string, error) {
+	if path, err := os.Executable(); err == nil && filepathBase(path) == name {
+		return path, nil
+	}
+	// Standard PATH lookup via the runner's exec package.
+	return execLookPath(name)
+}
+
+func indent(s, prefix string) string {
+	out := ""
+	for _, line := range splitLines(s) {
+		out += prefix + line + "\n"
+	}
+	return out
+}
+
+func splitLines(s string) []string {
+	var out []string
+	start := 0
+	for i, c := range s {
+		if c == '\n' {
+			out = append(out, s[start:i])
+			start = i + 1
+		}
+	}
+	if start < len(s) {
+		out = append(out, s[start:])
+	}
+	return out
 }
