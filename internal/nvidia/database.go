@@ -28,10 +28,10 @@ import (
 type Category int
 
 const (
-	CategoryUnknown Category = iota
-	CategoryConsumerGeForce       // GeForce RTX / GTX consumer cards
-	CategoryWorkstationProfessional // RTX PRO Blackwell, RTX Ada Pro, RTX A-series, Quadro
-	CategoryDataCenter            // L4 / L40 / A* / H* / B* (and legacy T4, V100, P*)
+	CategoryUnknown                 Category = iota
+	CategoryConsumerGeForce                  // GeForce RTX / GTX consumer cards
+	CategoryWorkstationProfessional          // RTX PRO Blackwell, RTX Ada Pro, RTX A-series, Quadro
+	CategoryDataCenter                       // L4 / L40 / A* / H* / B* (and legacy T4, V100, P*)
 )
 
 // Kind is finer-grained within a Category: which architecture/generation,
@@ -166,7 +166,7 @@ func classifyByPCIID(pciID string) (Classification, bool) {
 // more general ones (e.g. "RTX PRO" before generic "RTX").
 
 type namePattern struct {
-	re   *regexp.Regexp
+	re       *regexp.Regexp
 	classify func(name string) Classification
 }
 

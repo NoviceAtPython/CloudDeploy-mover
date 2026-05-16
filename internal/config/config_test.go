@@ -227,8 +227,8 @@ func TestGPUValidatorRejectsBadInputs(t *testing.T) {
 	})
 	t.Run("bad streaming value", func(t *testing.T) {
 		g := &GPUProfile{
-			Filename: "bad-streaming.yaml",
-			Match:    GPUMatch{NamePatterns: []string{"X"}},
+			Filename:  "bad-streaming.yaml",
+			Match:     GPUMatch{NamePatterns: []string{"X"}},
 			Streaming: GPUStreamingFlag{AV1Encode: "maybe"},
 		}
 		err := ValidateGPU(g)
