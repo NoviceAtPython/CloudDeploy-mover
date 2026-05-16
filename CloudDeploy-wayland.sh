@@ -115,9 +115,41 @@ SUNSHINE_FORK_REPO="${SUNSHINE_FORK_REPO:-https://github.com/NoviceAtPython/Suns
 SUNSHINE_DIAGNOSTIC_FORK_BRANCH="${SUNSHINE_DIAGNOSTIC_FORK_BRANCH:-codex/sunshine-pairing-diagnostics}"
 SUNSHINE_CLEAN_FORK_BRANCH="${SUNSHINE_CLEAN_FORK_BRANCH:-clouddeploy-clean-pairing-stream-fix}"
 SUNSHINE_FORK_BRANCH="${SUNSHINE_FORK_BRANCH:-$SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
+# Pinned Sunshine fork commit. This is the known-good HDR success state
+# (Moonlight overlay confirmed "AV1 10-bit HDR" on the live VM after this
+# commit landed in NoviceAtPython/Sunshine). Hard-resetting to this hash
+# inside install_sunshine_from_fork_if_requested prevents future movement
+# of codex/sunshine-pairing-diagnostics from silently breaking HDR. Set
+# to the empty string to disable the pin and follow the branch tip.
+# See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md.
+SUNSHINE_FORK_COMMIT="${SUNSHINE_FORK_COMMIT:-464bccf1b6e33bf35138136c6138fd9851e6d906}"
 SUNSHINE_BUILD_DIR="${SUNSHINE_BUILD_DIR:-/opt/sunshine-src}"
 SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS:-2}"
 SUNSHINE_INSTALL_BIN="${SUNSHINE_INSTALL_BIN:-/usr/local/bin/sunshine-clouddeploy}"
+# Sunshine HDR runtime knobs. The Sunshine fork at SUNSHINE_FORK_COMMIT
+# adds two env vars that flip HDR all the way through to Moonlight's
+# overlay on the CloudDeploy NVIDIA private DRM path (where the standard
+# HDR_OUTPUT_METADATA blob is intentionally 0):
+#   SUNSHINE_FORCE_AV1_HDR10                - bumps active_av1_mode 2->3,
+#                                             forces config.monitor.
+#                                             dynamicRange=1, advertises
+#                                             SCM_AV1_MAIN10 in
+#                                             /serverinfo.
+#   SUNSHINE_SYNTHESIZE_HDR10_METADATA      - flips the
+#                                             control_hdr_mode_t.enabled
+#                                             control packet to 1 even
+#                                             when get_hdr_metadata()
+#                                             returns no display blob;
+#                                             synthesises BT.2020 / D65 /
+#                                             1000-nit / MaxCLL=1000 /
+#                                             MaxFALL=400 defaults so
+#                                             Moonlight's overlay reads
+#                                             HDR.
+# Both default to ENABLE_HDR so an HDR deploy auto-enables both without
+# the operator having to remember them. Operators can still override
+# explicitly by exporting either var before invoking the script.
+SUNSHINE_FORCE_AV1_HDR10="${SUNSHINE_FORCE_AV1_HDR10:-${ENABLE_HDR:-0}}"
+SUNSHINE_SYNTHESIZE_HDR10_METADATA="${SUNSHINE_SYNTHESIZE_HDR10_METADATA:-${ENABLE_HDR:-0}}"
 # Sunshine's optional CUDA/NvFBC module fails to compile against CUDA 13 headers
 # combined with newer glibc on Ubuntu 25.10 / 26.04 (rsqrt/rsqrtf conflict).
 # The KMS/DRM/Wayland/NVENC streaming path does not need it, so auto-disable it
@@ -1161,10 +1193,13 @@ write_clouddeploy_env_file() {
                 printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "${SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
                 printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "${SUNSHINE_CLEAN_FORK_BRANCH}"
                 printf 'SUNSHINE_FORK_BRANCH=%q\n' "${SUNSHINE_FORK_BRANCH}"
+                printf 'SUNSHINE_FORK_COMMIT=%q\n' "${SUNSHINE_FORK_COMMIT}"
                 printf 'SUNSHINE_BUILD_DIR=%q\n' "${SUNSHINE_BUILD_DIR}"
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
                 printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "${SUNSHINE_ENABLE_CUDA_MODULE}"
+                printf 'SUNSHINE_FORCE_AV1_HDR10=%q\n' "${SUNSHINE_FORCE_AV1_HDR10}"
+                printf 'SUNSHINE_SYNTHESIZE_HDR10_METADATA=%q\n' "${SUNSHINE_SYNTHESIZE_HDR10_METADATA}"
                 printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}"
                 printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
                 printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
@@ -2949,8 +2984,12 @@ WorkingDirectory=${HOME_DIR}
 # multi-GPU VMs with "Failed to gain CAP_SYS_ADMIN" / "missing_fb_handle"
 # / "Couldn't get handle for DRM Framebuffer" in the journal.
 NoNewPrivileges=no
-AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
-CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+# CAP_SYS_NICE: Sunshine's NVENC encode threads set elevated scheduling
+# priority on a real-time-ish thread to keep encode latency stable at
+# 4K120. The final known-good live-VM install had it; preserve here so
+# the deploy matches that exact state.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
@@ -2962,6 +3001,13 @@ Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
 Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
+# Sunshine fork HDR knobs. These are the levers that flip Moonlight's
+# overlay from "AV1 10-bit SDR" to "AV1 10-bit HDR" on the CloudDeploy
+# NVIDIA private DRM path. They are always emitted (defaulting to
+# ENABLE_HDR) so a future "Environment=ENABLE_HDR=1" reset doesn't
+# silently drop the HDR signalling.
+Environment=SUNSHINE_FORCE_AV1_HDR10=${SUNSHINE_FORCE_AV1_HDR10}
+Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=${SUNSHINE_SYNTHESIZE_HDR10_METADATA}
 ExecStartPre=/usr/local/bin/clouddeploy-wait-sunshine-session.sh
 ExecStart=${runtime_bin} ${HOME_DIR}/.config/sunshine/sunshine.conf
 Restart=on-failure
@@ -3385,6 +3431,32 @@ install_sunshine_from_fork_if_requested() {
                         configure_git_safe_directories
                         [[ -d "${SUNSHINE_BUILD_DIR}/.git" ]] || die "${SUNSHINE_BUILD_DIR} is missing .git after checkout"
                         git -C "${SUNSHINE_BUILD_DIR}" rev-parse --show-toplevel >/dev/null
+
+                        # Hard-reset to the pinned known-good HDR commit. The
+                        # branch tip can move (diagnostic branch); the pin is
+                        # what makes "ENABLE_HDR=1 deploy => Moonlight overlay
+                        # shows HDR" reproducible. Set SUNSHINE_FORK_COMMIT=""
+                        # to follow the branch tip instead.
+                        if [[ -n "${SUNSHINE_FORK_COMMIT}" ]]; then
+                                if git -C "${SUNSHINE_BUILD_DIR}" cat-file -e "${SUNSHINE_FORK_COMMIT}^{commit}" 2>/dev/null; then
+                                        git -C "${SUNSHINE_BUILD_DIR}" reset --hard "${SUNSHINE_FORK_COMMIT}"
+                                        log "Pinned Sunshine fork to known-good HDR commit ${SUNSHINE_FORK_COMMIT}"
+                                else
+                                        # The pinned commit isn't reachable from the
+                                        # fetched branch tip. Fetch the specific SHA
+                                        # by ref (works for any commit in the repo's
+                                        # default fetch refspec), then reset.
+                                        if git -C "${SUNSHINE_BUILD_DIR}" fetch origin "${SUNSHINE_FORK_COMMIT}" 2>/dev/null; then
+                                                git -C "${SUNSHINE_BUILD_DIR}" reset --hard "${SUNSHINE_FORK_COMMIT}"
+                                                log "Pinned Sunshine fork to known-good HDR commit ${SUNSHINE_FORK_COMMIT} (fetched by SHA)"
+                                        else
+                                                die "SUNSHINE_FORK_COMMIT=${SUNSHINE_FORK_COMMIT} is not reachable from ${SUNSHINE_FORK_REPO} branch ${SUNSHINE_FORK_BRANCH}. Either update the pin in CloudDeploy-wayland.sh or set SUNSHINE_FORK_COMMIT=\"\" to follow the branch tip."
+                                        fi
+                                fi
+                        else
+                                log "SUNSHINE_FORK_COMMIT empty: following ${SUNSHINE_FORK_BRANCH} tip ($(git -C "${SUNSHINE_BUILD_DIR}" rev-parse --short HEAD))"
+                        fi
+
                         git -C "${SUNSHINE_BUILD_DIR}" submodule update --init --recursive
                         log "Applying Ubuntu 24.04 Doxygen compatibility patch for Sunshine fork build"
                         local doxyconfig_file
@@ -3477,16 +3549,42 @@ install_sunshine_from_fork_if_requested() {
                         built_bin="$(find "${SUNSHINE_BUILD_DIR}/build" -type f -name sunshine -perm -111 2>/dev/null | head -n1)"
                         [[ -x "${built_bin}" ]] || die "Could not find built Sunshine binary in ${SUNSHINE_BUILD_DIR}/build"
 
+                        # Install the source-built binary to both the
+                        # CloudDeploy-internal path AND the generic
+                        # /usr/local/bin/sunshine path. The service uses
+                        # SUNSHINE_INSTALL_BIN, but /usr/local/bin/sunshine
+                        # shadows any stale packaged /usr/bin/sunshine in
+                        # ${PATH} so manual `sunshine` invocations and the
+                        # web UI's "Open Sunshine" both pick the patched
+                        # fork build. This avoids the libminiupnpc / libicu
+                        # version-skew failure mode that recurs when the
+                        # apt-installed Sunshine library ABI drifts away
+                        # from what the source build linked against.
                         install -m 0755 "${built_bin}" "${SUNSHINE_INSTALL_BIN}"
+                        install -m 0755 "${built_bin}" /usr/local/bin/sunshine
                         if command -v setcap >/dev/null 2>&1; then
-                                # CAP_SYS_ADMIN: KMS framebuffer handle access (drm_info / KMS
-                                # capture) and DRM master handoff. Without it Sunshine logs
-                                # "Failed to gain CAP_SYS_ADMIN" + "missing_fb_handle" and falls
-                                # back to /dev/dri/card0 Virtual-1 1024x768 on a multi-GPU VM.
-                                # CAP_NET_BIND_SERVICE: bind Sunshine's privileged ports (47984
-                                # RTSP, etc.) when not running as root.
-                                setcap cap_sys_admin,cap_net_bind_service+ep "${SUNSHINE_INSTALL_BIN}" || true
-                                log "setcap on ${SUNSHINE_INSTALL_BIN}: $(getcap "${SUNSHINE_INSTALL_BIN}" 2>/dev/null || true)"
+                                # CAP_SYS_ADMIN:        KMS framebuffer handle access
+                                #                       (drm_info / KMS capture) +
+                                #                       DRM master handoff. Without
+                                #                       it Sunshine logs "Failed to
+                                #                       gain CAP_SYS_ADMIN" +
+                                #                       "missing_fb_handle" and
+                                #                       falls back to
+                                #                       /dev/dri/card0 Virtual-1
+                                #                       1024x768 on a multi-GPU VM.
+                                # CAP_NET_BIND_SERVICE: bind Sunshine's privileged
+                                #                       ports (47984 RTSP, etc.)
+                                #                       when not running as root.
+                                # CAP_SYS_NICE:         NVENC encode threads use
+                                #                       SCHED_FIFO-ish priority for
+                                #                       stable 4K120 latency. The
+                                #                       known-good live-VM install
+                                #                       had it; preserve here so
+                                #                       deploys exactly match.
+                                for sunshine_bin_target in "${SUNSHINE_INSTALL_BIN}" /usr/local/bin/sunshine; do
+                                        setcap cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep "${sunshine_bin_target}" || true
+                                        log "setcap on ${sunshine_bin_target}: $(getcap "${sunshine_bin_target}" 2>/dev/null || true)"
+                                done
                         fi
 
                         [[ -d "${SUNSHINE_BUILD_DIR}/build/assets" ]] || die "Sunshine fork build assets missing: ${SUNSHINE_BUILD_DIR}/build/assets"
@@ -4042,23 +4140,34 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-# Intentionally NOT writing 'hdr = ...': Sunshine logs
+# Intentionally NOT writing 'hdr = ...', 'fps = ...', or 'resolutions = ...':
+# Sunshine logs
 #   Warning: Unrecognized configurable option [hdr]
-# so the key has no effect in the current fork build. The actual HDR
-# negotiation happens client-side via Moonlight's launch request, which
-# Sunshine maps to AV1 Main10 / pixel_format=P010 / BT.2020 PQ inside the
-# encode-selection code path. Until the fork enforces that path on
-# ENABLE_HDR=1 (see docs/SUNSHINE-HDR-NEGOTIATION.md), writing
-# 'hdr = 1' here just produces a noisy warning.
-fps = [60, ${TARGET_FPS}]
-resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
+#   Warning: Unrecognized configurable option [fps]
+#   Warning: Unrecognized configurable option [resolutions]
+# for all three. The HDR negotiation happens via Moonlight's launch
+# request and the Sunshine fork enforces AV1 Main10 / P010 / BT.2020 PQ
+# in src/rtsp.cpp + src/video.cpp (commit 464bccf1; see
+# docs/SUNSHINE-HDR-NEGOTIATION.md). The fps/resolution offered to the
+# client come from KWin's EDID + the active mode line, not from
+# sunshine.conf - writing them here just produces noise in the journal.
 stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 EOF
+        # CSRF allowlist: localhost + 127.0.0.1 are needed for the
+        # Sunshine web UI when accessed via SSH tunnel or local browser
+        # on the host. The Tailscale IP is added when available so
+        # remote PIN-pairing over Tailscale works. Without these origins
+        # Sunshine's PIN endpoint rejects the POST with a CSRF error.
+        local -a csrf_origins=(
+                "https://localhost:47990"
+                "https://127.0.0.1:47990"
+        )
         if [[ -n "${ts_ip}" ]]; then
-                printf 'csrf_allowed_origins = https://%s:47990\n' "${ts_ip}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+                csrf_origins+=("https://${ts_ip}:47990")
         fi
+        printf 'csrf_allowed_origins = %s\n' "$(IFS=,; printf '%s' "${csrf_origins[*]}")" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
         chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 }
 
@@ -4191,10 +4300,20 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
         printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "clouddeploy-clean-pairing-stream-fix"
         printf 'SUNSHINE_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
+        # Pinned known-good HDR commit. Update only when a newer fork
+        # commit has been validated end-to-end (Moonlight overlay reads
+        # "AV1 10-bit HDR"). See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md.
+        printf 'SUNSHINE_FORK_COMMIT=%q\n' "464bccf1b6e33bf35138136c6138fd9851e6d906"
         printf 'SUNSHINE_BUILD_DIR=%q\n' "/opt/sunshine-src"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
         printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "auto"
+        # Default both HDR knobs to "${ENABLE_HDR}" so flipping ENABLE_HDR=1
+        # in this file automatically enables Sunshine's HDR control-packet
+        # synthesis (without that, Moonlight's overlay labels the stream
+        # SDR even when the bitstream is BT.2020+SMPTE2084).
+        printf 'SUNSHINE_FORCE_AV1_HDR10=%q\n' "${ENABLE_HDR:-0}"
+        printf 'SUNSHINE_SYNTHESIZE_HDR10_METADATA=%q\n' "${ENABLE_HDR:-0}"
         printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "0"
         printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
         printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
@@ -4333,20 +4452,21 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-# Intentionally NOT writing 'hdr = ...'; the fork prints
-# "Unrecognized configurable option [hdr]" and the option has no effect.
-# HDR is negotiated client-side via Moonlight's launch request; the
-# Sunshine fork is what has to enforce AV1 Main10 / P010 / BT.2020 PQ
-# in the encode-selection path. See docs/SUNSHINE-HDR-NEGOTIATION.md.
-fps = [60, ${TARGET_FPS}]
-resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
+# Intentionally NOT writing 'hdr = ...', 'fps = ...', 'resolutions = ...':
+# Sunshine logs "Unrecognized configurable option" for all three. The
+# HDR negotiation flows through Moonlight's launch request + the
+# Sunshine fork's encode-selection path (commit 464bccf1; see
+# docs/SUNSHINE-HDR-NEGOTIATION.md). fps/resolution come from KWin's
+# active mode + EDID.
 stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 CONF
+csrf_origins="https://localhost:47990,https://127.0.0.1:47990"
 if [[ -n "${TS_IP}" ]]; then
-        printf 'csrf_allowed_origins = https://%s:47990\n' "${TS_IP}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+        csrf_origins="${csrf_origins},https://${TS_IP}:47990"
 fi
+printf 'csrf_allowed_origins = %s\n' "${csrf_origins}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 
 systemctl reset-failed plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
@@ -4654,6 +4774,124 @@ echo
 echo "Pairing helper used Sunshine's API only; it did not inject sunshine_state.json."
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-pair-pin
+
+        cat > /usr/local/sbin/clouddeploy-validate-hdr-stream <<'EOF'
+#!/usr/bin/env bash
+# clouddeploy-validate-hdr-stream
+#
+# Grep the Sunshine journal for the markers that prove the HDR control
+# packet reached Moonlight after a successful Moonlight client connect.
+# Run this AFTER opening the stream from Moonlight at least once - the
+# control packet is only emitted when a client session starts. With no
+# active client this script just reports what was last seen in the journal.
+#
+# Exit codes:
+#   0 - All HDR markers seen at least once (HDR success state).
+#   1 - HDR enabled in CloudDeploy but one or more markers missing.
+#   2 - HDR not enabled in CloudDeploy; informational dump only.
+#
+# Required markers (when ENABLE_HDR=1):
+#   * "NVIDIA private HDR via NV_INPUT_COLORSPACE=BT.2100 PQ"
+#     OR  "NVIDIA private HDR via NV_CRTC_REGAMMA_TF=PQ"
+#   * "Encode selection:"  with selected_colorspace=HDR, _bit_depth=10-bit,
+#     _pix_fmt=p010
+#   * "HDR metadata fallback" or "HDR control message ... SYNTHESIZED HDR10"
+#     (proves the Sunshine fork synthesised HDR10 defaults on the NVIDIA
+#     private DRM path - this is what flips Moonlight's overlay)
+#   * "Sent HDR mode control packet to Moonlight: enabled=1"
+#     (this is THE ground truth Moonlight reads for the overlay)
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+ENABLE_HDR="${ENABLE_HDR:-0}"
+SINCE="${1:-15 minutes ago}"
+
+journal="$(journalctl -u sunshine-headless.service --since "${SINCE}" --no-pager 2>/dev/null || true)"
+if [[ -z "${journal}" ]]; then
+        echo "No sunshine-headless.service journal entries since ${SINCE}." >&2
+        exit 1
+fi
+
+mark() {
+        local name="$1"
+        local pattern="$2"
+        local match
+        match="$(printf '%s\n' "${journal}" | grep -E "${pattern}" | tail -n1 || true)"
+        if [[ -n "${match}" ]]; then
+                printf '  [OK]   %s\n        %s\n' "${name}" "${match}"
+                return 0
+        else
+                printf '  [MISS] %s\n' "${name}"
+                return 1
+        fi
+}
+
+echo "=== clouddeploy-validate-hdr-stream (since: ${SINCE}, ENABLE_HDR=${ENABLE_HDR}) ==="
+
+ok=1
+mark "NVIDIA private HDR detected on active CRTC/plane" \
+        'is_hdr: NVIDIA private HDR via (NV_CRTC_REGAMMA_TF=PQ|NV_INPUT_COLORSPACE=BT.2100 PQ|NV_INPUT_COLORSPACE=BT2100 PQ)' || ok=0
+mark "Encode selection chose HDR colorspace" \
+        'Encode selection:.*selected_colorspace=HDR' || ok=0
+mark "Encode selection chose 10-bit depth" \
+        'Encode selection:.*selected_bit_depth=10-bit' || ok=0
+mark "Encode selection chose P010 pix_fmt" \
+        'Encode selection:.*selected_pix_fmt=p010' || ok=0
+mark "Sunshine fork synthesised HDR10 static metadata" \
+        'HDR metadata fallback: standard DRM HDR_OUTPUT_METADATA blob is 0|SYNTHESIZED HDR10 defaults' || ok=0
+mark "Moonlight client received HDR control packet enabled=1" \
+        'Sent HDR mode control packet to Moonlight: enabled=1' || ok=0
+mark "NvEnc colour-config emitted for AV1 (BT.2020 + PQ)" \
+        'NvEnc color-config: codec=AV1' || ok=0
+
+# Failure signals - if any of these are present, HDR is definitely off
+# even if a subset of the [OK] markers above hit on a stale earlier run.
+echo
+echo "=== HDR negative markers (must NOT appear when HDR is good) ==="
+neg_hit=0
+neg() {
+        local name="$1"
+        local pattern="$2"
+        local match
+        match="$(printf '%s\n' "${journal}" | grep -E "${pattern}" | tail -n1 || true)"
+        if [[ -n "${match}" ]]; then
+                printf '  [HIT]  %s\n        %s\n' "${name}" "${match}"
+                neg_hit=1
+        else
+                printf '  [ok]   %s (not seen)\n' "${name}"
+        fi
+}
+neg "Sunshine fell back to AV1 SDR" \
+        'Color coding: SDR \(Rec\. 601\)|Color coding: SDR \(Rec\. 709\)' || true
+neg "HDR control packet sent with enabled=0" \
+        'Sent HDR mode control packet to Moonlight: enabled=0|Sent HDR mode: false|Sent HDR mode: 0' || true
+
+if [[ "${neg_hit}" -ne 0 ]]; then
+        ok=0
+fi
+
+echo
+if [[ "${ENABLE_HDR}" != "1" ]]; then
+        echo "ENABLE_HDR is not 1 in ${ENV_FILE} - informational dump only."
+        exit 2
+fi
+
+if [[ "${ok}" -eq 1 ]]; then
+        echo "RESULT: HDR streaming markers all confirmed. Moonlight overlay should read 'AV1 10-bit HDR'."
+        exit 0
+else
+        echo "RESULT: One or more HDR streaming markers missing. Connect Moonlight, start a stream, then re-run this validator with a fresh --since window." >&2
+        exit 1
+fi
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-validate-hdr-stream
 
         systemctl daemon-reload
 }
@@ -5328,6 +5566,17 @@ validate_streaming_stack_ready() {
 
         # ENABLE_HDR=1 requires the full HDR good state, not just SDR streaming.
         validate_hdr_final_state
+
+        # Best-effort streaming-side HDR hint. The Sunshine fork's
+        # control-packet log "Sent HDR mode control packet to Moonlight:
+        # enabled=1" only appears once a Moonlight client actually
+        # connects and starts a session, so we cannot demand it at
+        # deploy time. Instead, log an instruction so the operator can
+        # confirm HDR end-to-end after the first connect.
+        if [[ "${ENABLE_HDR:-0}" == "1" ]]; then
+                log "HDR streaming knobs in sunshine-headless.service: SUNSHINE_FORCE_AV1_HDR10=${SUNSHINE_FORCE_AV1_HDR10:-0} SUNSHINE_SYNTHESIZE_HDR10_METADATA=${SUNSHINE_SYNTHESIZE_HDR10_METADATA:-0}"
+                log "After connecting Moonlight, run /usr/local/sbin/clouddeploy-validate-hdr-stream to confirm 'Sent HDR mode control packet to Moonlight: enabled=1' and friends. See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md for the full marker list."
+        fi
 }
 
 print_driver_cuda_sunshine_summary() {
