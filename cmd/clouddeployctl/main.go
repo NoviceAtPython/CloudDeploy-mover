@@ -25,8 +25,10 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/nvidia"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/phase"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/reboot"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/ubuntu"
 )
 
 // Version is overridden via -ldflags '-X main.Version=...'.
@@ -55,6 +57,7 @@ func newRoot() *cobra.Command {
 	root.PersistentFlags().String("config-dir", defaultConfigDir, "path to the config/ directory")
 	root.PersistentFlags().Bool("dry-run", false, "do not make destructive changes; print what would happen")
 	root.PersistentFlags().Bool("verbose", false, "verbose logging")
+	root.PersistentFlags().Bool("allow-unsupported", false, "allow applying on explicitly unsupported Ubuntu versions")
 
 	root.AddCommand(newApplyCmd())
 	root.AddCommand(newResumeCmd())
@@ -62,6 +65,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newValidateCmd())
 	root.AddCommand(newPhaseCmd())
 	root.AddCommand(newStateCmd())
+	root.AddCommand(newCollectLogsCmd())
 
 	return root
 }
@@ -188,9 +192,9 @@ const partialApplyBanner = `
 ================================================================================
   Milestone 3 partial apply complete.
 
-  Implemented:   base-packages, nvidia-driver, cuda
+  Implemented:   base-packages, nvidia-driver, cuda, EDID/GRUB
   NOT yet:       kwin-patch, sunshine-build, services,
-                 EDID/GRUB, HDR DRM validation, HDR stream validation
+                 HDR DRM validation, HDR stream validation
 
   For a full deploy that reaches "AV1 10-bit HDR" in Moonlight today,
   use the v2 entrypoint:
@@ -215,32 +219,92 @@ reboot the continuation service invokes 'clouddeployctl resume' which
 picks up where apply left off.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
+
+			allowUnsup, _ := cmd.Flags().GetBool("allow-unsupported")
+			res, err := ubuntu.ReadAndGate(ubuntu.DefaultOSReleasePath)
+			if err != nil && !os.IsNotExist(err) {
+				return fmt.Errorf("ubuntu gate read: %w", err)
+			}
+			if !res.Supported {
+				fmt.Printf("OS unsupported: %+v\n", res)
+				if !allowUnsup {
+					return fmt.Errorf("bailing out due to unsupported OS. Use --allow-unsupported to override")
+				}
+				fmt.Println("Warning: proceeding anyway due to --allow-unsupported")
+			}
+
 			deps, lock, err := loadDeps(cmd, true)
 			if err != nil {
 				return err
 			}
-			defer lock.Release()
 
-			return runPhasesAndBanner(ctx, deps)
+			err = runPhasesAndBanner(ctx, deps, false)
+			lock.Release()
+
+			if errors.Is(err, phase.ErrRebootRequired) {
+				os.Exit(2)
+			}
+			if err == nil {
+				os.Exit(10)
+			}
+			return err
 		},
 	}
 }
 
 // runPhasesAndBanner is shared between apply and resume.
-func runPhasesAndBanner(ctx context.Context, deps *phase.Deps) error {
+func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) error {
 	phases := []phase.Phase{
 		phase.BasePackages{},
 		phase.NvidiaDriver{},
 		phase.Cuda{},
+		phase.Edid{},
 	}
+
+	if isResume {
+		svc := &reboot.Service{Runner: deps.Runner, DryRun: deps.DryRun}
+		if svc.IsInstalled() {
+			fmt.Println("resume: Disabling continuation service...")
+			_ = svc.Disable(ctx)
+		}
+	}
+
 	for _, p := range phases {
 		fmt.Printf("\n=== phase %s ===\n", p.Name())
 		if err := p.Run(ctx, deps); err != nil {
 			if errors.Is(err, phase.ErrRebootRequired) {
 				fmt.Println("\nphase requested a reboot to continue.")
-				fmt.Println("(Reboot scheduling is a Milestone 4 deliverable; for now the operator")
-				fmt.Println(" should run `sudo reboot` and then `sudo clouddeployctl resume`.)")
-				return nil
+
+				svc := &reboot.Service{
+					Runner: deps.Runner,
+					DryRun: deps.DryRun,
+				}
+
+				profileName := ""
+				if deps.Profile != nil {
+					profileName = deps.Profile.Profile
+				}
+				args := reboot.Args{
+					Profile:   profileName,
+					StatePath: deps.StatePath,
+				}
+
+				fmt.Println("Installing continuation service...")
+				if err := svc.Install(ctx, args); err != nil {
+					return fmt.Errorf("install continuation unit: %w", err)
+				}
+
+				if deps.Profile != nil && deps.Profile.Deploy.AutoReboot {
+					fmt.Println("deploy.auto_reboot=true: Scheduling reboot now...")
+					if err := svc.Reboot(ctx); err != nil {
+						return fmt.Errorf("auto-reboot failed: %w", err)
+					}
+					return phase.ErrRebootRequired
+				} else {
+					fmt.Println("(deploy.auto_reboot is false or no profile loaded.)")
+					fmt.Println("Please run `sudo reboot` manually, then `sudo clouddeployctl resume`.")
+					return phase.ErrRebootRequired
+				}
 			}
 			return err
 		}
@@ -263,14 +327,23 @@ func newResumeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			defer lock.Release()
 
 			if deps.State.RebootNeeded {
 				deps.State.ClearRebootNeeded()
 				_ = deps.PersistState()
 				fmt.Println("resume: clearing RebootNeeded marker")
 			}
-			return runPhasesAndBanner(ctx, deps)
+
+			err = runPhasesAndBanner(ctx, deps, true)
+			lock.Release()
+
+			if errors.Is(err, phase.ErrRebootRequired) {
+				os.Exit(2)
+			}
+			if err == nil {
+				os.Exit(10)
+			}
+			return err
 		},
 	}
 }
@@ -696,4 +769,40 @@ func splitLines(s string) []string {
 		out = append(out, s[start:])
 	}
 	return out
+}
+func newCollectLogsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "collect-logs",
+		Short: "Collect logs and state for debugging",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			r := runner.New()
+			r.PrintToStdout = false
+
+			archive := "clouddeploy-logs.tar.gz"
+			fmt.Printf("Collecting logs into %s...\n", archive)
+
+			script := `set -e
+mkdir -p /tmp/cdlogs
+cp -a /var/log/clouddeploy /tmp/cdlogs/ || true
+cp -a /var/lib/clouddeploy/state.json /tmp/cdlogs/ || true
+journalctl -n 5000 > /tmp/cdlogs/journal.log || true
+systemctl status clouddeploy*.service > /tmp/cdlogs/systemctl.log || true
+dmesg | grep -i 'nv\|drm' > /tmp/cdlogs/dmesg-nvidia.log || true
+tail -n 2000 /var/log/dpkg.log > /tmp/cdlogs/dpkg.log || true
+tail -n 2000 /var/log/apt/term.log > /tmp/cdlogs/apt-term.log || true
+find /tmp/cdlogs -type f -exec sed -i -E 's/pass(word)?=[^ &]+/pass=REDACTED/gi' {} + || true
+tar -czf ` + archive + ` -C /tmp cdlogs
+rm -rf /tmp/cdlogs`
+			res := r.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"bash", "-c", script},
+				LogFile: "-",
+			})
+			if res.ExitCode != 0 {
+				return fmt.Errorf("collect-logs failed: %v", res.Stderr)
+			}
+			fmt.Println("Done.")
+			return nil
+		},
+	}
 }
