@@ -180,22 +180,20 @@ Milestone 1: nvidia and cuda are implemented; the rest are stubs.`,
 }
 
 func newDoctorNvidiaCmd() *cobra.Command {
-	return &cobra.Command{
+	c := &cobra.Command{
 		Use:   "nvidia",
 		Short: "Report NVIDIA driver readiness (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			// Milestone 1: print the family-selector decision against
-			// whatever evidence we can read from this host. In a real
-			// VM run this would also include nvidia-smi output, dkms
-			// status, /proc/driver/nvidia/version, etc. - those land
-			// in Milestone 2.
-			ev, err := nvidia.GatherEvidenceFromHost()
+			driverMajor, _ := cmd.Flags().GetString("driver-major")
+			opts := nvidia.EvidenceOptions{DriverMajor: driverMajor}
+			ev, err := nvidia.GatherEvidenceFromHost(opts)
 			if err != nil {
 				fmt.Printf("doctor nvidia: could not gather evidence: %v\n", err)
 				return nil
 			}
 			cls := nvidia.Classify(ev.GPUName, ev.PCIID)
 			fam, reason, selErr := nvidia.SelectFamily(ev)
+			scanned := nvidia.ScannedMajors(opts)
 			fmt.Printf("doctor nvidia:\n")
 			fmt.Printf("  Detected GPU            : %s\n", evOrUnknown(ev.GPUName))
 			fmt.Printf("  PCI ID                  : %s\n", evOrUnknown(ev.PCIID))
@@ -210,6 +208,8 @@ func newDoctorNvidiaCmd() *cobra.Command {
 			fmt.Printf("  Installed server-open   : %v\n", ev.InstalledServerOpen)
 			fmt.Printf("  Installed non-server    : %v\n", ev.InstalledNonServer)
 			fmt.Printf("  Installed non-server-open: %v\n", ev.InstalledNonServerOpen)
+			fmt.Printf("  Driver majors scanned   : %v\n", scanned)
+			fmt.Printf("  Availability known      : %v\n", ev.AvailabilityKnown)
 			fmt.Printf("  Available server        : %v\n", ev.AvailableServer)
 			fmt.Printf("  Available server-open   : %v\n", ev.AvailableServerOpen)
 			fmt.Printf("  Available non-server    : %v\n", ev.AvailableNonServer)
@@ -222,9 +222,17 @@ func newDoctorNvidiaCmd() *cobra.Command {
 			if selErr != nil {
 				fmt.Printf("  Error                   : %v\n", selErr)
 			}
+			if !ev.AvailabilityKnown {
+				fmt.Printf("  Note                    : apt-cache was not consulted; availability is approximate.\n")
+			}
+			if driverMajor == "" {
+				fmt.Printf("  Note                    : --driver-major not supplied; scanned %v as a best-effort guess.\n", scanned)
+			}
 			return nil
 		},
 	}
+	c.Flags().String("driver-major", "", "NVIDIA driver major version to scan (e.g. 580); defaults to a fallback set when empty")
+	return c
 }
 
 func newDoctorCudaCmd() *cobra.Command {

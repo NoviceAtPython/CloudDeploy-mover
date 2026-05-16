@@ -125,10 +125,28 @@ type Evidence struct {
 	InstalledNonServerOpen bool
 
 	// ---- apt availability ----
-	// AvailableXxx is true when `apt-cache policy
-	// nvidia-driver-${MAJOR}-xxx` reports a Candidate other than
-	// "(none)". Zero means the package family cannot be installed
-	// on this host (wrong release, repo not enabled, etc.).
+	// AvailabilityKnown distinguishes "we have not run apt-cache yet
+	// (read-only doctor mode; assume optimistic)" from "we did run
+	// apt-cache and it returned what's in the AvailableXxx fields
+	// (which may all be false, meaning nothing is installable)".
+	//
+	// When false:
+	//   IsAvailable() returns true for every family (optimistic).
+	//   SelectFamily() will not surface ErrNoFamilyAvailable solely
+	//   because every AvailableXxx is zero.
+	// When true:
+	//   IsAvailable() honors the AvailableXxx flags exactly.
+	//   SelectFamily() will return ErrNoFamilyAvailable when no
+	//   family is installable (or ErrNoOpenAvailable when open is
+	//   required but no *-open family is installable).
+	//
+	// This is the v2-bug fix: previously a host with no apt-cache
+	// scan looked indistinguishable from a host where apt-cache
+	// reported nothing available, so the selector either over-failed
+	// or over-succeeded depending on which side of the ambiguity
+	// you read.
+	AvailabilityKnown bool
+
 	AvailableServer        bool
 	AvailableServerOpen    bool
 	AvailableNonServer     bool
@@ -138,6 +156,20 @@ type Evidence struct {
 	NvidiaSmiWorks bool
 
 	// ---- Profile hints (from config/profiles/<name>.yaml) ----
+	//
+	// PreferOpenFamily is SOFT. It biases the selector toward
+	// server-open -> non-server-open, but if neither *-open is
+	// available AND the GPU does not REQUIRE the open kernel module
+	// (i.e. not Blackwell, no dmesg signal), the selector falls back
+	// to server -> non-server rather than failing.
+	//
+	// PreferServerFamily is SOFT. It biases the selector toward
+	// server -> server-open -> non-server -> non-server-open. Server
+	// family is the canonical NVIDIA recommendation for data-center
+	// deploys.
+	//
+	// The "hard open requirement" is hardware-driven only: dmesg
+	// signal OR Blackwell consumer/pro/datacenter.
 	PreferOpenFamily   bool
 	PreferServerFamily bool
 }
@@ -170,11 +202,16 @@ func (e Evidence) AlreadyInstalled() Family {
 }
 
 // IsAvailable reports whether a specific family is available from apt.
-// Evidence with no availability data populated (the early-evidence
-// case where apt-cache policy hasn't been consulted) treats every
-// family as available so the selector still has a reasonable answer.
+//
+// When AvailabilityKnown is false (we have not consulted apt-cache
+// yet), every family is treated as available. This is the optimistic
+// read-only mode used by `doctor` on a developer host that does not
+// have NVIDIA's apt sources configured.
+//
+// When AvailabilityKnown is true, the AvailableXxx flag is honoured
+// exactly. All-false is a meaningful "nothing available" state.
 func (e Evidence) IsAvailable(f Family) bool {
-	if !e.HasAvailabilityInfo() {
+	if !e.AvailabilityKnown {
 		return true
 	}
 	switch f {
@@ -190,11 +227,22 @@ func (e Evidence) IsAvailable(f Family) bool {
 	return false
 }
 
-// HasAvailabilityInfo reports whether any AvailableXxx flag is set.
-// Used by IsAvailable to distinguish "no apt-cache data" (assume
-// everything available) from "apt-cache says nothing is available"
-// (refuse to pick anything).
+// HasAvailabilityInfo is retained as a convenience predicate. Returns
+// true when AvailabilityKnown is set OR any AvailableXxx flag is true.
+// Tests that don't care about the trinary use this; production code
+// should use AvailabilityKnown directly.
 func (e Evidence) HasAvailabilityInfo() bool {
+	return e.AvailabilityKnown || e.AvailableServer || e.AvailableServerOpen ||
+		e.AvailableNonServer || e.AvailableNonServerOpen
+}
+
+// anyAvailable returns true if at least one family is reachable. When
+// AvailabilityKnown is false, the optimistic IsAvailable shortcut
+// makes this trivially true.
+func (e Evidence) anyAvailable() bool {
+	if !e.AvailabilityKnown {
+		return true
+	}
 	return e.AvailableServer || e.AvailableServerOpen ||
 		e.AvailableNonServer || e.AvailableNonServerOpen
 }
@@ -211,119 +259,132 @@ func (e Evidence) requiresOpenKernelModule() bool {
 // SelectFamily returns the family the deploy should use, plus a
 // human-readable reason and an error.
 //
+// The "open kernel module required" axis is hardware-driven:
+//   - dmesg "requires use of NVIDIA open kernel modules"
+//   - Blackwell GPU (consumer, pro, datacenter)
+//
+// In both of those cases the selector MUST pick a *-open family or
+// fail with ErrNoOpenAvailable.
+//
+// PreferOpenFamily on a non-Blackwell GPU is a SOFT bias: it sorts
+// *-open ahead of closed in the preference order, but if no *-open
+// is installable the selector still picks server or non-server when
+// the GPU does not need open. This is the v3-brief behaviour change
+// from Milestone 1.1's first cut.
+//
 // Precedence (highest wins):
 //
-//  1. dmesg "requires use of NVIDIA open kernel modules"
-//     -> any *-open family that is available, prefer server-open
-//     -> ErrNoOpenAvailable if neither *-open is available.
+//  1. dmesg requires open OR Blackwell -> hard open requirement.
+//     Try server-open -> non-server-open. Anything else returns
+//     ErrNoOpenAvailable.
 //
-//  2. Blackwell GPUs (consumer, pro, or datacenter)
-//     -> same as (1).
+//  2. One family installed + nvidia-smi works -> keep it.
+//     (Skipped when 1 triggered, since the kernel said the
+//     installed closed module is doomed.)
 //
-//  3. A single installed family + nvidia-smi works
-//     -> keep it. Skips the v2 regression where the selector
-//        uninstalls a working server-open install.
-//        BUT: skipped when (1) or (2) hit, because the kernel told
-//        us the installed closed module is doomed.
+//  3. Data-center + PreferServerFamily -> closed-first preference
+//     (server -> server-open -> non-server -> non-server-open).
 //
-//  4. Data-center GPU + PreferServerFamily
-//     -> server if available, else server-open, else non-server,
-//        else non-server-open.
+//  4. PreferOpenFamily (soft) -> open-first preference
+//     (server-open -> non-server-open -> server -> non-server).
 //
-//  5. PreferOpenFamily hint
-//     -> server-open if available, else non-server-open, else error.
+//  5. PreferServerFamily (non-data-center) -> same closed-first
+//     chain as 3.
 //
-//  6. PreferServerFamily hint
-//     -> server if available, else server-open, else non-server,
-//        else non-server-open.
+//  6. Default -> server-open -> server -> non-server-open -> non-server.
 //
-//  7. Default
-//     -> server-open if available, else server, else non-server-open,
-//        else non-server, else ErrNoFamilyAvailable.
-//
-// The open vs closed axis takes precedence over server vs non-server
-// because picking the wrong open/closed choice can brick the install;
-// picking the wrong server vs non-server still produces a working
-// driver, just from a non-ideal apt channel.
+// When AvailabilityKnown is true and no family is reachable at all,
+// returns ErrNoFamilyAvailable.
 func SelectFamily(e Evidence) (Family, string, error) {
-	// 1 & 2: open kernel module required.
+	// 1: hard open requirement.
 	if e.requiresOpenKernelModule() {
-		f, reason := chooseFromOpenPreference(e)
+		f, reason := firstAvailable(e, openOnlyOrder)
 		if f == FamilyUnknown {
 			return FamilyUnknown, openRequiredReason(e), ErrNoOpenAvailable
 		}
 		return f, openRequiredReason(e) + "; " + reason, nil
 	}
 
-	// 3: working installed driver wins.
+	// 2: working installed driver wins. (Not reached when 1 fired.)
 	if installed := e.AlreadyInstalled(); installed != FamilyUnknown && e.NvidiaSmiWorks {
 		return installed, fmt.Sprintf("installed family %q already loaded and nvidia-smi works", installed), nil
 	}
 
-	// 4: data-center + prefer-server.
+	// Before falling through to preference-based selection, refuse
+	// fast when AvailabilityKnown=true and nothing is installable.
+	if !e.anyAvailable() {
+		return FamilyUnknown, "apt-cache reports no NVIDIA driver family available for the configured driver major", ErrNoFamilyAvailable
+	}
+
+	// 3: data-center + prefer-server.
 	if e.IsDataCenter && e.PreferServerFamily {
-		f, reason := chooseFromServerPreference(e)
+		f, reason := firstAvailable(e, serverFirstOrder)
 		if f == FamilyUnknown {
 			return FamilyUnknown, "data-center GPU + profile prefers server family", ErrNoFamilyAvailable
 		}
 		return f, "data-center GPU + profile prefers server family; " + reason, nil
 	}
 
-	// 5: prefer-open hint.
+	// 4: prefer-open hint (SOFT).
 	if e.PreferOpenFamily {
-		f, reason := chooseFromOpenPreference(e)
+		f, reason := firstAvailable(e, openFirstOrder)
 		if f == FamilyUnknown {
-			return FamilyUnknown, "profile prefers open family", ErrNoOpenAvailable
+			return FamilyUnknown, "profile prefers open family", ErrNoFamilyAvailable
 		}
-		return f, "profile prefers open family; " + reason, nil
+		return f, "profile prefers open family (soft); " + reason, nil
 	}
 
-	// 6: prefer-server hint.
+	// 5: prefer-server hint.
 	if e.PreferServerFamily {
-		f, reason := chooseFromServerPreference(e)
+		f, reason := firstAvailable(e, serverFirstOrder)
 		if f == FamilyUnknown {
 			return FamilyUnknown, "profile prefers server family", ErrNoFamilyAvailable
 		}
 		return f, "profile prefers server family; " + reason, nil
 	}
 
-	// 7: default fall-through. server-open is the safest modern
-	// answer when the operator hasn't expressed a preference.
-	for _, candidate := range []Family{FamilyServerOpen, FamilyServer, FamilyNonServerOpen, FamilyNonServer} {
+	// 6: default fall-through.
+	f, reason := firstAvailable(e, defaultOrder)
+	if f == FamilyUnknown {
+		return FamilyUnknown, "default: no family available", ErrNoFamilyAvailable
+	}
+	return f, "default: " + reason, nil
+}
+
+// Preference orderings. The selector walks the slice in order and
+// returns the first available family.
+var (
+	// openOnlyOrder is used when the GPU REQUIRES the open kernel
+	// module. Only *-open families are considered; closed families
+	// are deliberately absent so we hit ErrNoOpenAvailable rather
+	// than silently installing a doomed closed driver.
+	openOnlyOrder = []Family{FamilyServerOpen, FamilyNonServerOpen}
+
+	// openFirstOrder is the SOFT PreferOpenFamily ordering: open
+	// preferred, but closed accepted as fallback for GPUs that work
+	// with either module.
+	openFirstOrder = []Family{FamilyServerOpen, FamilyNonServerOpen, FamilyServer, FamilyNonServer}
+
+	// serverFirstOrder is the data-center / PreferServerFamily
+	// ordering: closed-first, then open as fallback.
+	serverFirstOrder = []Family{FamilyServer, FamilyServerOpen, FamilyNonServer, FamilyNonServerOpen}
+
+	// defaultOrder is what we pick when the operator expresses no
+	// preference. server-open is the safest modern choice; closed
+	// server is the second-safest; non-server-* is the last resort.
+	defaultOrder = []Family{FamilyServerOpen, FamilyServer, FamilyNonServerOpen, FamilyNonServer}
+)
+
+// firstAvailable returns the first family in order that IsAvailable
+// reports as installable, along with a one-line "why this one" reason.
+func firstAvailable(e Evidence, order []Family) (Family, string) {
+	for i, candidate := range order {
 		if e.IsAvailable(candidate) {
-			return candidate, fmt.Sprintf("default: %s is the safest available choice", candidate), nil
+			if i == 0 {
+				return candidate, fmt.Sprintf("%s available", candidate)
+			}
+			return candidate, fmt.Sprintf("falling back to %s (preferred families ahead of it are not installable)", candidate)
 		}
-	}
-	return FamilyUnknown, "default: no family available", ErrNoFamilyAvailable
-}
-
-// chooseFromOpenPreference picks the best available *-open family.
-// Order: server-open, then non-server-open.
-func chooseFromOpenPreference(e Evidence) (Family, string) {
-	if e.IsAvailable(FamilyServerOpen) {
-		return FamilyServerOpen, "server-open available"
-	}
-	if e.IsAvailable(FamilyNonServerOpen) {
-		return FamilyNonServerOpen, "server-open unavailable; falling back to non-server-open"
-	}
-	return FamilyUnknown, ""
-}
-
-// chooseFromServerPreference picks the best available family with a
-// closed-module-first bias. Order: server, server-open, non-server,
-// non-server-open.
-func chooseFromServerPreference(e Evidence) (Family, string) {
-	if e.IsAvailable(FamilyServer) {
-		return FamilyServer, "server available"
-	}
-	if e.IsAvailable(FamilyServerOpen) {
-		return FamilyServerOpen, "server unavailable; falling back to server-open"
-	}
-	if e.IsAvailable(FamilyNonServer) {
-		return FamilyNonServer, "server / server-open unavailable; falling back to non-server"
-	}
-	if e.IsAvailable(FamilyNonServerOpen) {
-		return FamilyNonServerOpen, "only non-server-open is available"
 	}
 	return FamilyUnknown, ""
 }

@@ -8,14 +8,46 @@ import (
 	"strings"
 )
 
+// EvidenceOptions tunes GatherEvidenceFromHost.
+//
+// DriverMajor scopes the dpkg / apt-cache scan to one specific NVIDIA
+// driver major (e.g. "580"). Defaults to "580" because that is what
+// the hdr-4k120 profile pins. Set to "" to scan a small fallback set
+// of recent majors (580, 570, 560, 550, 535); this is approximate
+// and `doctor` should warn the operator that availability is a
+// best-effort guess in that case.
+//
+// Future fields land here without breaking callers.
+type EvidenceOptions struct {
+	DriverMajor string
+}
+
+// defaultDriverMajor is what we scan when EvidenceOptions.DriverMajor
+// is empty. Matches the hdr-4k120 profile's nvidia.driver_major.
+const defaultDriverMajor = "580"
+
+// fallbackDriverMajors is the approximate scan when no major is
+// configured. Order: newest first.
+var fallbackDriverMajors = []string{"580", "570", "560", "550", "535"}
+
 // GatherEvidenceFromHost shells out to read enough state from the
 // running system to feed SelectFamily / ValidateInstalled.
 //
 // Tolerates missing tools (lspci, dpkg, nvidia-smi, apt-cache) so it
 // can run on a developer box too. Missing evidence is Evidence's
 // zero value, not an error.
-func GatherEvidenceFromHost() (Evidence, error) {
+//
+// The result has AvailabilityKnown=true iff apt-cache was available
+// and the scan completed. Read-only doctor on a dev box without apt
+// gets AvailabilityKnown=false so SelectFamily takes the optimistic
+// path.
+func GatherEvidenceFromHost(opts EvidenceOptions) (Evidence, error) {
 	ev := Evidence{}
+
+	majors := []string{strings.TrimSpace(opts.DriverMajor)}
+	if majors[0] == "" {
+		majors = fallbackDriverMajors
+	}
 
 	// ---- lspci → PCI ID + GPU name ----
 	if lspci, err := exec.LookPath("lspci"); err == nil {
@@ -67,7 +99,7 @@ func GatherEvidenceFromHost() (Evidence, error) {
 		}
 	}
 
-	// ---- dpkg state ----
+	// ---- dpkg state (scoped to majors) ----
 	if dpkg, err := exec.LookPath("dpkg-query"); err == nil {
 		isInstalled := func(pkg string) bool {
 			out, err := exec.Command(dpkg, "-W", "-f=${db:Status-Abbrev}\n", pkg).Output()
@@ -76,7 +108,7 @@ func GatherEvidenceFromHost() (Evidence, error) {
 			}
 			return strings.HasPrefix(strings.TrimSpace(string(out)), "ii ") || strings.TrimSpace(string(out)) == "ii"
 		}
-		for _, major := range []string{"580", "570", "560", "550", "535"} {
+		for _, major := range majors {
 			if isInstalled("nvidia-driver-" + major + "-server") {
 				ev.InstalledServer = true
 			}
@@ -92,7 +124,7 @@ func GatherEvidenceFromHost() (Evidence, error) {
 		}
 	}
 
-	// ---- apt-cache availability ----
+	// ---- apt-cache availability (scoped to majors) ----
 	if aptCache, err := exec.LookPath("apt-cache"); err == nil {
 		hasCandidate := func(pkg string) bool {
 			out, err := exec.Command(aptCache, "policy", pkg).Output()
@@ -108,9 +140,9 @@ func GatherEvidenceFromHost() (Evidence, error) {
 			}
 			return false
 		}
-		// Same major-list scan as for dpkg. Any major being available
-		// is enough to set the flag.
-		for _, major := range []string{"580", "570", "560", "550", "535"} {
+		// apt-cache scan completed (even if everything is unavailable).
+		ev.AvailabilityKnown = true
+		for _, major := range majors {
 			if hasCandidate("nvidia-driver-" + major + "-server") {
 				ev.AvailableServer = true
 			}
@@ -137,6 +169,18 @@ func GatherEvidenceFromHost() (Evidence, error) {
 		return ev, errors.New("nvidia: no NVIDIA GPU or driver evidence found on this host")
 	}
 	return ev, nil
+}
+
+// ScannedMajors reports which driver majors GatherEvidenceFromHost
+// would scan for the given EvidenceOptions. Used by `doctor` to print
+// "availability is approximate" when the operator did not pin a major.
+func ScannedMajors(opts EvidenceOptions) []string {
+	if m := strings.TrimSpace(opts.DriverMajor); m != "" {
+		return []string{m}
+	}
+	out := make([]string, len(fallbackDriverMajors))
+	copy(out, fallbackDriverMajors)
+	return out
 }
 
 func extractGPUName(lspciLine string) string {
