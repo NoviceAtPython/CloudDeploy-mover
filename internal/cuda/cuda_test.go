@@ -42,10 +42,10 @@ func TestParseMode(t *testing.T) {
 
 func TestPlan(t *testing.T) {
 	cases := []struct {
-		mode           Mode
-		willAttempt    bool
-		failsOnError   bool
-		rationaleHas   string
+		mode         Mode
+		willAttempt  bool
+		failsOnError bool
+		rationaleHas string
 	}{
 		{ModeNone, false, false, "skip"},
 		{ModeOptional, true, false, "continues"},

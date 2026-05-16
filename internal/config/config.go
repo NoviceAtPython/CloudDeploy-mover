@@ -188,8 +188,8 @@ type GPUProfile struct {
 // the listed PCI IDs match exactly OR any of the name patterns match
 // (substring or regex, decided by the consumer).
 type GPUMatch struct {
-	PCIIDs        []string `yaml:"pci_ids"`
-	NamePatterns  []string `yaml:"name_patterns"`
+	PCIIDs       []string `yaml:"pci_ids"`
+	NamePatterns []string `yaml:"name_patterns"`
 }
 
 // GPUNVIDIAConfig is the NVIDIA-side overlay.

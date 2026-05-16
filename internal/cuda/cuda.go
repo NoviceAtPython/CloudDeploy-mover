@@ -106,12 +106,12 @@ func Plan(m Mode) PlanResult {
 // Attempt records one outcome of a runfile install attempt. The fields
 // are what the retry-suppressor consults to decide whether to retry.
 type Attempt struct {
-	URL        string
-	Size       int64
-	SHA256     string
-	CheckOK    bool   // did `cuda_*_linux.run --check` succeed?
-	InstallOK  bool   // did the actual install succeed?
-	ErrorTail  string // last few lines of stderr; surfaced in logs
+	URL       string
+	Size      int64
+	SHA256    string
+	CheckOK   bool   // did `cuda_*_linux.run --check` succeed?
+	InstallOK bool   // did the actual install succeed?
+	ErrorTail string // last few lines of stderr; surfaced in logs
 }
 
 // RetryDecider holds the history of runfile attempts and answers

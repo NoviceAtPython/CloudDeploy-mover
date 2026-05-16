@@ -244,6 +244,6 @@ func (RealFS) ReadFile(path string) ([]byte, error)  { return os.ReadFile(path) 
 func (RealFS) WriteFile(path string, data []byte, perm fs.FileMode) error {
 	return os.WriteFile(path, data, perm)
 }
-func (RealFS) Remove(path string) error                       { return os.Remove(path) }
-func (RealFS) Rename(oldpath, newpath string) error           { return os.Rename(oldpath, newpath) }
-func (RealFS) MkdirAll(path string, perm fs.FileMode) error   { return os.MkdirAll(path, perm) }
+func (RealFS) Remove(path string) error                     { return os.Remove(path) }
+func (RealFS) Rename(oldpath, newpath string) error         { return os.Rename(oldpath, newpath) }
+func (RealFS) MkdirAll(path string, perm fs.FileMode) error { return os.MkdirAll(path, perm) }
