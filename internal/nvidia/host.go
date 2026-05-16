@@ -11,18 +11,17 @@ import (
 // GatherEvidenceFromHost shells out to read enough state from the
 // running system to feed SelectFamily / ValidateInstalled.
 //
-// This is the live-host counterpart to the unit-tested decision logic
-// in family.go. It is intentionally tolerant of missing tools
-// (`lspci`, `dpkg`, `nvidia-smi`) so it can run on a dev box too -
-// missing evidence becomes Evidence's zero value, not an error.
+// Tolerates missing tools (lspci, dpkg, nvidia-smi, apt-cache) so it
+// can run on a developer box too. Missing evidence is Evidence's
+// zero value, not an error.
 func GatherEvidenceFromHost() (Evidence, error) {
 	ev := Evidence{}
 
+	// ---- lspci → PCI ID + GPU name ----
 	if lspci, err := exec.LookPath("lspci"); err == nil {
 		out, err := exec.Command(lspci, "-nn").Output()
 		if err == nil {
 			for _, line := range strings.Split(string(out), "\n") {
-				// We only care about NVIDIA GPU rows.
 				if !strings.Contains(line, "NVIDIA Corporation") {
 					continue
 				}
@@ -35,12 +34,26 @@ func GatherEvidenceFromHost() (Evidence, error) {
 			}
 		}
 	}
-	if ev.PCIID != "" {
-		ev.IsBlackwellConsumer = IsBlackwellConsumerPCIID(ev.PCIID)
-		ev.IsDataCenter = IsDataCenterPCIID(ev.PCIID)
+
+	// ---- Classify into Category / Kind + hard-evidence flags ----
+	cls := Classify(ev.GPUName, ev.PCIID)
+	if cls.HardEvidence.IsBlackwellConsumer {
+		ev.IsBlackwellConsumer = true
+	}
+	if cls.HardEvidence.IsBlackwellPro {
+		ev.IsBlackwellPro = true
+	}
+	if cls.HardEvidence.IsBlackwellDC {
+		ev.IsBlackwellDC = true
+	}
+	if cls.HardEvidence.IsDataCenter {
+		ev.IsDataCenter = true
+	}
+	if cls.HardEvidence.IsLegacyPascal {
+		ev.IsLegacyPascal = true
 	}
 
-	// dmesg evidence. dmesg may be root-only; tolerate failure.
+	// ---- dmesg / kern.log: open-kernel-module requirement ----
 	if dmesg, err := exec.LookPath("dmesg"); err == nil {
 		out, err := exec.Command(dmesg, "--ctime", "-l", "warn,err,crit,alert,emerg").Output()
 		if err == nil {
@@ -48,76 +61,99 @@ func GatherEvidenceFromHost() (Evidence, error) {
 		}
 	}
 	if !ev.DmesgRequiresOpenKernelModule {
-		// Fallback: /var/log/kern.log may be readable to non-root.
 		if f, err := os.Open("/var/log/kern.log"); err == nil {
 			ev.DmesgRequiresOpenKernelModule = scanReaderForOpenKernelModuleNotice(f)
 			_ = f.Close()
 		}
 	}
 
-	// dpkg state. Missing dpkg -> all installed flags stay false,
-	// which is correct on a non-Debian dev box.
+	// ---- dpkg state ----
 	if dpkg, err := exec.LookPath("dpkg-query"); err == nil {
-		query := func(pkg string) bool {
+		isInstalled := func(pkg string) bool {
 			out, err := exec.Command(dpkg, "-W", "-f=${db:Status-Abbrev}\n", pkg).Output()
 			if err != nil {
 				return false
 			}
 			return strings.HasPrefix(strings.TrimSpace(string(out)), "ii ") || strings.TrimSpace(string(out)) == "ii"
 		}
-		// Try every major version we currently care about. This is a
-		// short list and rarely changes; expanding it is one PR away.
 		for _, major := range []string{"580", "570", "560", "550", "535"} {
-			if query("nvidia-driver-" + major + "-server") {
+			if isInstalled("nvidia-driver-" + major + "-server") {
 				ev.InstalledServer = true
 			}
-			if query("nvidia-driver-" + major + "-server-open") {
+			if isInstalled("nvidia-driver-" + major + "-server-open") {
 				ev.InstalledServerOpen = true
 			}
-			if query("nvidia-driver-" + major) {
+			if isInstalled("nvidia-driver-" + major) {
 				ev.InstalledNonServer = true
 			}
-			if query("nvidia-driver-" + major + "-open") {
+			if isInstalled("nvidia-driver-" + major + "-open") {
 				ev.InstalledNonServerOpen = true
 			}
 		}
 	}
 
+	// ---- apt-cache availability ----
+	if aptCache, err := exec.LookPath("apt-cache"); err == nil {
+		hasCandidate := func(pkg string) bool {
+			out, err := exec.Command(aptCache, "policy", pkg).Output()
+			if err != nil {
+				return false
+			}
+			for _, line := range strings.Split(string(out), "\n") {
+				line = strings.TrimSpace(line)
+				if strings.HasPrefix(line, "Candidate:") {
+					cand := strings.TrimSpace(strings.TrimPrefix(line, "Candidate:"))
+					return cand != "" && cand != "(none)"
+				}
+			}
+			return false
+		}
+		// Same major-list scan as for dpkg. Any major being available
+		// is enough to set the flag.
+		for _, major := range []string{"580", "570", "560", "550", "535"} {
+			if hasCandidate("nvidia-driver-" + major + "-server") {
+				ev.AvailableServer = true
+			}
+			if hasCandidate("nvidia-driver-" + major + "-server-open") {
+				ev.AvailableServerOpen = true
+			}
+			if hasCandidate("nvidia-driver-" + major) {
+				ev.AvailableNonServer = true
+			}
+			if hasCandidate("nvidia-driver-" + major + "-open") {
+				ev.AvailableNonServerOpen = true
+			}
+		}
+	}
+
+	// ---- nvidia-smi smoke test ----
 	if smi, err := exec.LookPath("nvidia-smi"); err == nil {
 		if err := exec.Command(smi, "-L").Run(); err == nil {
 			ev.NvidiaSmiWorks = true
 		}
 	}
 
-	// At this point we've gathered what we can. Return the
-	// half-filled Evidence; an empty/zero record is also valid (means
-	// "no NVIDIA GPU detected here").
-	if ev.PCIID == "" && !ev.NvidiaSmiWorks && !ev.InstalledServer && !ev.InstalledServerOpen && !ev.InstalledNonServer && !ev.InstalledNonServerOpen {
+	if ev.PCIID == "" && !ev.NvidiaSmiWorks && !anyInstalled(ev) {
 		return ev, errors.New("nvidia: no NVIDIA GPU or driver evidence found on this host")
 	}
 	return ev, nil
 }
 
 func extractGPUName(lspciLine string) string {
-	// Format: "01:00.0 VGA compatible controller [0300]: NVIDIA Corporation GB202 [GeForce RTX 5090] [10de:2b85] (rev a1)"
-	// We want "NVIDIA GeForce RTX 5090" if possible, otherwise fall
-	// back to the substring after "NVIDIA Corporation".
 	const marker = "NVIDIA Corporation "
 	idx := strings.Index(lspciLine, marker)
 	if idx < 0 {
 		return ""
 	}
 	tail := strings.TrimSpace(lspciLine[idx+len(marker):])
-	// Pull the [bracketed marketing name] if present.
 	if open := strings.IndexByte(tail, '['); open >= 0 {
 		if close := strings.IndexByte(tail[open:], ']'); close > 0 {
 			inner := tail[open+1 : open+close]
-			if !strings.Contains(inner, ":") { // not a PCI ID bracket
+			if !strings.Contains(inner, ":") {
 				return "NVIDIA " + inner
 			}
 		}
 	}
-	// Strip trailing " [pciid] (rev ...)".
 	cut := strings.IndexByte(tail, '[')
 	if cut > 0 {
 		tail = strings.TrimSpace(tail[:cut])
@@ -136,7 +172,6 @@ func bytesContainOpenKernelModuleNotice(out []byte) bool {
 
 func scanReaderForOpenKernelModuleNotice(f *os.File) bool {
 	scanner := bufio.NewScanner(f)
-	// Some kern.log lines can be long.
 	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for scanner.Scan() {
 		if lineMatchesOpenKernelModuleNotice(scanner.Text()) {
@@ -153,4 +188,24 @@ func lineMatchesOpenKernelModuleNotice(line string) bool {
 	lower := strings.ToLower(line)
 	return strings.Contains(lower, "requires use of nvidia open kernel modules") ||
 		strings.Contains(lower, "requires use of the nvidia open kernel modules")
+}
+
+// ---- Compatibility wrappers ----
+//
+// IsBlackwellConsumerPCIID / IsDataCenterPCIID predate the Classify
+// API. They remain as thin wrappers so external tests and callers
+// keep compiling while we move the rest of the code over.
+
+// IsBlackwellConsumerPCIID reports true for known GeForce RTX 50-series
+// PCI device IDs.
+func IsBlackwellConsumerPCIID(pciID string) bool {
+	c, ok := classifyByPCIID(pciID)
+	return ok && c.HardEvidence.IsBlackwellConsumer
+}
+
+// IsDataCenterPCIID reports true for known NVIDIA data-center PCI
+// device IDs.
+func IsDataCenterPCIID(pciID string) bool {
+	c, ok := classifyByPCIID(pciID)
+	return ok && c.HardEvidence.IsDataCenter
 }

@@ -1,0 +1,30 @@
+# Datacenter Pascal legacy (P100 / P40 / P4).
+#
+# Pre-Turing NVENC: H.264 only on P40 / P4; P100 has no NVENC at all.
+# No HEVC Main10, no AV1, no HDR. v3 doctor should refuse hdr-4k120
+# on these GPUs with a clear explanation.
+
+match:
+  pci_ids:
+    - "10de:15f7"  # P100 12GB PCIe
+    - "10de:15f8"  # P100 16GB PCIe
+    - "10de:1b38"  # P40
+    - "10de:1bb3"  # P4
+  name_patterns:
+    - "P100"
+    - "P40"
+    - "P4"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "470"
+  notes:
+    - "Pascal legacy GPUs are out of scope for AV1/HDR streaming."
+    - "P100 has no NVENC at all (no encode possible)."
+    - "P40 / P4 have H.264 only; no HEVC Main10, no HDR."
+    - "doctor should refuse the hdr-4k120 profile on these hosts."
+
+streaming:
+  av1_encode: no
+  hdr: no

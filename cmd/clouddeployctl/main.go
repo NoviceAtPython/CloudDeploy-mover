@@ -194,16 +194,34 @@ func newDoctorNvidiaCmd() *cobra.Command {
 				fmt.Printf("doctor nvidia: could not gather evidence: %v\n", err)
 				return nil
 			}
-			fam, reason := nvidia.SelectFamily(ev)
+			cls := nvidia.Classify(ev.GPUName, ev.PCIID)
+			fam, reason, selErr := nvidia.SelectFamily(ev)
 			fmt.Printf("doctor nvidia:\n")
-			fmt.Printf("  Detected GPU         : %s\n", evOrUnknown(ev.GPUName))
-			fmt.Printf("  PCI ID               : %s\n", evOrUnknown(ev.PCIID))
-			fmt.Printf("  Blackwell consumer   : %v\n", ev.IsBlackwellConsumer)
-			fmt.Printf("  dmesg open required  : %v\n", ev.DmesgRequiresOpenKernelModule)
-			fmt.Printf("  Installed (server)   : %v\n", ev.InstalledServer)
-			fmt.Printf("  Installed (server-open): %v\n", ev.InstalledServerOpen)
-			fmt.Printf("  Selected family      : %s\n", fam)
-			fmt.Printf("  Reason               : %s\n", reason)
+			fmt.Printf("  Detected GPU            : %s\n", evOrUnknown(ev.GPUName))
+			fmt.Printf("  PCI ID                  : %s\n", evOrUnknown(ev.PCIID))
+			fmt.Printf("  Classification          : %s / %s\n", cls.Category, cls.Kind)
+			fmt.Printf("  Blackwell (consumer)    : %v\n", ev.IsBlackwellConsumer)
+			fmt.Printf("  Blackwell (workstation) : %v\n", ev.IsBlackwellPro)
+			fmt.Printf("  Blackwell (datacenter)  : %v\n", ev.IsBlackwellDC)
+			fmt.Printf("  Data-center             : %v\n", ev.IsDataCenter)
+			fmt.Printf("  Pascal legacy           : %v\n", ev.IsLegacyPascal)
+			fmt.Printf("  dmesg open required     : %v\n", ev.DmesgRequiresOpenKernelModule)
+			fmt.Printf("  Installed server        : %v\n", ev.InstalledServer)
+			fmt.Printf("  Installed server-open   : %v\n", ev.InstalledServerOpen)
+			fmt.Printf("  Installed non-server    : %v\n", ev.InstalledNonServer)
+			fmt.Printf("  Installed non-server-open: %v\n", ev.InstalledNonServerOpen)
+			fmt.Printf("  Available server        : %v\n", ev.AvailableServer)
+			fmt.Printf("  Available server-open   : %v\n", ev.AvailableServerOpen)
+			fmt.Printf("  Available non-server    : %v\n", ev.AvailableNonServer)
+			fmt.Printf("  Available non-server-open: %v\n", ev.AvailableNonServerOpen)
+			fmt.Printf("  nvidia-smi works        : %v\n", ev.NvidiaSmiWorks)
+			fmt.Printf("  AV1 encode supported    : %v\n", cls.Kind.SupportsAV1Encode())
+			fmt.Printf("  HDR streaming supported : %v\n", cls.Kind.SupportsHDRStreaming())
+			fmt.Printf("  Selected family         : %s\n", fam)
+			fmt.Printf("  Reason                  : %s\n", reason)
+			if selErr != nil {
+				fmt.Printf("  Error                   : %v\n", selErr)
+			}
 			return nil
 		},
 	}

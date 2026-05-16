@@ -1,0 +1,25 @@
+# Datacenter Volta V100.
+#
+# NVENC supports H.264 only (no HEVC Main10, no AV1). HDR streaming
+# path is not viable on V100. v3 doctor surfaces this and refuses
+# the hdr-4k120 profile when the GPU is V100.
+
+match:
+  pci_ids:
+    - "10de:1db4"  # V100 16GB PCIe
+    - "10de:1db5"  # V100 32GB SXM2
+    - "10de:1db6"  # V100 32GB PCIe
+  name_patterns:
+    - "V100"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "V100 NVENC has no HEVC Main10 or AV1. HDR not supported."
+    - "Recommend sdr-safe profile (1080p60 H.264) on V100."
+
+streaming:
+  av1_encode: no
+  hdr: no

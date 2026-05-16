@@ -1,0 +1,34 @@
+# Consumer GeForce Blackwell (RTX 50-series).
+#
+# Replaces / generalises config/gpus/rtx5090.yaml. The selector now
+# uses internal/nvidia.Classify against the name regex
+# "GeForce RTX 50\d\d", so any 50-series SKU is covered without
+# needing a dedicated PCI ID entry.
+#
+# Hard rule: GB202 / Blackwell consumer cannot use the closed kernel
+# module on current driver branches. The deploy MUST pick a *-open
+# package family.
+
+match:
+  pci_ids:
+    - "10de:2b85"  # RTX 5090
+    - "10de:2b87"  # RTX 5090 D
+    - "10de:2c02"  # RTX 5080
+  name_patterns:
+    - "GeForce RTX 5090"
+    - "GeForce RTX 5080"
+    - "GeForce RTX 5070"
+    - "GeForce RTX 50"  # fallback for SKUs added after this commit
+
+nvidia:
+  prefer_open_family: true
+  driver_major_min: "580"
+  notes:
+    - "Closed kernel module unsupported (driver rejects the PCI ID)."
+    - "Open family required: server-open preferred, non-server-open"
+    - "as fallback when server-open is not in apt sources."
+    - "Driver branch >= 580 is the minimum that enumerates Blackwell."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

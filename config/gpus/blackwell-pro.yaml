@@ -1,0 +1,23 @@
+# Workstation Professional Blackwell (RTX PRO Blackwell family).
+#
+# Same kernel-module rule as the consumer Blackwell: closed module
+# unsupported, *-open required. The professional cards typically
+# ship with server-open available in the standard NVIDIA apt sources.
+
+match:
+  name_patterns:
+    - "RTX PRO 6000 Blackwell"
+    - "RTX PRO 5000 Blackwell"
+    - "RTX PRO 4000 Blackwell"
+    - "RTX PRO"
+
+nvidia:
+  prefer_open_family: true
+  driver_major_min: "580"
+  notes:
+    - "Workstation Blackwell requires the open kernel module."
+    - "server-open preferred; non-server-open as fallback."
+
+streaming:
+  av1_encode: yes
+  hdr: yes

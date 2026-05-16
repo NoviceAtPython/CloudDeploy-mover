@@ -1,0 +1,22 @@
+# Datacenter Turing T4.
+#
+# Common cloud GPU. NVENC supports H.264 + HEVC only. HDR streaming
+# is limited to HEVC Main10. Closed module is the canonical choice.
+
+match:
+  pci_ids:
+    - "10de:1eb8"
+  name_patterns:
+    - "T4"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "T4 is a stable cloud baseline; server family is the right answer."
+    - "No NVENC AV1 encoder; HDR via HEVC Main10."
+
+streaming:
+  av1_encode: no
+  hdr: limited

@@ -7,40 +7,21 @@
 //	non-server      nvidia-driver-${MAJOR}                closed kernel module
 //	non-server-open nvidia-driver-${MAJOR}-open           open kernel module
 //
-// Picking the wrong family wedges the deploy. The RTX 5090 / GB202
-// case from the v2 deploy is the motivating example: the standard
-// closed kernel module rejects Blackwell consumer GPUs; the install
-// must use server-open (or non-server-open). v2's selector picked
-// server and then v2's validator refused to accept the manual
-// server-open install the operator performed.
+// Picking the wrong family wedges the deploy. Three v2-era failure
+// modes drive the design here:
+//
+//   - RTX 5090 / GB202 cannot use the closed kernel module on current
+//     driver branches. The deploy MUST pick an *-open package.
+//   - v2's validator demanded `nvidia-driver-580-server` even when the
+//     operator had `nvidia-driver-580-server-open` installed and
+//     working. A working installed family must be preserved.
+//   - The selector must not pick a family that apt cannot install
+//     ("server-open" is the right answer only if `server-open` is
+//     actually available in the configured apt sources).
 //
 // SelectFamily takes a typed Evidence record and returns a typed
-// Family + a human-readable reason. The decision tree is data, not
-// nested if-statements, so it can be table-tested.
-//
-// Inputs (Evidence struct):
-//
-//   - PCIID / GPUName (from lspci -nn)
-//   - IsBlackwellConsumer (heuristic: GeForce RTX 50-series consumer
-//     SKU; closed kernel module unsupported)
-//   - IsDataCenter (L4, A10, A100, H100 - prefer server family)
-//   - DmesgRequiresOpenKernelModule (NVRM message in dmesg)
-//   - InstalledServer / InstalledServerOpen / InstalledNonServer /
-//     InstalledNonServerOpen (dpkg state)
-//   - NvidiaSmiWorks (does nvidia-smi succeed against the running
-//     module?)
-//   - PreferOpenFamily (profile hint, defaults to true for HDR-4K120)
-//   - PreferServerFamily (profile hint for data-center deploys)
-//
-// Validation rules:
-//
-//   - Once a family is selected, the system is considered "correct"
-//     when that family's package is installed AND nvidia-smi works.
-//   - The selector MUST NOT demand server packages when server-open
-//     is the chosen family. v2's bug.
-//
-// All decisions are pure functions of Evidence. Side-effect code lives
-// in apply.go / install.go (Milestone 4).
+// Family + reason + error. Pure function; all I/O lives in host.go
+// and the wider deploy phase.
 package nvidia
 
 import (
@@ -59,6 +40,12 @@ const (
 	FamilyNonServerOpen Family = "non-server-open"
 	FamilyUnknown       Family = ""
 )
+
+// AllFamilies returns every concrete family in a stable order. Used
+// by config validators and by the doctor report.
+func AllFamilies() []Family {
+	return []Family{FamilyServer, FamilyServerOpen, FamilyNonServer, FamilyNonServerOpen}
+}
 
 // IsOpen reports whether the family uses the NVIDIA open kernel module.
 // Blackwell consumer (RTX 50-series) requires this.
@@ -103,27 +90,54 @@ func (f Family) DkmsPackage(major string) string {
 	return ""
 }
 
-// Evidence is the input to SelectFamily.
+// ErrNoOpenAvailable is the structured error returned when the GPU
+// requires an open kernel module family but no *-open package family
+// is available in apt.
+var ErrNoOpenAvailable = errors.New("nvidia: GPU requires the NVIDIA open kernel module but no -open driver package family is available from apt")
+
+// ErrNoFamilyAvailable is returned when none of the four families is
+// available in apt. The driver-major may simply be wrong (e.g. asking
+// for 580 on a release that only ships up to 570).
+var ErrNoFamilyAvailable = errors.New("nvidia: no NVIDIA driver package family is available from apt for the requested driver major")
+
+// Evidence is the input to SelectFamily. All fields are zero-value
+// safe; an empty Evidence is "no evidence", not "all false".
 type Evidence struct {
-	// Hardware
+	// ---- Hardware ----
 	PCIID               string // e.g. "10de:2b85"
 	GPUName             string // e.g. "NVIDIA GeForce RTX 5090"
-	IsBlackwellConsumer bool   // GB202 / RTX 50-series GeForce
-	IsDataCenter        bool   // L4 / A10 / A100 / H100
+	IsBlackwellConsumer bool   // GB202 / RTX 50-series GeForce; closed module unsupported
+	IsBlackwellPro      bool   // RTX PRO Blackwell workstation; closed module unsupported
+	IsBlackwellDC       bool   // B100 / B200 / GB200 datacenter Blackwell; closed module unsupported
+	IsDataCenter        bool   // L4 / L40 / A10 / A100 / H100 / etc.
+	IsLegacyPascal      bool   // P100 / P40 / P4: no AV1, no HDR; surface a warning
 
-	// Kernel evidence
-	DmesgRequiresOpenKernelModule bool // NVRM: "requires use of NVIDIA open kernel modules"
+	// ---- Kernel evidence ----
+	// dmesg NVRM line "requires use of NVIDIA open kernel modules" /
+	// "requires use of the NVIDIA open kernel modules". Highest-priority
+	// signal: if the kernel said so, the kernel said so.
+	DmesgRequiresOpenKernelModule bool
 
-	// dpkg state (mutually-exclusive in practice, but we record all)
+	// ---- dpkg state ----
 	InstalledServer        bool
 	InstalledServerOpen    bool
 	InstalledNonServer     bool
 	InstalledNonServerOpen bool
 
-	// Runtime
+	// ---- apt availability ----
+	// AvailableXxx is true when `apt-cache policy
+	// nvidia-driver-${MAJOR}-xxx` reports a Candidate other than
+	// "(none)". Zero means the package family cannot be installed
+	// on this host (wrong release, repo not enabled, etc.).
+	AvailableServer        bool
+	AvailableServerOpen    bool
+	AvailableNonServer     bool
+	AvailableNonServerOpen bool
+
+	// ---- Runtime ----
 	NvidiaSmiWorks bool
 
-	// Profile hints (from config/profiles/<name>.yaml)
+	// ---- Profile hints (from config/profiles/<name>.yaml) ----
 	PreferOpenFamily   bool
 	PreferServerFamily bool
 }
@@ -155,81 +169,177 @@ func (e Evidence) AlreadyInstalled() Family {
 	return FamilyUnknown
 }
 
-// SelectFamily returns the family the deploy should use, plus a
-// human-readable reason explaining the decision.
-//
-// Precedence (highest wins):
-//  1. dmesg "requires use of NVIDIA open kernel modules" -> open family.
-//  2. Blackwell consumer GPU -> open family.
-//  3. Working installed family + nvidia-smi works -> keep it.
-//  4. Data-center GPU + PreferServerFamily -> server.
-//  5. PreferOpenFamily profile hint -> open family.
-//  6. PreferServerFamily profile hint -> server family.
-//  7. Default -> server-open (safest modern default).
-//
-// The open vs closed axis takes precedence over the server vs
-// non-server axis because picking the wrong open/closed choice can
-// brick the install; picking the wrong server/non-server choice
-// usually still produces a working driver, just from a non-ideal apt
-// channel.
-func SelectFamily(e Evidence) (Family, string) {
-	// 1. dmesg evidence is the strongest signal: the kernel itself
-	//    told us the closed module was rejected.
-	if e.DmesgRequiresOpenKernelModule {
-		return openVariant(e), "dmesg: NVIDIA driver requires open kernel modules"
+// IsAvailable reports whether a specific family is available from apt.
+// Evidence with no availability data populated (the early-evidence
+// case where apt-cache policy hasn't been consulted) treats every
+// family as available so the selector still has a reasonable answer.
+func (e Evidence) IsAvailable(f Family) bool {
+	if !e.HasAvailabilityInfo() {
+		return true
 	}
-
-	// 2. Blackwell consumer GPUs (GB202 = RTX 50-series GeForce)
-	//    cannot use the closed module at all on current driver
-	//    branches; force open regardless of profile hint.
-	if e.IsBlackwellConsumer {
-		return openVariant(e), "Blackwell consumer GPU (e.g. RTX 5090): closed kernel module unsupported"
+	switch f {
+	case FamilyServer:
+		return e.AvailableServer
+	case FamilyServerOpen:
+		return e.AvailableServerOpen
+	case FamilyNonServer:
+		return e.AvailableNonServer
+	case FamilyNonServerOpen:
+		return e.AvailableNonServerOpen
 	}
-
-	// 3. If exactly one family is installed AND nvidia-smi is
-	//    working, the safest thing is to keep it. v2 violated this
-	//    rule for server-open and ended up uninstalling a working
-	//    driver to "fix" a misdetected family.
-	if installed := e.AlreadyInstalled(); installed != FamilyUnknown && e.NvidiaSmiWorks {
-		return installed, fmt.Sprintf("installed family %q already loaded and nvidia-smi works", installed)
-	}
-
-	// 4. Data-center GPU + profile prefers server: server (closed) is
-	//    the canonical NVIDIA recommendation for headless/data-center
-	//    deploys. Open module also works on these but the deploy is
-	//    less likely to surprise an operator who's expecting the
-	//    closed module.
-	if e.IsDataCenter && e.PreferServerFamily {
-		return FamilyServer, "data-center GPU + profile prefers server family"
-	}
-
-	// 5. Open family explicitly preferred by profile.
-	if e.PreferOpenFamily {
-		return openVariant(e), "profile prefers open family"
-	}
-
-	// 6. Server family explicitly preferred by profile (non-data-center).
-	if e.PreferServerFamily {
-		return FamilyServer, "profile prefers server family"
-	}
-
-	// 7. Default: server-open. Open module works on every GPU
-	//    NVIDIA supports today, server channel has the longest
-	//    backport window.
-	return FamilyServerOpen, "default: server-open is the safest modern choice"
+	return false
 }
 
-// openVariant returns server-open or non-server-open based on
-// data-center status and profile hints.
-func openVariant(e Evidence) Family {
-	if e.IsDataCenter || e.PreferServerFamily {
-		return FamilyServerOpen
+// HasAvailabilityInfo reports whether any AvailableXxx flag is set.
+// Used by IsAvailable to distinguish "no apt-cache data" (assume
+// everything available) from "apt-cache says nothing is available"
+// (refuse to pick anything).
+func (e Evidence) HasAvailabilityInfo() bool {
+	return e.AvailableServer || e.AvailableServerOpen ||
+		e.AvailableNonServer || e.AvailableNonServerOpen
+}
+
+// requiresOpenKernelModule returns true if any hard evidence makes
+// the closed kernel module unusable.
+func (e Evidence) requiresOpenKernelModule() bool {
+	return e.DmesgRequiresOpenKernelModule ||
+		e.IsBlackwellConsumer ||
+		e.IsBlackwellPro ||
+		e.IsBlackwellDC
+}
+
+// SelectFamily returns the family the deploy should use, plus a
+// human-readable reason and an error.
+//
+// Precedence (highest wins):
+//
+//  1. dmesg "requires use of NVIDIA open kernel modules"
+//     -> any *-open family that is available, prefer server-open
+//     -> ErrNoOpenAvailable if neither *-open is available.
+//
+//  2. Blackwell GPUs (consumer, pro, or datacenter)
+//     -> same as (1).
+//
+//  3. A single installed family + nvidia-smi works
+//     -> keep it. Skips the v2 regression where the selector
+//        uninstalls a working server-open install.
+//        BUT: skipped when (1) or (2) hit, because the kernel told
+//        us the installed closed module is doomed.
+//
+//  4. Data-center GPU + PreferServerFamily
+//     -> server if available, else server-open, else non-server,
+//        else non-server-open.
+//
+//  5. PreferOpenFamily hint
+//     -> server-open if available, else non-server-open, else error.
+//
+//  6. PreferServerFamily hint
+//     -> server if available, else server-open, else non-server,
+//        else non-server-open.
+//
+//  7. Default
+//     -> server-open if available, else server, else non-server-open,
+//        else non-server, else ErrNoFamilyAvailable.
+//
+// The open vs closed axis takes precedence over server vs non-server
+// because picking the wrong open/closed choice can brick the install;
+// picking the wrong server vs non-server still produces a working
+// driver, just from a non-ideal apt channel.
+func SelectFamily(e Evidence) (Family, string, error) {
+	// 1 & 2: open kernel module required.
+	if e.requiresOpenKernelModule() {
+		f, reason := chooseFromOpenPreference(e)
+		if f == FamilyUnknown {
+			return FamilyUnknown, openRequiredReason(e), ErrNoOpenAvailable
+		}
+		return f, openRequiredReason(e) + "; " + reason, nil
 	}
+
+	// 3: working installed driver wins.
+	if installed := e.AlreadyInstalled(); installed != FamilyUnknown && e.NvidiaSmiWorks {
+		return installed, fmt.Sprintf("installed family %q already loaded and nvidia-smi works", installed), nil
+	}
+
+	// 4: data-center + prefer-server.
+	if e.IsDataCenter && e.PreferServerFamily {
+		f, reason := chooseFromServerPreference(e)
+		if f == FamilyUnknown {
+			return FamilyUnknown, "data-center GPU + profile prefers server family", ErrNoFamilyAvailable
+		}
+		return f, "data-center GPU + profile prefers server family; " + reason, nil
+	}
+
+	// 5: prefer-open hint.
 	if e.PreferOpenFamily {
-		// Profile hint alone leans server-open for the open family.
-		return FamilyServerOpen
+		f, reason := chooseFromOpenPreference(e)
+		if f == FamilyUnknown {
+			return FamilyUnknown, "profile prefers open family", ErrNoOpenAvailable
+		}
+		return f, "profile prefers open family; " + reason, nil
 	}
-	return FamilyServerOpen
+
+	// 6: prefer-server hint.
+	if e.PreferServerFamily {
+		f, reason := chooseFromServerPreference(e)
+		if f == FamilyUnknown {
+			return FamilyUnknown, "profile prefers server family", ErrNoFamilyAvailable
+		}
+		return f, "profile prefers server family; " + reason, nil
+	}
+
+	// 7: default fall-through. server-open is the safest modern
+	// answer when the operator hasn't expressed a preference.
+	for _, candidate := range []Family{FamilyServerOpen, FamilyServer, FamilyNonServerOpen, FamilyNonServer} {
+		if e.IsAvailable(candidate) {
+			return candidate, fmt.Sprintf("default: %s is the safest available choice", candidate), nil
+		}
+	}
+	return FamilyUnknown, "default: no family available", ErrNoFamilyAvailable
+}
+
+// chooseFromOpenPreference picks the best available *-open family.
+// Order: server-open, then non-server-open.
+func chooseFromOpenPreference(e Evidence) (Family, string) {
+	if e.IsAvailable(FamilyServerOpen) {
+		return FamilyServerOpen, "server-open available"
+	}
+	if e.IsAvailable(FamilyNonServerOpen) {
+		return FamilyNonServerOpen, "server-open unavailable; falling back to non-server-open"
+	}
+	return FamilyUnknown, ""
+}
+
+// chooseFromServerPreference picks the best available family with a
+// closed-module-first bias. Order: server, server-open, non-server,
+// non-server-open.
+func chooseFromServerPreference(e Evidence) (Family, string) {
+	if e.IsAvailable(FamilyServer) {
+		return FamilyServer, "server available"
+	}
+	if e.IsAvailable(FamilyServerOpen) {
+		return FamilyServerOpen, "server unavailable; falling back to server-open"
+	}
+	if e.IsAvailable(FamilyNonServer) {
+		return FamilyNonServer, "server / server-open unavailable; falling back to non-server"
+	}
+	if e.IsAvailable(FamilyNonServerOpen) {
+		return FamilyNonServerOpen, "only non-server-open is available"
+	}
+	return FamilyUnknown, ""
+}
+
+func openRequiredReason(e Evidence) string {
+	switch {
+	case e.DmesgRequiresOpenKernelModule:
+		return "dmesg: NVIDIA driver requires open kernel modules"
+	case e.IsBlackwellConsumer:
+		return "Blackwell consumer GPU (e.g. RTX 5090): closed kernel module unsupported"
+	case e.IsBlackwellPro:
+		return "Blackwell RTX PRO workstation GPU: closed kernel module unsupported"
+	case e.IsBlackwellDC:
+		return "Blackwell datacenter GPU (e.g. B100/B200/GB200): closed kernel module unsupported"
+	}
+	return "open kernel module required by hardware"
 }
 
 // ValidateInstalled checks that the installed dpkg state matches the
@@ -245,7 +355,6 @@ func ValidateInstalled(want Family, e Evidence) error {
 	}
 	got := e.AlreadyInstalled()
 	if got == FamilyUnknown {
-		// Either nothing installed, or multiple families installed.
 		switch {
 		case !anyInstalled(e):
 			return fmt.Errorf("nvidia: expected family %q installed; nothing installed", want)
@@ -271,7 +380,6 @@ func anyInstalled(e Evidence) bool {
 // GB202 [GeForce RTX 5090] [10de:2b85] (rev a1)". Returns "" if no
 // match.
 func ParsePCIID(lspciLine string) string {
-	// We don't want to pull in regexp for this; do it by hand.
 	for i := 0; i < len(lspciLine); i++ {
 		if lspciLine[i] != '[' {
 			continue
@@ -302,30 +410,4 @@ func isPCIID(s string) bool {
 		}
 	}
 	return true
-}
-
-// IsBlackwellConsumerPCIID reports true for known GeForce RTX 50-series
-// PCI device IDs. We do not attempt to be exhaustive: only the SKUs
-// CloudDeploy has actually validated against. New SKUs should be added
-// here once seen.
-func IsBlackwellConsumerPCIID(pciID string) bool {
-	switch strings.ToLower(pciID) {
-	case "10de:2b85", // GB202 RTX 5090
-		"10de:2b87", // GB202 RTX 5090 D (China SKU)
-		"10de:2c02": // GB203 RTX 5080
-		return true
-	}
-	return false
-}
-
-// IsDataCenterPCIID reports true for known NVIDIA data-center PCI device
-// IDs that CloudDeploy has validated (L4, etc.).
-func IsDataCenterPCIID(pciID string) bool {
-	switch strings.ToLower(pciID) {
-	case "10de:27b8", // L4
-		"10de:2235", // A10
-		"10de:20b5": // A100 (80GB PCIe)
-		return true
-	}
-	return false
 }

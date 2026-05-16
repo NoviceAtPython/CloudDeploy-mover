@@ -1,0 +1,27 @@
+# Consumer GeForce Ampere (RTX 30-series).
+#
+# Pre-AV1 generation. NVENC supports H.264 and HEVC but not AV1, so
+# the v3 HDR streaming path cannot reach the "AV1 10-bit HDR" success
+# state on these GPUs. v3 will surface that as a clear warning in
+# `doctor` rather than letting Sunshine fail later.
+
+match:
+  pci_ids:
+    - "10de:2204"  # RTX 3090
+    - "10de:2208"  # RTX 3080 Ti
+    - "10de:2206"  # RTX 3080
+  name_patterns:
+    - "GeForce RTX 3090"
+    - "GeForce RTX 30"
+
+nvidia:
+  prefer_open_family: false
+  driver_major_min: "535"
+  notes:
+    - "Ampere consumer supports closed and open kernel modules."
+    - "No NVENC AV1 encoder; HDR streaming is HEVC only or SDR."
+    - "Sunshine fork still works; profile must not assert AV1 HDR."
+
+streaming:
+  av1_encode: no
+  hdr: limited      # HEVC Main10 path only; v3 doctor warns

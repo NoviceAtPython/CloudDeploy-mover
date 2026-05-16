@@ -1,0 +1,26 @@
+# Datacenter Ampere small/mid (A10 / A16 / A40).
+#
+# Pre-AV1 generation: NVENC supports H.264 / HEVC only. Server family
+# preferred.
+
+match:
+  pci_ids:
+    - "10de:2235"  # A10
+    - "10de:25b6"  # A16
+    - "10de:2236"  # A40
+  name_patterns:
+    - "A10"
+    - "A16"
+    - "A40"
+
+nvidia:
+  prefer_open_family: false
+  prefer_server: true
+  driver_major_min: "535"
+  notes:
+    - "Data-center Ampere small/mid: server family preferred."
+    - "No NVENC AV1 encoder; HDR via HEVC Main10."
+
+streaming:
+  av1_encode: no
+  hdr: limited
