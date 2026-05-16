@@ -4042,7 +4042,14 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-hdr = ${ENABLE_HDR}
+# Intentionally NOT writing 'hdr = ...': Sunshine logs
+#   Warning: Unrecognized configurable option [hdr]
+# so the key has no effect in the current fork build. The actual HDR
+# negotiation happens client-side via Moonlight's launch request, which
+# Sunshine maps to AV1 Main10 / pixel_format=P010 / BT.2020 PQ inside the
+# encode-selection code path. Until the fork enforces that path on
+# ENABLE_HDR=1 (see docs/SUNSHINE-HDR-NEGOTIATION.md), writing
+# 'hdr = 1' here just produces a noisy warning.
 fps = [60, ${TARGET_FPS}]
 resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
 stream_audio = disabled
@@ -4326,7 +4333,11 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-hdr = ${ENABLE_HDR}
+# Intentionally NOT writing 'hdr = ...'; the fork prints
+# "Unrecognized configurable option [hdr]" and the option has no effect.
+# HDR is negotiated client-side via Moonlight's launch request; the
+# Sunshine fork is what has to enforce AV1 Main10 / P010 / BT.2020 PQ
+# in the encode-selection path. See docs/SUNSHINE-HDR-NEGOTIATION.md.
 fps = [60, ${TARGET_FPS}]
 resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
 stream_audio = disabled
