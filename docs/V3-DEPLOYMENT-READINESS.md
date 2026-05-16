@@ -45,7 +45,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `validate hdr-stream` | Stub. Milestone 4. |
 | `state show` | **Real**. |
 | `state reset --phase X` | **Real**. |
-| `apply` | **Partial.** Runs `base-packages → nvidia-driver → cuda → edid (opt-in)`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true`). Refuses unsupported Ubuntu versions unless `--allow-unsupported`. |
+| `apply` | **Partial.** Runs `base-packages → nvidia-driver → cuda → edid (opt-in)`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`. |
 | `resume` | **Real**. Reads state, clears RebootNeeded, replays implemented phases. Disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
 | `phase nvidia-driver` | **Real + dirty-driver cleanup planner.** |

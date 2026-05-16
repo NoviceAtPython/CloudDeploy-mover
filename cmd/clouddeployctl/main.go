@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -81,8 +82,8 @@ docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
 Milestone 3 partial:
   doctor apt | nvidia | cuda | system                read-only checks
-  phase base-packages | nvidia-driver | cuda          implemented
-  apply                                                runs the three
+    phase base-packages | nvidia-driver | cuda | edid   implemented
+    apply                                                runs the implemented
                                                        phases above
                                                        then exits with
                                                        a partial-apply
@@ -192,9 +193,11 @@ const partialApplyBanner = `
 ================================================================================
   Milestone 3 partial apply complete.
 
-  Implemented:   base-packages, nvidia-driver, cuda, EDID/GRUB
+  Implemented:   base-packages, nvidia-driver, cuda, edid
   NOT yet:       kwin-patch, sunshine-build, services,
                  HDR DRM validation, HDR stream validation
+
+  Note: The EDID/GRUB phase may write kernel arguments and request a reboot.
 
   For a full deploy that reaches "AV1 10-bit HDR" in Moonlight today,
   use the v2 entrypoint:
@@ -209,14 +212,18 @@ func newApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
 		Short: "Run the implemented phases (Milestone 3 partial)",
-		Long: `Run base-packages, nvidia-driver, and cuda in order, then exit
+		Long: `Run base-packages, nvidia-driver, cuda, and edid in order, then exit
 with a clear partial-apply banner. Each phase is idempotent: re-running
 apply on the same VM skips phases already marked done.
 
-When nvidia-driver requests a reboot, apply writes state, schedules a
-reboot via the clouddeploy-continue.service, and exits 0. After the
+When a phase requests a reboot, apply writes state, schedules a
+reboot via the clouddeploy-continue.service, and exits 2. After the
 reboot the continuation service invokes 'clouddeployctl resume' which
-picks up where apply left off.`,
+picks up where apply left off.
+
+Note: deploy.auto_reboot defaults to false unless explicitly set to true
+in the active profile. When false, the operator must manually run
+'sudo reboot'.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 
@@ -226,7 +233,8 @@ picks up where apply left off.`,
 				return fmt.Errorf("ubuntu gate read: %w", err)
 			}
 			if !res.Supported {
-				fmt.Printf("OS unsupported: %+v\n", res)
+				fmt.Printf("OS unsupported:\n  Found: %s (version %s)\n  Supported: %v\n  Reason: %s\n",
+					res.Release.ID, res.Release.VersionID, ubuntu.SupportedVersions(), res.Reason)
 				if !allowUnsup {
 					return fmt.Errorf("bailing out due to unsupported OS. Use --allow-unsupported to override")
 				}
@@ -638,6 +646,7 @@ func newPhaseCmd() *cobra.Command {
 	p.AddCommand(newPhaseImplCmd("base-packages", phase.BasePackages{}))
 	p.AddCommand(newPhaseImplCmd("nvidia-driver", phase.NvidiaDriver{}))
 	p.AddCommand(newPhaseImplCmd("cuda", phase.Cuda{}))
+	p.AddCommand(newPhaseImplCmd("edid", phase.Edid{}))
 	for _, name := range []string{"kwin-patch", "sunshine-build", "services"} {
 		n := name
 		p.AddCommand(&cobra.Command{
@@ -779,7 +788,7 @@ func newCollectLogsCmd() *cobra.Command {
 			r := runner.New()
 			r.PrintToStdout = false
 
-			archive := "clouddeploy-logs.tar.gz"
+			archive := fmt.Sprintf("/tmp/clouddeploy-logs-%d.tar.gz", time.Now().Unix())
 			fmt.Printf("Collecting logs into %s...\n", archive)
 
 			script := `set -e
@@ -791,6 +800,7 @@ systemctl status clouddeploy*.service > /tmp/cdlogs/systemctl.log || true
 dmesg | grep -i 'nv\|drm' > /tmp/cdlogs/dmesg-nvidia.log || true
 tail -n 2000 /var/log/dpkg.log > /tmp/cdlogs/dpkg.log || true
 tail -n 2000 /var/log/apt/term.log > /tmp/cdlogs/apt-term.log || true
+clouddeployctl state show > /tmp/cdlogs/state-show.txt 2>/dev/null || true
 find /tmp/cdlogs -type f -exec sed -i -E 's/pass(word)?=[^ &]+/pass=REDACTED/gi' {} + || true
 tar -czf ` + archive + ` -C /tmp cdlogs
 rm -rf /tmp/cdlogs`

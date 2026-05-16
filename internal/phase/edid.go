@@ -19,9 +19,9 @@ const EdidName = "edid"
 // Ubuntu 22.04+.
 const EdidGrubDropIn = "/etc/default/grub.d/99-clouddeploy-edid.cfg"
 
-// EdidScriptPath is the helpers/write-edids.py path the phase
+// EdidScriptPath is the scripts/write-edids.py path the phase
 // invokes. Override via Edid.ScriptPath in tests.
-const EdidScriptPath = "/opt/clouddeploy-mover/helpers/write-edids.py"
+const EdidScriptPath = "/opt/clouddeploy-mover/scripts/write-edids.py"
 
 // Edid is the EDID/GRUB phase. Opt-in: only runs when the profile
 // supplies display.forced_connector AND a recognised resolution.
