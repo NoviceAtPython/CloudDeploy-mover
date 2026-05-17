@@ -1,12 +1,19 @@
-# hdr-4k120 - production HDR profile.
+# hdr-4k120 - intended final HDR state.
 #
-# Equivalent of running v2 with ENABLE_HDR=1, TARGET_WIDTH=3840,
-# TARGET_HEIGHT=2160, TARGET_FPS=120, FORCED_CONNECTOR=DP-1, the
-# patched-KWin NVIDIA private HDR path enabled, the Sunshine fork
-# pinned to the known-good HDR commit, and both HDR env knobs on.
+# This profile describes the END STATE the deploy targets:
+#   3840x2160 @ 120 Hz, AV1 NVENC, 10-bit, HDR.
 #
-# See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md for the full
-# state-of-record matching this profile.
+# v3 is NOT yet able to reach this state end-to-end. See
+# docs/V2-V3-PARITY.md for the exact gap. The currently-implemented
+# phases (ubuntu-upgrade, base-packages, nvidia-driver, cuda, edid)
+# are real; KDE / KWin / Sunshine / Tailscale / PipeWire / streaming
+# + HDR validation remain on the v2 path:
+#
+#     sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
+#
+# v2 is the validated end-to-end path. See
+# docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md for the
+# state-of-record this profile reaches once v3 catches up.
 
 profile: hdr-4k120
 ubuntu_version: "25.10"

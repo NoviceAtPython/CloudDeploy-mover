@@ -1,14 +1,15 @@
 // Command clouddeployctl is the v3 CloudDeploy orchestrator entry point.
 //
-// State at Milestone 3 partial: doctor (apt/nvidia/cuda/system) is
-// real and read-only; apply / resume / phase base-packages /
-// nvidia-driver / cuda / edid are real and implemented. The reboot
-// continuation service is implemented. (KWin / Sunshine /
-// KWin/Plasma/Sunshine systemd units / HDR validation are NOT yet
-// implemented; apply exits after the implemented phases with a clear
-// partial-apply banner).
+// State at Milestone 4 (in progress): doctor (apt/nvidia/cuda/system) is
+// real and read-only; apply / resume / phase ubuntu-upgrade /
+// base-packages / nvidia-driver / cuda / edid are real and implemented.
+// The reboot continuation service is implemented. (KWin / Sunshine /
+// KWin/Plasma/Sunshine systemd units / Tailscale / PipeWire / HDR
+// validators are NOT yet implemented; apply exits after the implemented
+// phases with a clear partial-apply banner.)
 //
-// See docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
+// See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability audit,
+// docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
 // docs/V3-ROADMAP.md for milestone-by-milestone status.
 package main
 
@@ -81,13 +82,15 @@ State is persisted in /var/lib/clouddeploy/state.json. Logs go under
 docs/V3-ROADMAP.md for milestone status, and
 docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
-Milestone 3 partial:
-  doctor apt | nvidia | cuda | system                read-only checks
-    phase base-packages | nvidia-driver | cuda | edid   implemented
-    apply                                                runs the implemented
-                                                       phases above
-                                                       then exits with
-                                                       a partial-apply
+Milestone 4 (in progress):
+  doctor apt | nvidia | cuda | system                  read-only checks
+  phase ubuntu-upgrade | base-packages |
+        nvidia-driver | cuda | edid                    implemented
+  apply                                                runs the implemented
+                                                       phases above (in
+                                                       that order) then
+                                                       exits with a
+                                                       partial-apply
                                                        banner
   resume                                               continues after
                                                        a reboot
@@ -192,30 +195,43 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 
 const partialApplyBanner = `
 ================================================================================
-  Milestone 3 partial apply complete.
+  Milestone 4 partial apply complete (v3 is NOT yet v2-equivalent).
 
-  Implemented:   base-packages, nvidia-driver, cuda, edid
-  NOT yet:       kwin-patch, sunshine-build, services,
+  Implemented:   ubuntu-upgrade, base-packages, nvidia-driver, cuda, edid
+  NOT yet:       headless user, cloud-init wait,
+                 KDE/KWin install, patched-KWin HDR build, Sunshine fork
+                 build, Tailscale install, PipeWire virtual sink,
+                 KWin/Plasma/Sunshine systemd units,
                  HDR DRM validation, HDR stream validation
 
-  Note: The EDID/GRUB phase may write kernel arguments and request a reboot.
+  Note: ubuntu-upgrade or the EDID/GRUB phase may write changes that
+        request a reboot. apply will install the continuation service
+        and exit with code 2 in that case; resume picks up afterward.
 
   For a full deploy that reaches "AV1 10-bit HDR" in Moonlight today,
   use the v2 entrypoint:
 
       sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 
-  v3 will own the remaining phases in Milestone 4. See docs/V3-ROADMAP.md.
+  v3 will own the remaining phases in subsequent Milestone 4 sub-cuts.
+  See docs/V2-V3-PARITY.md for the capability audit and
+  docs/V3-ROADMAP.md for milestone-by-milestone status.
 ================================================================================
 `
 
 func newApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
-		Short: "Run the implemented phases (Milestone 3 partial)",
-		Long: `Run base-packages, nvidia-driver, cuda, and edid in order, then exit
-with a clear partial-apply banner. Each phase is idempotent: re-running
-apply on the same VM skips phases already marked done.
+		Short: "Run the implemented phases (Milestone 4 partial)",
+		Long: `Run ubuntu-upgrade, base-packages, nvidia-driver, cuda, and edid
+in order, then exit with a clear partial-apply banner. Each phase is
+idempotent: re-running apply on the same VM skips phases already
+marked done.
+
+ubuntu-upgrade is the first phase because dist-upgrade rewrites the
+apt world; it only acts when profile.ubuntu_version differs from the
+host VERSION_ID AND deploy.auto_upgrade_ubuntu=true. See
+docs/V2-V3-PARITY.md for the supported upgrade hops.
 
 When a phase requests a reboot, apply writes state, schedules a
 reboot via the clouddeploy-continue.service, and exits 2. After the
@@ -237,20 +253,38 @@ in the active profile. When false, the operator must manually run
 			allowUnsup, _ := cmd.Flags().GetBool("allow-unsupported")
 
 			var targetVersion string
+			autoUpgrade := false
 			if deps.Profile != nil {
 				targetVersion = deps.Profile.UbuntuVersion
+				autoUpgrade = deps.Profile.Deploy.AutoUpgradeUbuntu
 			}
 			res, err := ubuntu.ReadAndGate(ubuntu.DefaultOSReleasePath, targetVersion)
 			if err != nil && !os.IsNotExist(err) {
 				return fmt.Errorf("ubuntu gate read: %w", err)
 			}
-			if !res.Supported {
+			// Special case: if the host is currently a v3-supported
+			// release but profile targets a different one, and
+			// deploy.auto_upgrade_ubuntu=true, defer the exact-match
+			// gate to the ubuntu-upgrade phase. Without this, apply
+			// would refuse to run on a fresh 24.04 image even though
+			// ubuntu-upgrade is the whole point of going first.
+			deferToUpgradePhase := false
+			if !res.Supported && autoUpgrade && targetVersion != "" {
+				if ubuntu.IsSupportedVersion(res.Release.VersionID) {
+					deferToUpgradePhase = true
+				}
+			}
+			if !res.Supported && !deferToUpgradePhase {
 				fmt.Printf("OS unsupported:\n  Found: %s (version %s)\n  Supported: %v\n  Reason: %s\n",
 					res.Release.ID, res.Release.VersionID, ubuntu.SupportedVersions(), res.Reason)
 				if !allowUnsup {
 					return fmt.Errorf("bailing out due to unsupported OS. Use --allow-unsupported to override")
 				}
 				fmt.Println("Warning: proceeding anyway due to --allow-unsupported")
+			}
+			if deferToUpgradePhase {
+				fmt.Printf("Host on Ubuntu %s; profile targets %s and deploy.auto_upgrade_ubuntu=true; ubuntu-upgrade phase will reconcile.\n",
+					res.Release.VersionID, targetVersion)
 			}
 
 			err = runPhasesAndBanner(ctx, deps, false)
@@ -267,8 +301,18 @@ in the active profile. When false, the operator must manually run
 }
 
 // runPhasesAndBanner is shared between apply and resume.
+//
+// Order is load-bearing:
+//
+//  1. ubuntu-upgrade: rewrites the apt world; must precede any apt
+//     install. No-op on a host that already matches profile.ubuntu_version.
+//  2. base-packages: build-essential / git / dkms / curl etc.
+//  3. nvidia-driver: picks family + installs the right metapackage.
+//  4. cuda: only if profile.cuda.mode != none.
+//  5. edid: stamps a kernel cmdline edid override if the profile asks.
 func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) error {
 	phases := []phase.Phase{
+		phase.UbuntuUpgrade{},
 		phase.BasePackages{},
 		phase.NvidiaDriver{},
 		phase.Cuda{},
@@ -638,6 +682,7 @@ func newValidateCmd() *cobra.Command {
 
 func newPhaseCmd() *cobra.Command {
 	p := &cobra.Command{Use: "phase [name]"}
+	p.AddCommand(newPhaseImplCmd("ubuntu-upgrade", phase.UbuntuUpgrade{}))
 	p.AddCommand(newPhaseImplCmd("base-packages", phase.BasePackages{}))
 	p.AddCommand(newPhaseImplCmd("nvidia-driver", phase.NvidiaDriver{}))
 	p.AddCommand(newPhaseImplCmd("cuda", phase.Cuda{}))

@@ -46,6 +46,30 @@ type DeployConfig struct {
 	// continuation service. Off by default - the operator opts in
 	// because rebooting a cloud VM is a destructive action.
 	AutoReboot bool `yaml:"auto_reboot"`
+
+	// AutoUpgradeUbuntu, when true, lets the ubuntu-upgrade phase
+	// perform an Ubuntu release upgrade to reach
+	// `profile.ubuntu_version`. Off by default; an operator opts in
+	// because dist-upgrade of a running VM is destructive.
+	AutoUpgradeUbuntu bool `yaml:"auto_upgrade_ubuntu"`
+
+	// AcceptNonLTS unlocks non-LTS target releases (anything ending
+	// in `.10`: 24.10, 25.10, 26.10). Off by default; v3 refuses
+	// non-LTS hops unless the operator explicitly accepts them.
+	AcceptNonLTS bool `yaml:"accept_non_lts"`
+
+	// DirectAptCodenameUpgrade controls whether the ubuntu-upgrade
+	// phase uses the direct apt-source codename rewrite (the only
+	// path that works for 24.04 LTS -> 25.10 questing, since
+	// `do-release-upgrade -d` refuses that hop).
+	//
+	//   "auto"  - default. Use direct rewrite for known-failing hops
+	//             (currently 24.04 -> 25.10), do-release-upgrade
+	//             otherwise.
+	//   "force" - always use direct rewrite.
+	//   "off"   - never use direct rewrite; rely on
+	//             do-release-upgrade.
+	DirectAptCodenameUpgrade string `yaml:"direct_apt_codename_upgrade"`
 }
 
 // DisplayConfig is the target output mode + HDR flag.

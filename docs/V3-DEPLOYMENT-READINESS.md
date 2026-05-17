@@ -1,30 +1,44 @@
 # v3 deployment readiness audit
 
-Refreshed at Milestone 3.5. The goal remains a no-contact deploy on
-an Ubuntu cloud VM with an NVIDIA GPU; this doc keeps the gap
-between "v3 today" and "no-contact full deploy" honest.
+Refreshed after the v2 → v3 parity audit
+([V2-V3-PARITY.md](V2-V3-PARITY.md)). The goal remains a no-contact
+deploy on an Ubuntu cloud VM with an NVIDIA GPU; this doc keeps the
+gap between "v3 today" and "no-contact full deploy" honest.
 
 ## TL;DR — can v3 do a no-contact deploy today?
 
-**No.** v3 today reaches:
+**No.** v3 is NOT equivalent to v2. The full P0 / P1 / P2 audit is in
+[V2-V3-PARITY.md](V2-V3-PARITY.md). v3 today reaches:
 
+* **(this commit) Ubuntu release upgrade**: 24.04 → 25.10 via direct
+  apt codename rewrite, behind `profile.deploy.auto_upgrade_ubuntu`.
 * `base_packages` installed via `apt.Transaction` (deadlock-proof).
-* NVIDIA driver family selected + installed via `nvidia.SelectFamily`.
+* NVIDIA driver family selected + installed via `nvidia.SelectFamily`,
+  with dirty-driver cleanup.
 * CUDA mode policy honoured (none / optional / required).
-* Reboot needed → continuation systemd unit installed + (optionally)
-  `systemctl reboot` triggered automatically.
-* After reboot the continuation service calls
-  `clouddeployctl resume` and finishes the remaining v3-implemented
-  phases.
+* EDID/GRUB cmdline generation (opt-in via `display.forced_connector`).
+* Reboot needed → continuation systemd unit installed; auto-reboot
+  via `profile.deploy.auto_reboot`.
+* `collect-logs` packages /var/log/clouddeploy + state + systemctl +
+  journal + dmesg + apt logs into a tarball.
 
-It does **not** yet build patched KWin, build Sunshine, generate
-runtime systemd units, generate forced EDIDs (this commit adds an
-optional EDID/GRUB phase but only triggers it when the profile opts
-in), wire Tailscale, or validate HDR. Those phases land in the rest
-of Milestone 4.
+It does **not** yet:
 
-For a full deploy that reaches `AV1 10-bit HDR` in Moonlight today,
-v2 is still the only validated path:
+* Create the headless user / sudo / loginctl-linger setup.
+* Block on cloud-init's apt lock (we wait on dpkg locks but not
+  on cloud-init's lifecycle).
+* Repair the snapd / libblockdev / corrupt-`/var/lib/dpkg/updates`
+  failure modes the v2 path handles.
+* Install KDE / Plasma / KWin.
+* Patch / build / install the patched-KWin NVIDIA private HDR path.
+* Build the Sunshine fork at `464bccf1`.
+* Generate the KWin / Plasma / Sunshine systemd units.
+* Wire Tailscale.
+* Install the PipeWire virtual sink.
+* Run the streaming or HDR validators.
+
+Until those land, the only command that reaches Moonlight
+`AV1 10-bit HDR` end-to-end remains the v2 entrypoint:
 
 ```bash
 sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh

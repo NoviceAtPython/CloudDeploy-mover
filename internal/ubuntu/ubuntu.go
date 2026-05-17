@@ -98,6 +98,16 @@ var supportedVersions = map[string]string{
 	"24.04": "supported (LTS); the Plasma 6 / patched-KWin / NVIDIA private HDR path was validated on 25.10",
 }
 
+// IsSupportedVersion reports whether the given VERSION_ID is in the
+// v3 supported list. Useful for callers that want to short-circuit
+// the exact-match gate (e.g. apply defers to the ubuntu-upgrade phase
+// when the host is on a supported release but the profile targets a
+// different one).
+func IsSupportedVersion(versionID string) bool {
+	_, ok := supportedVersions[versionID]
+	return ok
+}
+
 // SupportedVersions returns the version IDs the gate considers OK.
 // Sorted for stable printing.
 func SupportedVersions() []string {
