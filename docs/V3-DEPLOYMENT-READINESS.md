@@ -59,7 +59,8 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `validate hdr-stream` | Stub. Milestone 4. |
 | `state show` | **Real**. |
 | `state reset --phase X` | **Real**. |
-| `apply` | **Partial.** Runs `base-packages → nvidia-driver → cuda → edid (opt-in)`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`. |
+| `apply` | **Partial.** Runs `ubuntu-upgrade → base-packages → nvidia-driver → cuda → edid (opt-in)`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`, but if the host is on a v3-supported release AND `profile.deploy.auto_upgrade_ubuntu=true` AND the profile targets a different supported version, defers the exact-match gate to the ubuntu-upgrade phase. |
+| `phase ubuntu-upgrade` | **Real (this commit).** v3 port of v2's `maybe_upgrade_ubuntu` + `direct_apt_codename_upgrade`. 24.04 → 25.10 path works; anti-reboot-loop guard via `state.Details["pre_version"]`. do-release-upgrade path is stubbed with a clear error (set `deploy.direct_apt_codename_upgrade=force` to skip it). |
 | `resume` | **Real**. Reads state, clears RebootNeeded, replays implemented phases. Disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
 | `phase nvidia-driver` | **Real + dirty-driver cleanup planner.** |
@@ -94,7 +95,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 
 | Phase | Owner | Notes |
 | --- | --- | --- |
-| `ubuntu_upgrade` (optional) | Out of scope for v3 | If release upgrade is needed, do it via the v2 path or a separate Terraform/cloud-init step before invoking v3. |
+| `ubuntu_upgrade` | **v3 real (this commit)** | Direct apt codename rewrite 24.04 → 25.10. Honors `profile.deploy.{auto_upgrade_ubuntu,accept_non_lts,direct_apt_codename_upgrade}`. Reboot-aware. |
 | `base_packages` | **v3 real** | Idempotent. |
 | `nvidia_driver` | **v3 real** | Reboot-aware. |
 | `cuda` | **v3 real** | mode=none default. |
@@ -186,7 +187,15 @@ Findings from sweeping the codebase for misleading text:
 
 ## 7. Acceptance criteria for the next VM test
 
-After this commit, on a fresh Ubuntu 25.10 VM with an NVIDIA GPU:
+The `hdr-4k120` profile now ships with
+`deploy.auto_upgrade_ubuntu: true` + `deploy.accept_non_lts: true` +
+`deploy.direct_apt_codename_upgrade: auto` + `deploy.auto_reboot: false`.
+That means the next VM test can start from **either**:
+
+* a fresh Ubuntu 25.10 cloud image (no release-upgrade hop), or
+* a fresh Ubuntu 24.04 cloud image — the v3 ubuntu-upgrade phase will
+  reconcile to 25.10 via direct apt-source codename rewrite (the same
+  path v2 uses, because `do-release-upgrade -d` refuses 24.04 → 25.10).
 
 ```bash
 sudo CLOUDDEPLOY_RUN=1 PROFILE=hdr-4k120 bash bootstrap.sh
@@ -194,26 +203,38 @@ sudo CLOUDDEPLOY_RUN=1 PROFILE=hdr-4k120 bash bootstrap.sh
 
 Expected behaviour:
 
-1. `doctor system` confirms a supported Ubuntu version (25.10 / 24.04).
-2. `phase base-packages` installs the minimum tooling without dpkg
+1. `doctor system` confirms a v3-supported Ubuntu version (25.10 or
+   24.04). If the host is on 24.04 and the profile targets 25.10,
+   apply defers the exact-match gate to the ubuntu-upgrade phase.
+2. **If the host is on 24.04:** `phase ubuntu-upgrade` disables
+   third-party NVIDIA/CUDA apt sources, purges any stale NVIDIA/CUDA
+   packages, rewrites codenames in `/etc/apt/sources.list.d/ubuntu.sources`
+   + `/etc/apt/sources.list` from `noble` → `questing`, runs
+   `apt-get update` + `apt-get -y dist-upgrade`, sets RebootNeeded.
+   **Apply exits 2 here (auto_reboot=false default); the operator
+   reboots manually and SSHes back in to `sudo clouddeployctl resume`.**
+3. After the upgrade reboot, the host reports VERSION_ID=25.10; the
+   ubuntu-upgrade anti-loop guard confirms forward progress and marks
+   the phase done. Resume continues with the rest.
+4. `phase base-packages` installs the minimum tooling without dpkg
    deadlock.
-3. `phase nvidia-driver` selects the right family (server-open for
+5. `phase nvidia-driver` selects the right family (server-open for
    RTX 5090; either for RTX 4090; server for L4), installs it, runs
    `nvidia-smi` smoke test. If the kernel module did not load
-   without a reboot, sets RebootNeeded.
-4. `phase cuda` skips for `cuda.mode=none`.
-5. `phase edid` generates the 4K120-HDR EDID, writes GRUB cmdline,
-   updates initramfs + grub, sets RebootNeeded.
-6. **If reboot needed:** apply exits 2; continuation unit is enabled;
-   either `systemctl reboot` runs (auto-reboot) or operator does so.
-7. After reboot, `clouddeployctl resume` runs (from the continuation
-   service), `nvidia-smi` works, EDID is reflected on `DP-1`,
-   continuation unit is disabled.
-8. Final exit code is **10** (partial-apply banner) — KWin / Sunshine
-   / services / HDR validation are not implemented.
+   without a reboot, sets RebootNeeded → apply exits 2 again.
+6. After this second reboot, resume runs; `nvidia-smi` works.
+7. `phase cuda` skips for `cuda.mode=none`.
+8. `phase edid` generates the 4K120-HDR EDID, writes GRUB cmdline,
+   updates initramfs + grub, sets RebootNeeded → apply exits 2 a
+   third time. After reboot, resume confirms EDID is reflected on
+   `DP-1` and disables the continuation unit.
+9. Final exit code is **10** (partial-apply banner) — KWin / Sunshine
+   / Tailscale / PipeWire / services / HDR validation are not
+   implemented; **this is NOT a full streaming deploy**. For Moonlight
+   `AV1 10-bit HDR` today, use the v2 entrypoint.
 
-After Milestone 4 lands, the goal is final exit code **0** with
-Moonlight overlay reading `AV1 10-bit HDR`.
+After the rest of Milestone 4 lands, the goal is final exit code **0**
+with Moonlight overlay reading `AV1 10-bit HDR`.
 
 If you need to send the run somewhere for inspection:
 

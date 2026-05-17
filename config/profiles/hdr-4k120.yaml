@@ -55,3 +55,23 @@ sunshine:
 kwin:
   patched_hdr: true
   patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+# deploy: opts the v3 ubuntu-upgrade phase into reconciling the host
+# from a fresh Ubuntu 24.04 cloud image to the profile's target 25.10
+# via the same direct apt-source codename rewrite v2 uses (because
+# `do-release-upgrade -d` refuses the 24.04 -> 25.10 hop).
+#
+#   auto_upgrade_ubuntu       enable the ubuntu-upgrade phase at all
+#   accept_non_lts            unlock non-LTS targets (25.10 is non-LTS)
+#   direct_apt_codename_upgrade  auto/force/off; auto picks direct
+#                                rewrite for known-failing hops
+#   auto_reboot               false = operator SSHes back in and runs
+#                             `sudo clouddeployctl resume` manually
+#                             after each reboot (safer default on a
+#                             cloud VM than letting the orchestrator
+#                             reboot itself unattended)
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false
