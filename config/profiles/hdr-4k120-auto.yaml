@@ -1,0 +1,69 @@
+# hdr-4k120-auto - HDR streaming target, OS chosen by the resolver.
+#
+# This profile lets v3's OS resolver pick the newest v3-supported
+# Ubuntu version that passes the gate set, instead of hardcoding a
+# specific release. As of this commit the candidates are:
+#
+#   - 26.04 (placeholder; rejected today: not yet in v3 supported list)
+#   - 25.10 (validated end-to-end for HDR 4K120; selected today)
+#   - 24.04 (LTS fallback)
+#
+# When 26.04 lands and CloudDeploy validates the streaming stack on
+# it, adding "26.04" to internal/ubuntu.supportedVersions will make
+# this profile auto-upgrade fresh deploys to 26.04 with no profile
+# edit. The cuda phase is intentionally OFF here - layer
+# `hdr-4k120-cuda-auto` on top when CUDA is also required.
+#
+# Compared to hdr-4k120 (which hardcodes ubuntu_version: "25.10"),
+# this profile is the right starting point for "deploy this, and let
+# CloudDeploy figure out the OS".
+
+profile: hdr-4k120-auto
+# The resolver authoritatively picks the version; ubuntu_version is
+# left empty so the resolver's output is the only target.
+ubuntu_version: ""
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: none
+  method: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false
+
+  # OS resolver knobs. The list is newest-first; the resolver picks
+  # the first entry that is in v3's supported list AND passes the
+  # non-LTS gate (and the optional package probe).
+  ubuntu_selection_policy: latest-compatible
+  ubuntu_candidates:
+    - "26.04"
+    - "25.10"
+    - "24.04"
+  prefer_lts: false

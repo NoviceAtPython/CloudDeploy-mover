@@ -70,6 +70,45 @@ type DeployConfig struct {
 	//   "off"   - never use direct rewrite; rely on
 	//             do-release-upgrade.
 	DirectAptCodenameUpgrade string `yaml:"direct_apt_codename_upgrade"`
+
+	// UbuntuSelectionPolicy controls how the ubuntu-upgrade phase
+	// picks an OS target from `UbuntuCandidates`. Mirrors the
+	// CUDA selection-policy model:
+	//
+	//   ""                  - alias for "latest-compatible".
+	//   "latest-compatible" - walk `UbuntuCandidates` newest-first;
+	//                         pick the first one that is a v3-
+	//                         supported version + passes gates.
+	//   "exact"             - require a single candidate that matches
+	//                         exactly. Equivalent to setting
+	//                         Profile.UbuntuVersion and leaving
+	//                         UbuntuCandidates empty.
+	//   "min-version"       - filter out candidates below
+	//                         UbuntuMinVersion (e.g. min "25.10"
+	//                         excludes 24.04).
+	//   "any"               - accept any known candidate (still
+	//                         requires a known codename + non-LTS
+	//                         gate).
+	UbuntuSelectionPolicy string `yaml:"ubuntu_selection_policy"`
+
+	// UbuntuCandidates is the ordered list of Ubuntu VERSION_IDs the
+	// resolver tries newest-first. Empty defaults to "use
+	// Profile.UbuntuVersion only" (the pre-resolver behavior).
+	//
+	// Example (hdr-4k120-auto):
+	//   ubuntu_candidates: ["26.04", "25.10", "24.04"]
+	UbuntuCandidates []string `yaml:"ubuntu_candidates"`
+
+	// UbuntuMinVersion is the lower bound under
+	// UbuntuSelectionPolicy="min-version". Empty otherwise.
+	UbuntuMinVersion string `yaml:"ubuntu_min_version"`
+
+	// PreferLTS is a soft preference recorded in state.Details for
+	// audit. The resolver does NOT reorder the candidate list -- the
+	// operator's list order is authoritative -- but doctor + state
+	// show surface this so an operator can see what the profile
+	// asked for.
+	PreferLTS bool `yaml:"prefer_lts"`
 }
 
 // DisplayConfig is the target output mode + HDR flag.
@@ -336,6 +375,24 @@ func ValidateProfile(p *Profile) error {
 			}
 		}
 	}
+	osPolicy := strings.ToLower(strings.TrimSpace(p.Deploy.UbuntuSelectionPolicy))
+	switch osPolicy {
+	case "", "latest-compatible", "exact", "min-version", "any":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: deploy.ubuntu_selection_policy must be one of latest-compatible/exact/min-version/any, got %q", p.Profile, p.Deploy.UbuntuSelectionPolicy)
+	}
+	for _, v := range p.Deploy.UbuntuCandidates {
+		if !looksLikeUbuntuVersion(v) {
+			return fmt.Errorf("config: profile %q: deploy.ubuntu_candidates entry %q is not an Ubuntu VERSION_ID (e.g. \"24.04\", \"25.10\")", p.Profile, v)
+		}
+	}
+	if osPolicy == "min-version" && strings.TrimSpace(p.Deploy.UbuntuMinVersion) == "" {
+		return fmt.Errorf("config: profile %q: deploy.ubuntu_selection_policy=min-version requires deploy.ubuntu_min_version to be set", p.Profile)
+	}
+	if strings.TrimSpace(p.Deploy.UbuntuMinVersion) != "" && !looksLikeUbuntuVersion(p.Deploy.UbuntuMinVersion) {
+		return fmt.Errorf("config: profile %q: deploy.ubuntu_min_version %q is not an Ubuntu VERSION_ID", p.Profile, p.Deploy.UbuntuMinVersion)
+	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":
 		// ok
@@ -468,6 +525,23 @@ func ValidateGPU(g *GPUProfile) error {
 		return fmt.Errorf("config: gpu profile %q: streaming.hdr must be yes/no/limited, got %q", g.Filename, g.Streaming.HDR)
 	}
 	return nil
+}
+
+// looksLikeUbuntuVersion accepts a "YY.MM" Ubuntu VERSION_ID (e.g.
+// "22.04", "24.04", "25.10", "26.04"). Used by the deploy.ubuntu_*
+// validators.
+func looksLikeUbuntuVersion(s string) bool {
+	v := strings.TrimSpace(s)
+	if len(v) != 5 || v[2] != '.' {
+		return false
+	}
+	for _, idx := range []int{0, 1, 3, 4} {
+		c := v[idx]
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isValidRepoCandidate accepts "auto-host" (case-insensitive) or a

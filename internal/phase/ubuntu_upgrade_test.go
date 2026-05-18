@@ -262,6 +262,76 @@ func TestUbuntuUpgrade_StageMid_ContinuesIdempotent(t *testing.T) {
 	}
 }
 
+// TestUbuntuUpgrade_Resolver_PicksFirstSupported is the brief's
+// central OS-resolver case: candidates list newest-first, the
+// resolver rejects 26.04 (not in v3 supported list) and selects
+// 25.10. State.Details should record the full trail.
+func TestUbuntuUpgrade_Resolver_PicksFirstSupported(t *testing.T) {
+	p := profileForUpgrade("", true, true, "auto")
+	p.Deploy.UbuntuSelectionPolicy = "latest-compatible"
+	p.Deploy.UbuntuCandidates = []string{"26.04", "25.10", "24.04"}
+	deps := upgradeDeps(t, p)
+
+	// Host is already 25.10 -> after the resolver picks 25.10, the
+	// PlanUpgrade returns UpgradeNoop (current == target).
+	ph := UbuntuUpgrade{
+		CurrentVersionFn: func() string { return "25.10" },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := deps.State.Get(UbuntuUpgradeName).Status; got != state.StatusDone {
+		t.Errorf("status: got %q want done", got)
+	}
+	d := deps.State.Get(UbuntuUpgradeName).Details
+	if d["selected_ubuntu_version"] != "25.10" {
+		t.Errorf("selected_ubuntu_version: got %v want 25.10", d["selected_ubuntu_version"])
+	}
+	if d["selected_ubuntu_codename"] != "questing" {
+		t.Errorf("selected_ubuntu_codename: got %v want questing", d["selected_ubuntu_codename"])
+	}
+	tried, _ := d["ubuntu_candidates_tried"].([]string)
+	if len(tried) == 0 || tried[0] != "26.04" {
+		t.Errorf("ubuntu_candidates_tried: got %v want [26.04, ...]", tried)
+	}
+	rejected, _ := d["rejected_ubuntu_candidates"].(map[string]string)
+	if rejected["26.04"] == "" {
+		t.Errorf("rejected_ubuntu_candidates should record 26.04; got %v", rejected)
+	}
+	if d["ubuntu_selection_policy"] != "latest-compatible" {
+		t.Errorf("ubuntu_selection_policy: got %v want latest-compatible", d["ubuntu_selection_policy"])
+	}
+}
+
+// TestUbuntuUpgrade_Resolver_PackageProbeOverridesPick: a profile-
+// supplied probe rejects 25.10 even though it would otherwise pass;
+// the resolver falls through to 24.04.
+func TestUbuntuUpgrade_Resolver_PackageProbeOverridesPick(t *testing.T) {
+	p := profileForUpgrade("", true, true, "auto")
+	p.Deploy.UbuntuSelectionPolicy = "latest-compatible"
+	p.Deploy.UbuntuCandidates = []string{"25.10", "24.04"}
+	deps := upgradeDeps(t, p)
+
+	ph := UbuntuUpgrade{
+		CurrentVersionFn: func() string { return "24.04" },
+		OSPackageProbeFn: func(v string) (bool, string) {
+			if v == "25.10" {
+				return false, "kde-plasma not yet built for questing"
+			}
+			return true, ""
+		},
+	}
+	_ = ph.Run(context.Background(), deps)
+	d := deps.State.Get(UbuntuUpgradeName).Details
+	if d["selected_ubuntu_version"] != "24.04" {
+		t.Errorf("probe should push selection to 24.04; got %v", d["selected_ubuntu_version"])
+	}
+	rejected, _ := d["rejected_ubuntu_candidates"].(map[string]string)
+	if r := rejected["25.10"]; !strings.Contains(r, "package probe rejected") {
+		t.Errorf("rejected_ubuntu_candidates[25.10] should explain probe rejection; got %q", r)
+	}
+}
+
 func TestUbuntuUpgrade_BadDirectPolicy_FailsFatal(t *testing.T) {
 	deps := upgradeDeps(t, profileForUpgrade("25.10", true, true, "maybe"))
 	ph := UbuntuUpgrade{

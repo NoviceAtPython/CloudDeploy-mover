@@ -255,9 +255,11 @@ in the active profile. When false, the operator must manually run
 
 			var targetVersion string
 			autoUpgrade := false
+			useResolver := false
 			if deps.Profile != nil {
 				targetVersion = deps.Profile.UbuntuVersion
 				autoUpgrade = deps.Profile.Deploy.AutoUpgradeUbuntu
+				useResolver = len(deps.Profile.Deploy.UbuntuCandidates) > 0
 			}
 			res, err := ubuntu.ReadAndGate(ubuntu.DefaultOSReleasePath, targetVersion)
 			if err != nil && !os.IsNotExist(err) {
@@ -269,8 +271,13 @@ in the active profile. When false, the operator must manually run
 			// gate to the ubuntu-upgrade phase. Without this, apply
 			// would refuse to run on a fresh 24.04 image even though
 			// ubuntu-upgrade is the whole point of going first.
+			//
+			// Same deferral applies when the profile uses the OS
+			// resolver (ubuntu_version="" + ubuntu_candidates=[...]):
+			// the resolver authoritatively picks a target during the
+			// phase, so the exact-match gate is meaningless here.
 			deferToUpgradePhase := false
-			if !res.Supported && autoUpgrade && targetVersion != "" {
+			if !res.Supported && autoUpgrade && (targetVersion != "" || useResolver) {
 				if ubuntu.IsSupportedVersion(res.Release.VersionID) {
 					deferToUpgradePhase = true
 				}
@@ -284,8 +291,13 @@ in the active profile. When false, the operator must manually run
 				fmt.Println("Warning: proceeding anyway due to --allow-unsupported")
 			}
 			if deferToUpgradePhase {
-				fmt.Printf("Host on Ubuntu %s; profile targets %s and deploy.auto_upgrade_ubuntu=true; ubuntu-upgrade phase will reconcile.\n",
-					res.Release.VersionID, targetVersion)
+				if useResolver {
+					fmt.Printf("Host on Ubuntu %s; profile uses ubuntu_candidates=%v and deploy.auto_upgrade_ubuntu=true; ubuntu-upgrade phase will resolve a target.\n",
+						res.Release.VersionID, deps.Profile.Deploy.UbuntuCandidates)
+				} else {
+					fmt.Printf("Host on Ubuntu %s; profile targets %s and deploy.auto_upgrade_ubuntu=true; ubuntu-upgrade phase will reconcile.\n",
+						res.Release.VersionID, targetVersion)
+				}
 			}
 
 			err = runPhasesAndBanner(ctx, deps, false)

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/ubuntu"
 )
@@ -52,6 +53,40 @@ const (
 	UbuntuStageRebootRequired      UbuntuUpgradeStage = "reboot-required"
 )
 
+// buildOSResolverDetails turns a profile + resolver result into the
+// state.Details fields the brief asks for. Always returns a non-nil
+// map; entries are only populated when the input has meaningful data.
+func buildOSResolverDetails(profile *config.Profile, policy ubuntu.OSSelectionPolicy, res ubuntu.OSResolverResult) map[string]any {
+	out := map[string]any{}
+	if profile == nil {
+		return out
+	}
+	if profile.Deploy.UbuntuSelectionPolicy != "" || len(profile.Deploy.UbuntuCandidates) > 0 {
+		out["ubuntu_selection_policy"] = string(policy)
+	}
+	if len(profile.Deploy.UbuntuCandidates) > 0 {
+		out["ubuntu_candidates_configured"] = profile.Deploy.UbuntuCandidates
+	}
+	if len(res.Tried) > 0 {
+		tried := make([]string, 0, len(res.Tried))
+		for _, c := range res.Tried {
+			tried = append(tried, c.Version)
+		}
+		out["ubuntu_candidates_tried"] = tried
+	}
+	if res.Selected != "" {
+		out["selected_ubuntu_version"] = res.Selected
+		out["selected_ubuntu_codename"] = res.SelectedCodename
+	}
+	if reasons := res.RejectedReasons(); len(reasons) > 0 {
+		out["rejected_ubuntu_candidates"] = reasons
+	}
+	if profile.Deploy.PreferLTS {
+		out["prefer_lts"] = true
+	}
+	return out
+}
+
 // stageRequiresAdvance reports whether the recorded stage represents
 // "the dist-upgrade actually finished". When true AND
 // currentVersion == pre_version, the anti-loop guard fires.
@@ -85,6 +120,13 @@ type UbuntuUpgrade struct {
 	// apt.Transaction. nil = run the real path. Tests use this to
 	// exercise the stage-marker anti-loop guard cross-platform.
 	DirectRewriteHookFn func() error
+
+	// OSPackageProbeFn is the optional per-candidate hook the OS
+	// resolver calls to ask "would the profile's required packages
+	// install on this Ubuntu version?". nil = no probe (trust the
+	// codename map + v3-supported list). Tests use this to simulate
+	// "package X not yet available on 26.04".
+	OSPackageProbeFn ubuntu.PackageProbeFn
 }
 
 // Name implements Phase.
@@ -135,6 +177,8 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 	autoUpgrade := false
 	acceptNonLTS := false
 	policy := ubuntu.PolicyAuto
+	var resolved ubuntu.OSResolverResult
+	osPolicy := ubuntu.OSPolicyLatestCompatible
 	if deps.Profile != nil {
 		targetVer = deps.Profile.UbuntuVersion
 		autoUpgrade = deps.Profile.Deploy.AutoUpgradeUbuntu
@@ -145,6 +189,39 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 			deps.State.MarkFailed(UbuntuUpgradeName, "parse profile.deploy.direct_apt_codename_upgrade", err, true)
 			_ = deps.PersistState()
 			return fmt.Errorf("phase ubuntu-upgrade: %w", err)
+		}
+		if osPol, err := ubuntu.ParseOSSelectionPolicy(deps.Profile.Deploy.UbuntuSelectionPolicy); err == nil {
+			osPolicy = osPol
+		} else {
+			deps.State.MarkFailed(UbuntuUpgradeName, "parse profile.deploy.ubuntu_selection_policy", err, true)
+			_ = deps.PersistState()
+			return fmt.Errorf("phase ubuntu-upgrade: %w", err)
+		}
+		// Resolver: if the operator gave us a candidate list, walk it
+		// newest-first. The first candidate that passes the gate set
+		// (codename-known + v3-supported + non-LTS gate + optional
+		// package probe) wins. Falls back to Profile.UbuntuVersion
+		// (the pre-resolver behavior) when the list is empty.
+		if len(deps.Profile.Deploy.UbuntuCandidates) > 0 {
+			in := ubuntu.OSResolverInputs{
+				CurrentVersion: currentVer,
+				Candidates:     deps.Profile.Deploy.UbuntuCandidates,
+				MinVersion:     deps.Profile.Deploy.UbuntuMinVersion,
+				Policy:         osPolicy,
+				AcceptNonLTS:   acceptNonLTS,
+				PreferLTS:      deps.Profile.Deploy.PreferLTS,
+				Probe:          p.OSPackageProbeFn,
+			}
+			resolved = ubuntu.ResolveOSTarget(in)
+			log.Info("phase ubuntu-upgrade: OS resolver",
+				"policy", osPolicy,
+				"candidates", deps.Profile.Deploy.UbuntuCandidates,
+				"selected", resolved.Selected,
+				"selected_codename", resolved.SelectedCodename,
+				"rejected", resolved.RejectedReasons())
+			if resolved.Selected != "" {
+				targetVer = resolved.Selected
+			}
 		}
 	}
 
@@ -183,13 +260,19 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 			"pre_version", pre, "current_version", currentVer, "stage", stage)
 	}
 
+	resolverDetails := buildOSResolverDetails(deps.Profile, osPolicy, resolved)
+
 	switch plan.Action {
 	case ubuntu.UpgradeNoop:
-		deps.State.MarkDone(UbuntuUpgradeName, map[string]any{
+		doneDetails := map[string]any{
 			"current_version": currentVer,
 			"target_version":  targetVer,
 			"action":          plan.Action.String(),
-		})
+		}
+		for k, v := range resolverDetails {
+			doneDetails[k] = v
+		}
+		deps.State.MarkDone(UbuntuUpgradeName, doneDetails)
 		_ = deps.PersistState()
 		return nil
 
@@ -199,16 +282,25 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 		// by the wrapped error.
 		if errors.Is(plan.Err, ubuntu.ErrNoTargetVersion) {
 			deps.State.MarkSkipped(UbuntuUpgradeName, plan.Reason)
+			for k, v := range resolverDetails {
+				deps.State.Get(UbuntuUpgradeName).Details[k] = v
+			}
 			_ = deps.PersistState()
 			log.Info("phase ubuntu-upgrade: skipped (no target)")
 			return nil
 		}
 		deps.State.MarkFailed(UbuntuUpgradeName, plan.Reason, plan.Err, true)
+		for k, v := range resolverDetails {
+			deps.State.Get(UbuntuUpgradeName).Details[k] = v
+		}
 		_ = deps.PersistState()
 		return fmt.Errorf("phase ubuntu-upgrade: %w (%s)", plan.Err, plan.Reason)
 
 	case ubuntu.UpgradeRefusedNonLTS, ubuntu.UpgradeRefusedUnknownHop:
 		deps.State.MarkFailed(UbuntuUpgradeName, plan.Reason, plan.Err, true)
+		for k, v := range resolverDetails {
+			deps.State.Get(UbuntuUpgradeName).Details[k] = v
+		}
 		_ = deps.PersistState()
 		return fmt.Errorf("phase ubuntu-upgrade: %w (%s)", plan.Err, plan.Reason)
 
@@ -216,6 +308,9 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 		err := errors.New("phase ubuntu-upgrade: do-release-upgrade path is NOT yet implemented in v3; set deploy.direct_apt_codename_upgrade=force or wait for Milestone 4.1")
 		deps.State.MarkFailed(UbuntuUpgradeName,
 			"do-release-upgrade path missing from v3", err, true)
+		for k, v := range resolverDetails {
+			deps.State.Get(UbuntuUpgradeName).Details[k] = v
+		}
 		_ = deps.PersistState()
 		return err
 
@@ -223,7 +318,7 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 		if p.DirectRewriteHookFn != nil {
 			return p.DirectRewriteHookFn()
 		}
-		return p.runDirectCodenameRewrite(ctx, deps, plan, currentVer, log)
+		return p.runDirectCodenameRewrite(ctx, deps, plan, currentVer, resolverDetails, log)
 	}
 
 	err := fmt.Errorf("unexpected upgrade action %s", plan.Action)
@@ -232,7 +327,7 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 	return err
 }
 
-func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps, plan ubuntu.UpgradePlan, currentVer string, log *slog.Logger) error {
+func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps, plan ubuntu.UpgradePlan, currentVer string, resolverDetails map[string]any, log *slog.Logger) error {
 	deps.State.MarkRunning(UbuntuUpgradeName)
 	// Stash / extend Details. We preserve any stage marker from a
 	// previous attempt so the per-stage idempotency logic below knows
@@ -249,6 +344,9 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 		"target_codename":  plan.TargetCodename,
 		"action":           plan.Action.String(),
 		"stage":            string(UbuntuStageStarted),
+	}
+	for k, v := range resolverDetails {
+		details[k] = v
 	}
 	deps.State.Get(UbuntuUpgradeName).Details = details
 	_ = deps.PersistState()

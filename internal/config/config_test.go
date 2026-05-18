@@ -167,6 +167,73 @@ func TestHDRCudaCompatibleProfileSpec(t *testing.T) {
 	}
 }
 
+// TestHDRAutoProfileSpec exercises the OS-resolver-driven HDR profile.
+// ubuntu_version is intentionally empty; the resolver picks the OS.
+func TestHDRAutoProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-auto")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-auto): %v", err)
+	}
+	if p.UbuntuVersion != "" {
+		t.Errorf("auto profile must leave ubuntu_version empty; got %q", p.UbuntuVersion)
+	}
+	if p.Deploy.UbuntuSelectionPolicy != "latest-compatible" {
+		t.Errorf("ubuntu_selection_policy: got %q want latest-compatible", p.Deploy.UbuntuSelectionPolicy)
+	}
+	want := []string{"26.04", "25.10", "24.04"}
+	if len(p.Deploy.UbuntuCandidates) != len(want) {
+		t.Errorf("ubuntu_candidates: got %v want %v", p.Deploy.UbuntuCandidates, want)
+	} else {
+		for i, v := range want {
+			if p.Deploy.UbuntuCandidates[i] != v {
+				t.Errorf("ubuntu_candidates[%d]: got %q want %q", i, p.Deploy.UbuntuCandidates[i], v)
+			}
+		}
+	}
+	if strings.ToLower(p.CUDA.Mode) != "none" {
+		t.Errorf("auto profile cuda.mode should be none; got %q", p.CUDA.Mode)
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-auto): %v", err)
+	}
+}
+
+// TestHDRCudaAutoProfileSpec exercises the combined OS+CUDA-resolver
+// profile: both the Ubuntu candidate list AND the cross-distro CUDA
+// candidate list are populated.
+func TestHDRCudaAutoProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-cuda-auto")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-cuda-auto): %v", err)
+	}
+	if p.UbuntuVersion != "" {
+		t.Errorf("cuda-auto profile must leave ubuntu_version empty; got %q", p.UbuntuVersion)
+	}
+	if p.Deploy.UbuntuSelectionPolicy != "latest-compatible" {
+		t.Errorf("ubuntu_selection_policy: got %q want latest-compatible", p.Deploy.UbuntuSelectionPolicy)
+	}
+	wantOS := []string{"26.04", "25.10", "24.04"}
+	for i, v := range wantOS {
+		if i >= len(p.Deploy.UbuntuCandidates) || p.Deploy.UbuntuCandidates[i] != v {
+			t.Errorf("ubuntu_candidates[%d]: got %v want %q", i, p.Deploy.UbuntuCandidates, v)
+		}
+	}
+	if !p.CUDA.AllowCrossDistroCudaRepo {
+		t.Error("cuda.allow_cross_distro_cuda_repo must be true")
+	}
+	if p.CUDA.PreferMajor != "13" {
+		t.Errorf("cuda.prefer_major: got %q want 13", p.CUDA.PreferMajor)
+	}
+	if !p.CUDA.CompileSmokeTest {
+		t.Error("cuda.compile_smoke_test must be true")
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-cuda-auto): %v", err)
+	}
+}
+
 // TestHDRCudaNativeProfileSpec exercises the diagnostic native-only
 // profile. It pins auto-host with no cross-distro / archive / runfile
 // fallback so a failure is the answer to "does NVIDIA officially
@@ -384,6 +451,19 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.CUDA.AllowCrossDistroCudaRepo = false
 			p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
 		}, "allow_cross_distro_cuda_repo"},
+		{"bad ubuntu_selection_policy", func(p *Profile) {
+			p.Deploy.UbuntuSelectionPolicy = "yolo"
+		}, "ubuntu_selection_policy"},
+		{"bad ubuntu_candidates entry", func(p *Profile) {
+			p.Deploy.UbuntuCandidates = []string{"24.04", "ubuntu2510"}
+		}, "ubuntu_candidates"},
+		{"min-version without min_version", func(p *Profile) {
+			p.Deploy.UbuntuSelectionPolicy = "min-version"
+			p.Deploy.UbuntuMinVersion = ""
+		}, "ubuntu_min_version"},
+		{"bad ubuntu_min_version", func(p *Profile) {
+			p.Deploy.UbuntuMinVersion = "questing"
+		}, "ubuntu_min_version"},
 	}
 	base := func() *Profile {
 		return &Profile{
