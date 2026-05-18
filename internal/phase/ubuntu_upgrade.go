@@ -410,16 +410,23 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 		}
 
 		// 3. Purge old NVIDIA/CUDA packages so we don't drag a stale
-		//    closed-driver stack into the new codename.
-		log.Info("phase ubuntu-upgrade: purging old NVIDIA/CUDA before codename rewrite")
+		//    closed-driver stack into the new codename. Also purge
+		//    snapd: on live VMs its postinst has half-failed during
+		//    25.10 dist-upgrade, leaving the system in a broken
+		//    state including a clobbered /etc/sudoers (which is why
+		//    apt-health writes /etc/sudoers.d/90-clouddeploy-<user>
+		//    earlier). CloudDeploy does not need snapd; uninstalling
+		//    it pre-emptively removes the failure mode entirely.
+		log.Info("phase ubuntu-upgrade: purging old NVIDIA/CUDA + snapd before codename rewrite")
 		if err := tc.Purge(ctx, []string{
 			"cuda-*", "nsight-*",
 			"nvidia-*", "libnvidia-*",
 			"xserver-xorg-video-nvidia-*",
+			"snapd",
 		}); err != nil {
 			// Purge of non-installed wildcards is non-fatal in apt;
 			// log + continue.
-			log.Warn("phase ubuntu-upgrade: pre-upgrade NVIDIA/CUDA purge non-fatal warning",
+			log.Warn("phase ubuntu-upgrade: pre-upgrade NVIDIA/CUDA/snapd purge non-fatal warning",
 				"err", err)
 		}
 

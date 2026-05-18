@@ -67,6 +67,54 @@ CLOUDDEPLOY_BRANCH="${CLOUDDEPLOY_BRANCH:-v3}"
 CLOUDDEPLOY_GO_VERSION="${CLOUDDEPLOY_GO_VERSION:-1.22.7}"
 CLOUDDEPLOY_RUN="${CLOUDDEPLOY_RUN:-1}"
 
+dpkg_health_preflight() {
+    # Best-effort: detect a corrupt /var/lib/dpkg/updates journal
+    # before we try to apt-get install golang-go. If `dpkg --audit`
+    # errors out AND the journal directory has numeric entries,
+    # quarantine those files and run `dpkg --configure -a`. This is
+    # the same recipe `phase apt-health` runs later, but bootstrap
+    # needs it earlier so the very first apt-get call doesn't half-
+    # configure the toolchain on a broken dpkg.
+    [[ -d /var/lib/dpkg/updates ]] || return 0
+    if dpkg --audit >/dev/null 2>/tmp/clouddeploy-dpkg-audit.err; then
+        return 0
+    fi
+    if ! grep -q '/var/lib/dpkg/updates' /tmp/clouddeploy-dpkg-audit.err 2>/dev/null; then
+        # Audit errored for some other reason. Surface it but don't
+        # quarantine the journal blindly.
+        log "dpkg --audit failed; head of stderr:"
+        head -n 5 /tmp/clouddeploy-dpkg-audit.err 2>/dev/null || true
+        return 0
+    fi
+    local ts backup
+    ts="$(date -u +%Y%m%d-%H%M%S)"
+    backup="/var/lib/clouddeploy/backups/dpkg-updates-${ts}"
+    log "dpkg journal looks corrupt; quarantining numeric files to ${backup}"
+    install -d -m 0700 "$(dirname "${backup}")"
+    install -d -m 0700 "${backup}"
+    shopt -s nullglob
+    local f moved=0
+    for f in /var/lib/dpkg/updates/[0-9]*; do
+        [[ -f "$f" ]] || continue
+        case "$(basename "$f")" in
+            *[!0-9]*) ;;  # skip non-pure-numeric
+            *)
+                mv "$f" "${backup}/"
+                moved=$((moved + 1))
+                ;;
+        esac
+    done
+    shopt -u nullglob
+    log "dpkg journal: moved ${moved} file(s) to ${backup}"
+    if ! dpkg --configure -a; then
+        die "dpkg --configure -a failed after quarantining journal; rerun manually and inspect ${backup}"
+    fi
+    if ! DEBIAN_FRONTEND=noninteractive apt-get -f install -y; then
+        die "apt-get -f install failed after dpkg journal quarantine; rerun manually and inspect ${backup}"
+    fi
+    log "dpkg health preflight: repair complete"
+}
+
 wait_for_apt_lock() {
     # Wait up to ~3 minutes for apt-daily / unattended-upgrades /
     # someone-else's apt to release the dpkg + apt locks. We don't try
@@ -118,6 +166,7 @@ ensure_go() {
     # Try apt first.
     if command -v apt-get >/dev/null 2>&1; then
         log "Installing golang-go via apt..."
+        dpkg_health_preflight
         wait_for_apt_lock
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
         wait_for_apt_lock

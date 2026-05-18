@@ -198,7 +198,7 @@ const partialApplyBanner = `
 ================================================================================
   Milestone 4 partial apply complete (v3 is NOT yet v2-equivalent).
 
-  Implemented:   ubuntu-upgrade, base-packages, nvidia-driver, cuda, edid
+  Implemented:   apt-health, ubuntu-upgrade, base-packages, nvidia-driver, cuda, edid
   NOT yet:       headless user, cloud-init wait,
                  KDE/KWin install, patched-KWin HDR build, Sunshine fork
                  build, Tailscale install, PipeWire virtual sink,
@@ -317,14 +317,19 @@ in the active profile. When false, the operator must manually run
 //
 // Order is load-bearing:
 //
-//  1. ubuntu-upgrade: rewrites the apt world; must precede any apt
+//  1. apt-health: preserve operator sudo + repair dpkg journal +
+//     detect mid-upgrade state. MUST run before any destructive apt
+//     work so a broken dpkg database doesn't half-finish a
+//     dist-upgrade and lock the operator out of sudo.
+//  2. ubuntu-upgrade: rewrites the apt world; must precede any apt
 //     install. No-op on a host that already matches profile.ubuntu_version.
-//  2. base-packages: build-essential / git / dkms / curl etc.
-//  3. nvidia-driver: picks family + installs the right metapackage.
-//  4. cuda: only if profile.cuda.mode != none.
-//  5. edid: stamps a kernel cmdline edid override if the profile asks.
+//  3. base-packages: build-essential / git / dkms / curl etc.
+//  4. nvidia-driver: picks family + installs the right metapackage.
+//  5. cuda: only if profile.cuda.mode != none.
+//  6. edid: stamps a kernel cmdline edid override if the profile asks.
 func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) error {
 	phases := []phase.Phase{
+		phase.AptHealth{},
 		phase.UbuntuUpgrade{},
 		phase.BasePackages{},
 		phase.NvidiaDriver{},
@@ -809,6 +814,7 @@ func newValidateCmd() *cobra.Command {
 
 func newPhaseCmd() *cobra.Command {
 	p := &cobra.Command{Use: "phase [name]"}
+	p.AddCommand(newPhaseImplCmd("apt-health", phase.AptHealth{}))
 	p.AddCommand(newPhaseImplCmd("ubuntu-upgrade", phase.UbuntuUpgrade{}))
 	p.AddCommand(newPhaseImplCmd("base-packages", phase.BasePackages{}))
 	p.AddCommand(newPhaseImplCmd("nvidia-driver", phase.NvidiaDriver{}))
