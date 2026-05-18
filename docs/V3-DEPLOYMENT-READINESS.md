@@ -64,7 +64,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `resume` | **Real**. Reads state, clears RebootNeeded, replays implemented phases. Disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
 | `phase nvidia-driver` | **Real + dirty-driver cleanup planner.** |
-| `phase cuda` | **Real (this commit: v2-parity rewrite).** Honors `cuda.method` (auto/apt/runfile/none). Apt path bootstraps `cuda-keyring_1.1-1`, installs toolkit-only (refuses `cuda-drivers*`), prefers `cuda-toolkit-13-N` then `cuda-toolkit`; Ubuntu's `nvidia-cuda-toolkit` is filtered when required-major=13. Runfile path stages under `/var/tmp/clouddeploy-cuda`, curl-retries with size + sha256 logging, runs `--check` before install, uses `RetryDecider` to refuse re-downloading the same corrupt SHA, and invokes `sh runfile --silent --toolkit --override --tmpdir=...`. Post-install verification probes nvcc release, checks `/usr/local/cuda/{bin/nvcc,include,lib64}`, and writes `/etc/profile.d/clouddeploy-cuda.sh`. State.Details records source / package / runfile_url / sha256 / nvcc_version / cuda_major / verified_layout. |
+| `phase cuda` | **Real (policy-driven).** Honors `cuda.method` (auto/apt/runfile/none) AND `cuda.selection_policy` (latest-compatible / exact-major / min-major / any) + `cuda.expected_major` + `cuda.min_major` + `cuda.allow_ubuntu_archive_fallback`. Apt path bootstraps `cuda-keyring_1.1-1`, installs toolkit-only (refuses `cuda-drivers*`); the candidate ladder is version-range aware (`cuda-toolkit-14-N → 13-N → 12-N → cuda-toolkit → nvidia-cuda-toolkit`) and policy-filtered (exact-major emits only that major; archive only when allowed AND the archive's actual major fits). Runfile path: `/var/tmp/clouddeploy-cuda`, curl-retries, size + sha256 logging, `--check` before install, `RetryDecider` refuses same-SHA retry, `sh runfile --silent --toolkit --override --tmpdir=...`. Post-install verification: nvcc parse + `/usr/local/cuda/{bin/nvcc,include,lib64}` + policy-driven `Selection.SatisfiesNvcc(rel)` (exact-major must match, min-major floors major). When `cuda.compile_smoke_test=true`, the phase writes `/var/tmp/clouddeploy-cuda-smoke/smoke.cu`, compiles it with the freshly-installed nvcc (compile failure is fatal in required mode), and best-effort runs the binary (runtime failure is logged but never fatal). State.Details records source / package / runfile_url / sha256 / nvcc_version / cuda_major / expected_major / selection_policy / verified_layout / compile_smoke_test* / runtime_smoke_test* / profile_snippet. |
 | `phase edid` | **Real (opt-in).** Invokes `helpers/write-edids.py`, writes `/lib/firmware/edid/<name>.bin`, drops a `/etc/default/grub.d/99-clouddeploy.cfg`, runs `update-initramfs -u` + `update-grub`, sets `RebootNeeded`. Only runs when `display.forced_connector` is set in the profile. |
 | `phase kwin-patch` | Stub. Milestone 4. |
 | `phase sunshine-build` | Stub. Milestone 4. |
@@ -189,13 +189,14 @@ Findings from sweeping the codebase for misleading text:
 
 ## 7. Acceptance criteria for the next VM test
 
-Three test profiles cover the supported paths:
+Four test profiles cover the supported paths:
 
-| Profile | Ubuntu target | CUDA | Notes |
+| Profile | Ubuntu target | CUDA selection | Notes |
 | --- | --- | --- | --- |
 | `hdr-4k120` | 25.10 | `mode=none` | Default. Tests ubuntu-upgrade → driver → edid; cuda is skipped. |
-| `hdr-4k120-cuda` | 25.10 | `mode=required`, `method=apt` | **Currently unsatisfiable** (NVIDIA has no ubuntu2510 CUDA repo and the 13.0.2 runfile is corrupt). v3 fails fatal with a clear "no CUDA apt repo available" message. |
-| `hdr-4k120-cuda-ubuntu2404` (this commit) | 24.04 | `mode=required`, `method=apt`, `auto_upgrade_ubuntu=false` | The known-working CUDA-required test target. Uses NVIDIA's `ubuntu2404` CUDA apt repo. |
+| `hdr-4k120-cuda` | 25.10 | strict: `exact-major=13`, no archive fallback, compile smoke on | **Currently unsatisfiable** (NVIDIA has no ubuntu2510 CUDA repo and the 13.0.2 runfile is corrupt). v3 fails fatal with a clear "no CUDA apt repo available" message. |
+| `hdr-4k120-cuda-ubuntu2404` | 24.04 | strict: `exact-major=13`, no archive fallback, compile smoke on | Known-working strict CUDA-13 test target. Uses NVIDIA's `ubuntu2404` CUDA apt repo, no Ubuntu upgrade. |
+| `hdr-4k120-cuda-compatible` (this commit) | 25.10 | broad: `latest-compatible`, `min_major=12`, archive fallback ok, compile smoke on | Broad-compat profile that accepts Ubuntu's CUDA 12.x archive when NVIDIA has no compatible repo. Use when CUDA 12 is acceptable. |
 
 `hdr-4k120` ships with
 `deploy.auto_upgrade_ubuntu: true` + `deploy.accept_non_lts: true` +

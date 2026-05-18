@@ -124,6 +124,54 @@ type CUDAConfig struct {
 	// runfile path. Zero falls back to the
 	// `CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS` env var, then 3.
 	RunfileMaxAttempts int `yaml:"runfile_max_attempts"`
+
+	// ExpectedMajor is the strict "this CUDA major must be installed
+	// after the phase succeeds" pin. Used only when SelectionPolicy
+	// is "exact-major". Empty otherwise.
+	ExpectedMajor string `yaml:"expected_major"`
+
+	// MinMajor is the lower-bound major when SelectionPolicy is
+	// "min-major". Example: "12" means CUDA 12.x and CUDA 13.x both
+	// satisfy. Empty otherwise.
+	MinMajor string `yaml:"min_major"`
+
+	// SelectionPolicy governs how the candidate ladder picks among
+	// available CUDA toolkit packages and how post-install
+	// verification gates the deploy:
+	//
+	//   ""                 - alias for "latest-compatible".
+	//   "latest-compatible" - default. Prefer the newest official
+	//                         NVIDIA toolkit major compatible with
+	//                         the installed driver; fall through to
+	//                         older majors / metapackage / archive
+	//                         (if allowed).
+	//   "exact-major"      - require ExpectedMajor exactly. Apt
+	//                         ladder is filtered to that major only;
+	//                         post-install nvcc must report that
+	//                         major or the phase fails.
+	//   "min-major"        - accept any toolkit major >= MinMajor.
+	//                         Apt ladder includes all majors >=
+	//                         MinMajor (descending preference).
+	//   "any"              - accept any installable toolkit and any
+	//                         nvcc that parses. Only useful for
+	//                         broad-compatibility deploys.
+	SelectionPolicy string `yaml:"selection_policy"`
+
+	// AllowUbuntuArchiveFallback governs whether Ubuntu's
+	// `nvidia-cuda-toolkit` package (CUDA 12.x as of 2026-05) is
+	// allowed in the candidate ladder. Off by default for the strict
+	// HDR/CUDA profile; on for the compatibility profile.
+	AllowUbuntuArchiveFallback bool `yaml:"allow_ubuntu_archive_fallback"`
+
+	// CompileSmokeTest, when true, makes the phase write a trivial
+	// .cu file under /var/tmp/clouddeploy-cuda-smoke and compile it
+	// with the freshly-installed nvcc before MarkDone. Required mode
+	// fails the deploy on compile failure; optional mode records a
+	// nonfatal skip. Running the compiled binary is best-effort
+	// (some headless cloud images have no usable CUDA device until
+	// the next reboot loads the driver fully) and never gates the
+	// phase status today.
+	CompileSmokeTest bool `yaml:"compile_smoke_test"`
 }
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
@@ -212,6 +260,25 @@ func ValidateProfile(p *Profile) error {
 		// ok
 	default:
 		return fmt.Errorf("config: profile %q: cuda.method must be one of auto/apt/runfile/none, got %q", p.Profile, p.CUDA.Method)
+	}
+	selPolicy := strings.ToLower(strings.TrimSpace(p.CUDA.SelectionPolicy))
+	switch selPolicy {
+	case "", "latest-compatible", "exact-major", "min-major", "any":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: cuda.selection_policy must be one of latest-compatible/exact-major/min-major/any, got %q", p.Profile, p.CUDA.SelectionPolicy)
+	}
+	if !isNumericMajorOrEmpty(p.CUDA.ExpectedMajor) {
+		return fmt.Errorf("config: profile %q: cuda.expected_major must be a positive integer string (e.g. \"13\"), got %q", p.Profile, p.CUDA.ExpectedMajor)
+	}
+	if !isNumericMajorOrEmpty(p.CUDA.MinMajor) {
+		return fmt.Errorf("config: profile %q: cuda.min_major must be a positive integer string (e.g. \"12\"), got %q", p.Profile, p.CUDA.MinMajor)
+	}
+	if selPolicy == "exact-major" && strings.TrimSpace(p.CUDA.ExpectedMajor) == "" {
+		return fmt.Errorf("config: profile %q: cuda.selection_policy=exact-major requires cuda.expected_major to be set", p.Profile)
+	}
+	if selPolicy == "min-major" && strings.TrimSpace(p.CUDA.MinMajor) == "" {
+		return fmt.Errorf("config: profile %q: cuda.selection_policy=min-major requires cuda.min_major to be set", p.Profile)
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":
@@ -345,6 +412,21 @@ func ValidateGPU(g *GPUProfile) error {
 		return fmt.Errorf("config: gpu profile %q: streaming.hdr must be yes/no/limited, got %q", g.Filename, g.Streaming.HDR)
 	}
 	return nil
+}
+
+// isNumericMajorOrEmpty accepts "" or a positive ASCII-digit major,
+// e.g. "12", "13", "14". Rejects "12.4", "-3", "v13".
+func isNumericMajorOrEmpty(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return true
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func looksLikePCIID(s string) bool {

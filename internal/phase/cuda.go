@@ -22,101 +22,81 @@ import (
 // CudaName is the canonical state-key.
 const CudaName = "cuda"
 
-// RunfileCheckCorruptHint is the operator-facing diagnostic emitted
-// whenever the NVIDIA runfile's `--check` step fails (its embedded MD5
-// does not match the runfile body). It is also appended to the final
-// error string when the runfile loop exhausts attempts so the operator
-// sees actionable guidance, not just "exhausted".
-//
-// Background: the CUDA 13.0.2 toolkit-only runfile
-//
-//	https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
-//
-// is reproducibly corrupt on the production mirror as of 2026-05-18:
-// clean (non-resumed) downloads consistently yield the same sha256
-// (81a5d0d0870ba2022efb0a531dcc60adbdc2bbff7b3ef19d6fd6d8105406c775),
-// and `sh cuda_*_linux.run --check` rejects them with
-// "MD5 sum is different from a7389036e857482d4465dc2d5b6370d8".
-// This means the upstream artifact itself (or its mirrored copy)
-// disagrees with its own embedded checksum — re-downloading cannot
-// help, and v3's RetryDecider correctly refuses to retry the same SHA.
+// RunfileCheckCorruptHint is emitted whenever the NVIDIA runfile's
+// `--check` step fails. See the original commit (a58aa34) for the
+// background on the corrupt CUDA 13.0.2 toolkit-only runfile.
 const RunfileCheckCorruptHint = "NVIDIA runfile internal checksum failed; artifact/cache likely corrupt. " +
 	"Re-downloading the same SHA cannot help. " +
 	"Try cuda.method=apt (the official NVIDIA CUDA apt repo is the recommended path), " +
 	"or pin a different cuda.runfile_url (a different CUDA 13.x version) AND set cuda.runfile_sha256 " +
 	"to a value that passes `sh cuda_*_linux.run --check`."
 
-// Cuda phase: real v2-equivalent CUDA toolkit install. Honors
-// cuda.Mode (none/optional/required) and cuda.Method (auto/apt/runfile/none),
-// drops a /etc/profile.d/clouddeploy-cuda.sh after a successful install,
-// and verifies nvcc + /usr/local/cuda layout. Defensible against the
-// known failure modes:
+// CudaSmokeProgram is the trivial .cu file the phase compiles after
+// install to prove that nvcc actually works against the installed
+// toolkit headers + libraries. Running the resulting binary is
+// best-effort (cloud images may not expose a usable CUDA device pre-
+// reboot); we only fail required mode on compile failure.
+const CudaSmokeProgram = `// clouddeployctl cuda smoke test: prove nvcc + toolkit headers/libs work.
+#include <cuda_runtime.h>
+__global__ void k() {}
+int main(void) {
+    k<<<1, 1>>>();
+    cudaError_t err = cudaDeviceSynchronize();
+    // cudaSuccess: a GPU is present and the kernel ran.
+    // cudaErrorNoDevice: toolkit OK; no CUDA device wired up in this
+    //                    cloud image yet (driver not fully loaded, or
+    //                    the VM is headless).
+    return (err == cudaSuccess || err == cudaErrorNoDevice) ? 0 : 1;
+}
+`
+
+// CudaSmokeDir is the default staging dir for the smoke test.
+const CudaSmokeDir = "/var/tmp/clouddeploy-cuda-smoke"
+
+// Cuda phase: real v2-equivalent CUDA toolkit install. Honors:
 //
-//   - same runfile sha256 + same --check failure -> refuses to retry
-//     (cuda.RetryDecider, the v2 regression we are preventing).
-//   - HTML error page disguised as a runfile -> caught by
-//     cuda.MinRunfileBytes.
-//   - Ubuntu's nvidia-cuda-toolkit installed when CUDA 13 is required
-//     -> filtered out of the candidate ladder.
-//   - cuda-drivers (the driver meta-package) ever installed -> apt
-//     path only installs toolkit packages; runfile uses --toolkit
-//     never --driver.
+//   - cuda.Mode    (none / optional / required)
+//   - cuda.Method  (auto / apt / runfile / none)
+//   - cuda.SelectionPolicy (latest-compatible / exact-major /
+//     min-major / any), cuda.ExpectedMajor, cuda.MinMajor
+//   - cuda.AllowUbuntuArchiveFallback
+//   - cuda.CompileSmokeTest
+//
+// Writes /etc/profile.d/clouddeploy-cuda.sh on success. Records source
+// (apt / runfile / already-installed), package, nvcc version, smoke
+// test outcome in state.Details.
 type Cuda struct {
-	// ProbeFn lets tests inject an apt-cache availability probe.
-	// nil = use real apt-cache via the runner.
-	ProbeFn cuda.AvailabilityProbe
-
-	// RepoProbeFn lets tests inject the "is the NVIDIA CUDA apt repo
-	// for distro X reachable?" check. nil = use a real HEAD probe
-	// via the runner.
-	RepoProbeFn cuda.RepoAvailabilityProbe
-
-	// CurrentUbuntuVersionFn lets tests inject the VERSION_ID instead
-	// of reading /etc/os-release. nil = real read.
+	ProbeFn                cuda.AvailabilityProbe
+	RepoProbeFn            cuda.RepoAvailabilityProbe
 	CurrentUbuntuVersionFn func() string
+	NvccProbeFn            func(ctx context.Context, deps *Deps) cuda.NvccRelease
+	CudaLayoutOKFn         func() bool
+	HTTPHeadFn             func(ctx context.Context, deps *Deps, url string) bool
+	DownloadFn             func(ctx context.Context, deps *Deps, url, dst string) (size int64, err error)
+	RunfileCheckFn         func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
+	RunfileInstallFn       func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
 
-	// NvccProbeFn lets tests inject the cached "nvcc release on this
-	// host" lookup. Returns NvccRelease{} when nvcc is absent or
-	// unparseable. nil = call /usr/local/cuda/bin/nvcc --version via
-	// the runner.
-	NvccProbeFn func(ctx context.Context, deps *Deps) cuda.NvccRelease
+	// SmokeCompileFn lets tests inject the `nvcc -o bin src.cu` step.
+	// Receives the path to the staged .cu and the desired binary path.
+	// nil = run nvcc via the runner.
+	SmokeCompileFn func(ctx context.Context, deps *Deps, src, bin string) error
 
-	// CudaLayoutOKFn lets tests fake the /usr/local/cuda {bin/nvcc,
-	// include, lib64} layout check. nil = real os.Stat.
-	CudaLayoutOKFn func() bool
+	// SmokeRunFn lets tests inject the "execute the smoke binary"
+	// step. nil = run the binary via the runner with a short timeout.
+	SmokeRunFn func(ctx context.Context, deps *Deps, bin string) error
 
-	// HTTPHeadFn lets tests inject the keyring-reachable check
-	// without curling. nil = curl --head via the runner.
-	HTTPHeadFn func(ctx context.Context, deps *Deps, url string) bool
-
-	// DownloadFn lets tests inject the runfile download step. nil =
-	// curl --retry via the runner. Returns the on-disk path + size
-	// or an error.
-	DownloadFn func(ctx context.Context, deps *Deps, url, dst string) (size int64, err error)
-
-	// RunfileCheckFn lets tests inject the `sh runfile --check` step.
-	// nil = call via the runner.
-	RunfileCheckFn func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
-
-	// RunfileInstallFn lets tests inject the `sh runfile --silent
-	// --toolkit --override --tmpdir=...` step. nil = call via the
-	// runner.
-	RunfileInstallFn func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
-
-	// ProfileSnippetPathOverride lets tests redirect the on-disk
-	// /etc/profile.d/clouddeploy-cuda.sh write to a temp file.
-	// Empty = the real path.
 	ProfileSnippetPathOverride string
+	RunfileTmpDirOverride      string
 
-	// RunfileTmpDirOverride lets tests redirect the staging dir to a
-	// t.TempDir(). Empty = cuda.RunfileTmpDir (`/var/tmp/clouddeploy-cuda`).
-	RunfileTmpDirOverride string
+	// SmokeDirOverride lets tests redirect the smoke staging dir to a
+	// t.TempDir(). Empty = CudaSmokeDir.
+	SmokeDirOverride string
 }
 
 // Name implements Phase.
 func (Cuda) Name() string { return CudaName }
 
-// Run implements Phase. See type-level docstring for the algorithm.
+// Run implements Phase.
 func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 	log := deps.Logger
 	if log == nil {
@@ -138,6 +118,8 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 	runfileURL := ""
 	runfileSHA := ""
 	runfileMaxAttempts := 0
+	var selection cuda.Selection
+	compileSmokeTest := false
 	if deps.Profile != nil {
 		m, err := cuda.ParseMode(deps.Profile.CUDA.Mode)
 		if err != nil {
@@ -153,14 +135,33 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 			return fmt.Errorf("phase cuda: %w", err)
 		}
 		method = mt
+		pol, err := cuda.ParseSelectionPolicy(deps.Profile.CUDA.SelectionPolicy)
+		if err != nil {
+			deps.State.MarkFailed(CudaName, "parse cuda.selection_policy", err, true)
+			_ = deps.PersistState()
+			return fmt.Errorf("phase cuda: %w", err)
+		}
 		explicitName = deps.Profile.CUDA.PackageName
 		driverMajor = deps.Profile.NVIDIA.DriverMajor
 		runfileURL = deps.Profile.CUDA.RunfileURL
 		runfileSHA = deps.Profile.CUDA.RunfileSHA256
 		runfileMaxAttempts = deps.Profile.CUDA.RunfileMaxAttempts
+		selection = cuda.Selection{
+			DriverPreferredMajor:       cuda.PreferredMajorForDriver(driverMajor),
+			Policy:                     pol,
+			ExpectedMajor:              strings.TrimSpace(deps.Profile.CUDA.ExpectedMajor),
+			MinMajor:                   strings.TrimSpace(deps.Profile.CUDA.MinMajor),
+			AllowUbuntuArchiveFallback: deps.Profile.CUDA.AllowUbuntuArchiveFallback,
+		}
+		// Default CompileSmokeTest:
+		//   - true  when cuda.compile_smoke_test is explicitly set true.
+		//   - false otherwise. (We default to false so existing
+		//     mode=optional / mode=none profiles do not suddenly fail
+		//     in environments without a C compiler.) The strict
+		//     hdr-4k120-cuda profile sets it true explicitly.
+		compileSmokeTest = deps.Profile.CUDA.CompileSmokeTest
 	}
 	plan := cuda.Plan(mode)
-	expectedMajor := cuda.ExpectedMajor(explicitName, runfileURL)
 
 	// mode=none / method=none: skip cleanly.
 	if !plan.WillAttemptInstall || method == cuda.MethodNone {
@@ -175,24 +176,35 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 		return nil
 	}
 
-	// Short-circuit: working install already on disk with a
-	// satisfying nvcc release.
-	if rel, ok := p.alreadyInstalledMatches(ctx, deps, expectedMajor); ok {
+	// Short-circuit: working install already on disk that satisfies
+	// the configured selection policy. Still run the smoke test (when
+	// CompileSmokeTest=true) so a stale-headers regression on a
+	// previously-passing host surfaces during apply.
+	if rel, ok := p.alreadyInstalledMatches(ctx, deps, selection); ok {
+		baseDetails := map[string]any{
+			"mode":             string(plan.Mode),
+			"method":           string(method),
+			"selection_policy": string(selection.Policy),
+			"source":           "already-installed",
+			"nvcc_version":     rel.Full(),
+			"cuda_major":       rel.Major,
+			"expected_major":   selection.EffectivePinnedMajor(),
+			"verified_layout":  true,
+		}
+		if err := p.runSmokeIfRequested(ctx, deps, compileSmokeTest, baseDetails, log); err != nil {
+			if plan.FailsDeployOnError {
+				return p.fail(deps, plan, "compile smoke test failed (already-installed path)", err)
+			}
+			return p.skipNonfatal(deps, plan, "compile smoke test failed (already-installed); mode=optional", baseDetails)
+		}
 		if err := p.writeProfileSnippet(); err != nil {
 			log.Warn("phase cuda: failed to write profile.d snippet", "err", err)
 		}
-		deps.State.MarkDone(CudaName, map[string]any{
-			"mode":            string(plan.Mode),
-			"method":          string(method),
-			"source":          "already-installed",
-			"nvcc_version":    rel.Full(),
-			"cuda_major":      rel.Major,
-			"expected_major":  expectedMajor,
-			"verified_layout": true,
-		})
+		baseDetails["profile_snippet"] = p.profileSnippetPath()
+		deps.State.MarkDone(CudaName, baseDetails)
 		_ = deps.PersistState()
-		log.Info("phase cuda: nvcc already installed and matches expected",
-			"nvcc", rel.Full(), "expected_major", expectedMajor)
+		log.Info("phase cuda: nvcc already installed and policy-satisfied",
+			"nvcc", rel.Full(), "policy", string(selection.Policy))
 		return nil
 	}
 
@@ -212,9 +224,9 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 
 	switch effectiveMethod {
 	case cuda.MethodApt:
-		return p.runAptPath(ctx, deps, plan, repoDistro, driverMajor, explicitName, expectedMajor, log)
+		return p.runAptPath(ctx, deps, plan, repoDistro, driverMajor, explicitName, selection, compileSmokeTest, log)
 	case cuda.MethodRunfile:
-		return p.runRunfilePath(ctx, deps, plan, runfileURL, runfileSHA, runfileMaxAttempts, expectedMajor, log)
+		return p.runRunfilePath(ctx, deps, plan, runfileURL, runfileSHA, runfileMaxAttempts, selection, compileSmokeTest, log)
 	}
 	err := fmt.Errorf("unknown effective method %q", effectiveMethod)
 	return p.fail(deps, plan, "method dispatch failed", err)
@@ -231,17 +243,17 @@ func (p Cuda) runAptPath(
 	repoDistro string,
 	driverMajor string,
 	explicitName string,
-	expectedMajor string,
+	selection cuda.Selection,
+	compileSmokeTest bool,
 	log *slog.Logger,
 ) error {
 	if repoDistro == "" {
-		// method=apt with no reachable repo. Fail or skip per mode.
-		err := fmt.Errorf("no official NVIDIA CUDA apt repo detected for this Ubuntu version; try method=runfile or set deploy fallback")
+		err := fmt.Errorf("no official NVIDIA CUDA apt repo detected for this Ubuntu version; try cuda.method=runfile or use a profile that targets a release with a CUDA apt repo (e.g. hdr-4k120-cuda-ubuntu2404)")
 		if plan.FailsDeployOnError {
 			return p.fail(deps, plan, "no CUDA apt repo available", err)
 		}
 		return p.skipNonfatal(deps, plan, "no CUDA apt repo available; mode=optional -> skipped",
-			map[string]any{"method": "apt", "repo_distro": ""})
+			map[string]any{"method": "apt", "repo_distro": "", "selection_policy": string(selection.Policy)})
 	}
 	if err := p.ensureCudaAptRepo(ctx, deps, repoDistro); err != nil {
 		if plan.FailsDeployOnError {
@@ -255,43 +267,48 @@ func (p Cuda) runAptPath(
 	if probe == nil {
 		probe = makeAptCacheProbe(ctx, deps)
 	}
-	opts := cuda.CandidateOptions{
-		PreferredMajor: driverMajor,
-		ExplicitName:   explicitName,
-		RequiredMajor:  expectedMajor,
-	}
+	opts := selection.CandidateOptions(explicitName)
 	pkg := cuda.DiscoverCandidate(opts, probe)
 
-	// If no apt candidate matches AND we're in required mode, fall
-	// back to the runfile path before declaring defeat (only if the
-	// profile pinned a runfile URL).
 	if pkg == "" {
+		// No apt candidate that matches the policy. Try the runfile
+		// fallback when the profile pinned one AND required mode is
+		// in play; otherwise fail / skip per mode.
 		if plan.FailsDeployOnError && deps.Profile != nil && strings.TrimSpace(deps.Profile.CUDA.RunfileURL) != "" {
-			log.Warn("phase cuda: no apt candidate matches required-major; falling back to runfile",
-				"required_major", expectedMajor)
+			log.Warn("phase cuda: no apt candidate satisfies selection policy; falling back to runfile",
+				"policy", string(selection.Policy),
+				"expected_major", selection.ExpectedMajor,
+				"min_major", selection.MinMajor)
 			return p.runRunfilePath(ctx, deps, plan,
 				deps.Profile.CUDA.RunfileURL, deps.Profile.CUDA.RunfileSHA256,
-				deps.Profile.CUDA.RunfileMaxAttempts, expectedMajor, log)
+				deps.Profile.CUDA.RunfileMaxAttempts, selection, compileSmokeTest, log)
 		}
 		if plan.FailsDeployOnError {
-			err := fmt.Errorf("no installable CUDA toolkit candidate (required major=%q) in ladder %v", expectedMajor, cuda.CandidateLadder(opts))
-			return p.fail(deps, plan, "no CUDA apt candidate matches required major", err)
+			err := fmt.Errorf("no installable CUDA toolkit candidate satisfies selection_policy=%q (expected_major=%q min_major=%q allow_ubuntu_archive_fallback=%v); ladder=%v",
+				selection.Policy, selection.ExpectedMajor, selection.MinMajor,
+				selection.AllowUbuntuArchiveFallback, cuda.CandidateLadder(opts))
+			return p.fail(deps, plan, "no CUDA apt candidate matches selection policy", err)
 		}
 		return p.skipNonfatal(deps, plan, "no installable CUDA toolkit candidate; mode=optional -> skipped",
-			map[string]any{"method": "apt", "repo_distro": repoDistro, "candidates": cuda.CandidateLadder(opts)})
+			map[string]any{
+				"method":           "apt",
+				"repo_distro":      repoDistro,
+				"selection_policy": string(selection.Policy),
+				"candidates":       cuda.CandidateLadder(opts),
+			})
 	}
 
-	// Refuse known driver meta-packages explicitly. (DiscoverCandidate
-	// today only ever returns toolkit names, but a future operator
-	// override via package_name should not be able to push us into
-	// installing cuda-drivers and clobbering the driver phase.)
 	if isDriverMetaPackage(pkg) {
 		err := fmt.Errorf("phase cuda refuses to install driver meta-package %q; the cuda phase is toolkit-only", pkg)
 		return p.fail(deps, plan, "refused driver meta-package", err)
 	}
 
 	log.Info("phase cuda: apt install (toolkit-only)",
-		"package", pkg, "repo", repoDistro, "expected_major", expectedMajor)
+		"package", pkg,
+		"repo", repoDistro,
+		"selection_policy", string(selection.Policy),
+		"expected_major", selection.ExpectedMajor,
+		"min_major", selection.MinMajor)
 	err := deps.APT.Run(ctx, func(tc *apt.TxContext) error {
 		return tc.Install(ctx, []string{pkg})
 	})
@@ -303,12 +320,12 @@ func (p Cuda) runAptPath(
 			map[string]any{"method": "apt", "package": pkg, "err": err.Error()})
 	}
 
-	return p.verifyAndFinish(ctx, deps, plan, map[string]any{
+	return p.verifyAndFinish(ctx, deps, plan, selection, compileSmokeTest, map[string]any{
 		"method":      "apt",
 		"repo_distro": repoDistro,
 		"package":     pkg,
 		"source":      "apt",
-	}, expectedMajor, log)
+	}, log)
 }
 
 func (p Cuda) ensureCudaAptRepo(ctx context.Context, deps *Deps, distro string) error {
@@ -319,14 +336,10 @@ func (p Cuda) ensureCudaAptRepo(ctx context.Context, deps *Deps, distro string) 
 	tmpDeb := filepath.Join(os.TempDir(), fmt.Sprintf("cuda-keyring-%d.deb", time.Now().UnixNano()))
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
-			"curl",
-			"-fL",
-			"--retry", "5",
-			"--retry-all-errors",
-			"--retry-delay", "5",
+			"curl", "-fL",
+			"--retry", "5", "--retry-all-errors", "--retry-delay", "5",
 			"--connect-timeout", "30",
-			"-o", tmpDeb,
-			url,
+			"-o", tmpDeb, url,
 		},
 		Sudo: true,
 	})
@@ -341,7 +354,6 @@ func (p Cuda) ensureCudaAptRepo(ctx context.Context, deps *Deps, distro string) 
 	if dres.Err != nil {
 		return fmt.Errorf("dpkg -i %s: %w", tmpDeb, dres.Err)
 	}
-	// apt-get update so the new repo's Release file is loaded.
 	return deps.APT.Run(ctx, func(tc *apt.TxContext) error {
 		return tc.Update(ctx)
 	})
@@ -370,7 +382,8 @@ func (p Cuda) runRunfilePath(
 	plan cuda.PlanResult,
 	url, expectedSHA string,
 	maxAttempts int,
-	expectedMajor string,
+	selection cuda.Selection,
+	compileSmokeTest bool,
 	log *slog.Logger,
 ) error {
 	if strings.TrimSpace(url) == "" {
@@ -387,15 +400,11 @@ func (p Cuda) runRunfilePath(
 	if p.RunfileTmpDirOverride != "" {
 		tmpdir = p.RunfileTmpDirOverride
 	}
-	// MkdirAll is cheap and safe under DryRun too: it never installs
-	// anything, just guarantees the staging dir exists so the
-	// download/check hooks (or the runner) have somewhere to write.
 	if err := os.MkdirAll(tmpdir, 0o755); err != nil {
 		return p.fail(deps, plan, fmt.Sprintf("mkdir %s", tmpdir), err)
 	}
 
 	var decider cuda.RetryDecider
-
 	var lastErr error
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		log.Info("phase cuda: runfile attempt",
@@ -416,18 +425,10 @@ func (p Cuda) runRunfilePath(
 			continue
 		}
 
-		// Always try to hash whatever's on disk. The download hook
-		// (real curl or a test stub) is expected to have produced a
-		// file at runfilePath; if it didn't, we just log empty and
-		// continue (the SHA mismatch / RetryDecider checks behave
-		// correctly with an empty hash).
 		actualSHA := ""
 		if s, hErr := sha256OfFile(runfilePath); hErr == nil {
 			actualSHA = s
 		} else if deps.DryRun && expectedSHA != "" {
-			// True dry-run with no on-disk file and no download hook:
-			// assume the pin will match so we exercise the rest of the
-			// happy path without faking I/O.
 			actualSHA = expectedSHA
 		} else {
 			log.Warn("phase cuda: sha256 failed; continuing without it", "err", hErr)
@@ -435,8 +436,6 @@ func (p Cuda) runRunfilePath(
 		log.Info("phase cuda: runfile downloaded",
 			"size", size, "sha256", actualSHA, "expected_sha256", expectedSHA)
 
-		// Anti-corruption guard: if a previous attempt with the same
-		// (sha256,size) already failed --check, do not retry.
 		if ok, why := decider.ShouldRetry(actualSHA, size); !ok {
 			lastErr = fmt.Errorf("retry refused: %s", why)
 			log.Error("phase cuda: refusing to retry corrupt runfile",
@@ -445,7 +444,6 @@ func (p Cuda) runRunfilePath(
 			break
 		}
 
-		// Refuse SHA mismatch when the operator pinned one.
 		if expectedSHA != "" && actualSHA != "" && !strings.EqualFold(actualSHA, expectedSHA) {
 			decider.Record(cuda.Attempt{URL: url, Size: size, SHA256: actualSHA, CheckOK: false, ErrorTail: "sha256 mismatch"})
 			lastErr = fmt.Errorf("runfile sha256 mismatch: got %s want %s", actualSHA, expectedSHA)
@@ -454,13 +452,9 @@ func (p Cuda) runRunfilePath(
 			continue
 		}
 
-		// --check the runfile before running the installer.
 		checkErr := p.checkRunfile(ctx, deps, runfilePath, tmpdir)
 		decider.Record(cuda.Attempt{
-			URL:     url,
-			Size:    size,
-			SHA256:  actualSHA,
-			CheckOK: checkErr == nil,
+			URL: url, Size: size, SHA256: actualSHA, CheckOK: checkErr == nil,
 		})
 		if checkErr != nil {
 			lastErr = fmt.Errorf("runfile --check failed (attempt %d): %w", attempt, checkErr)
@@ -471,7 +465,6 @@ func (p Cuda) runRunfilePath(
 			continue
 		}
 
-		// --check passed: install toolkit-only.
 		log.Info("phase cuda: runfile --check OK; installing toolkit-only",
 			"sha256", actualSHA, "size", size)
 		if err := p.installRunfile(ctx, deps, runfilePath, tmpdir); err != nil {
@@ -485,19 +478,15 @@ func (p Cuda) runRunfilePath(
 		}
 		_ = os.Remove(runfilePath)
 
-		return p.verifyAndFinish(ctx, deps, plan, map[string]any{
+		return p.verifyAndFinish(ctx, deps, plan, selection, compileSmokeTest, map[string]any{
 			"method":      "runfile",
 			"runfile_url": url,
 			"sha256":      actualSHA,
 			"size":        size,
 			"source":      "runfile",
-		}, expectedMajor, log)
+		}, log)
 	}
 
-	// All attempts exhausted. Always surface the corrupt-runfile hint
-	// at this point: even if the failure mode wasn't a `--check`
-	// failure on the last attempt, the operator typically wants
-	// "what to do next" without paging back through logs.
 	log.Error("phase cuda: runfile path exhausted attempts; hint follows",
 		"attempts", maxAttempts, "last_err", lastErr)
 	log.Error("phase cuda: hint", "hint", RunfileCheckCorruptHint)
@@ -525,15 +514,10 @@ func (p Cuda) downloadRunfile(ctx context.Context, deps *Deps, url, dst string) 
 	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
-			"curl",
-			"-fL",
-			"--retry", "10",
-			"--retry-all-errors",
-			"--retry-delay", "10",
-			"--connect-timeout", "30",
-			"--silent", "--show-error",
-			"-o", dst,
-			url,
+			"curl", "-fL",
+			"--retry", "10", "--retry-all-errors", "--retry-delay", "10",
+			"--connect-timeout", "30", "--silent", "--show-error",
+			"-o", dst, url,
 		},
 		Sudo:    true,
 		Timeout: 60 * time.Minute,
@@ -577,7 +561,7 @@ func (p Cuda) installRunfile(ctx context.Context, deps *Deps, runfile, tmpdir st
 		Argv: []string{
 			"sh", runfile,
 			"--silent",
-			"--toolkit", // toolkit-only; NEVER --driver
+			"--toolkit",
 			"--override",
 			"--tmpdir=" + tmpdir,
 		},
@@ -605,24 +589,26 @@ func sha256OfFile(path string) (string, error) {
 }
 
 // -----------------------------------------------------------------------------
-// verify + finish + state details helpers
+// verify + smoke + finish
 // -----------------------------------------------------------------------------
 
 func (p Cuda) verifyAndFinish(
 	ctx context.Context,
 	deps *Deps,
 	plan cuda.PlanResult,
+	selection cuda.Selection,
+	compileSmokeTest bool,
 	details map[string]any,
-	expectedMajor string,
 	log *slog.Logger,
 ) error {
 	rel := p.readNvccRelease(ctx, deps)
 	layoutOK := p.cudaLayoutOK()
 
 	details["mode"] = string(plan.Mode)
+	details["selection_policy"] = string(selection.Policy)
 	details["nvcc_version"] = rel.Full()
 	details["cuda_major"] = rel.Major
-	details["expected_major"] = expectedMajor
+	details["expected_major"] = selection.EffectivePinnedMajor()
 	details["verified_layout"] = layoutOK
 
 	if rel.Major == "" || !layoutOK {
@@ -633,12 +619,19 @@ func (p Cuda) verifyAndFinish(
 		}
 		return p.skipNonfatal(deps, plan, "cuda verification failed; mode=optional", details)
 	}
-	if !cuda.MajorMatches(rel, expectedMajor) {
-		err := fmt.Errorf("cuda version mismatch: nvcc=%s expected major=%s", rel.Full(), expectedMajor)
+	if ok, why := selection.SatisfiesNvcc(rel); !ok {
+		err := fmt.Errorf("cuda selection policy not satisfied: %s", why)
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "cuda major mismatch", err)
+			return p.fail(deps, plan, "cuda selection policy not satisfied", err)
 		}
-		return p.skipNonfatal(deps, plan, "cuda major mismatch; mode=optional", details)
+		return p.skipNonfatal(deps, plan, "cuda selection policy not satisfied; mode=optional", details)
+	}
+
+	if err := p.runSmokeIfRequested(ctx, deps, compileSmokeTest, details, log); err != nil {
+		if plan.FailsDeployOnError {
+			return p.fail(deps, plan, "compile smoke test failed", err)
+		}
+		return p.skipNonfatal(deps, plan, "compile smoke test failed; mode=optional", details)
 	}
 
 	if err := p.writeProfileSnippet(); err != nil {
@@ -651,7 +644,7 @@ func (p Cuda) verifyAndFinish(
 	return nil
 }
 
-func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, expectedMajor string) (cuda.NvccRelease, bool) {
+func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, selection cuda.Selection) (cuda.NvccRelease, bool) {
 	if !p.cudaLayoutOK() {
 		return cuda.NvccRelease{}, false
 	}
@@ -659,7 +652,8 @@ func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, expectedM
 	if rel.Major == "" {
 		return cuda.NvccRelease{}, false
 	}
-	return rel, cuda.MajorMatches(rel, expectedMajor)
+	ok, _ := selection.SatisfiesNvcc(rel)
+	return rel, ok
 }
 
 func (p Cuda) readNvccRelease(ctx context.Context, deps *Deps) cuda.NvccRelease {
@@ -668,7 +662,6 @@ func (p Cuda) readNvccRelease(ctx context.Context, deps *Deps) cuda.NvccRelease 
 	}
 	nvcc := filepath.Join(cuda.CudaRoot, "bin", "nvcc")
 	if _, err := os.Stat(nvcc); err != nil {
-		// Fall back to PATH lookup.
 		nvcc = "nvcc"
 	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
@@ -687,8 +680,6 @@ func (p Cuda) cudaLayoutOK() bool {
 		return p.CudaLayoutOKFn()
 	}
 	if runtime.GOOS != "linux" {
-		// Tests on Windows: there is no /usr/local/cuda; trust the
-		// nvcc probe to gate verification.
 		return true
 	}
 	for _, sub := range []string{
@@ -722,6 +713,106 @@ func (p Cuda) writeProfileSnippet() error {
 }
 
 // -----------------------------------------------------------------------------
+// smoke test
+// -----------------------------------------------------------------------------
+
+// runSmokeIfRequested writes the smoke .cu, compiles it with nvcc,
+// and (best-effort) runs the compiled binary. Mutates `details` with
+// compile_smoke_test* keys. Returns a non-nil error only on compile
+// failure when compileSmokeTest=true; run failures are recorded but
+// never fatal.
+func (p Cuda) runSmokeIfRequested(
+	ctx context.Context,
+	deps *Deps,
+	compileSmokeTest bool,
+	details map[string]any,
+	log *slog.Logger,
+) error {
+	details["compile_smoke_test"] = compileSmokeTest
+	if !compileSmokeTest {
+		return nil
+	}
+	dir := p.SmokeDirOverride
+	if dir == "" {
+		dir = CudaSmokeDir
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		details["compile_smoke_test_passed"] = false
+		details["compile_smoke_test_error"] = fmt.Sprintf("mkdir %s: %v", dir, err)
+		return fmt.Errorf("smoke test mkdir %s: %w", dir, err)
+	}
+	src := filepath.Join(dir, "smoke.cu")
+	bin := filepath.Join(dir, "smoke")
+	if err := os.WriteFile(src, []byte(CudaSmokeProgram), 0o644); err != nil {
+		details["compile_smoke_test_passed"] = false
+		details["compile_smoke_test_error"] = fmt.Sprintf("write %s: %v", src, err)
+		return fmt.Errorf("smoke test write %s: %w", src, err)
+	}
+	details["compile_smoke_test_binary"] = bin
+
+	log.Info("phase cuda: compiling smoke test", "src", src, "bin", bin)
+	if err := p.smokeCompile(ctx, deps, src, bin); err != nil {
+		details["compile_smoke_test_passed"] = false
+		details["compile_smoke_test_error"] = err.Error()
+		return fmt.Errorf("nvcc compile %s: %w", src, err)
+	}
+	details["compile_smoke_test_passed"] = true
+
+	// Best-effort run: record outcome, never fatal.
+	if runErr := p.smokeRun(ctx, deps, bin); runErr != nil {
+		log.Warn("phase cuda: smoke binary run failed (non-fatal; no CUDA device on this image?)", "err", runErr)
+		details["runtime_smoke_test_passed"] = false
+		details["runtime_smoke_test_error"] = runErr.Error()
+	} else {
+		details["runtime_smoke_test_passed"] = true
+	}
+	return nil
+}
+
+func (p Cuda) smokeCompile(ctx context.Context, deps *Deps, src, bin string) error {
+	if p.SmokeCompileFn != nil {
+		return p.SmokeCompileFn(ctx, deps, src, bin)
+	}
+	if deps.DryRun {
+		// Pretend to compile under DryRun so the happy path still
+		// reaches MarkDone in apply --dry-run.
+		return nil
+	}
+	nvcc := filepath.Join(cuda.CudaRoot, "bin", "nvcc")
+	if _, err := os.Stat(nvcc); err != nil {
+		nvcc = "nvcc"
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{nvcc, "-o", bin, src},
+		Sudo:    true,
+		Timeout: 5 * time.Minute,
+	})
+	if res.Err != nil {
+		return fmt.Errorf("%s -o %s %s: %w; stderr=%q",
+			nvcc, bin, src, res.Err, tailLines(res.Stderr, 12))
+	}
+	return nil
+}
+
+func (p Cuda) smokeRun(ctx context.Context, deps *Deps, bin string) error {
+	if p.SmokeRunFn != nil {
+		return p.SmokeRunFn(ctx, deps, bin)
+	}
+	if deps.DryRun {
+		return nil
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{bin},
+		Sudo:    true,
+		Timeout: 30 * time.Second,
+	})
+	if res.Err != nil {
+		return fmt.Errorf("run %s: %w; stderr=%q", bin, res.Err, tailLines(res.Stderr, 5))
+	}
+	return nil
+}
+
+// -----------------------------------------------------------------------------
 // repo probing helpers
 // -----------------------------------------------------------------------------
 
@@ -743,9 +834,6 @@ func (p Cuda) currentUbuntuVersion() string {
 	if p.CurrentUbuntuVersionFn != nil {
 		return p.CurrentUbuntuVersionFn()
 	}
-	// Best-effort read; if /etc/os-release is missing (developer
-	// host) we just return "" and the caller treats apt as
-	// unavailable.
 	b, err := os.ReadFile("/etc/os-release")
 	if err != nil {
 		return ""
@@ -753,8 +841,7 @@ func (p Cuda) currentUbuntuVersion() string {
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if strings.HasPrefix(line, "VERSION_ID=") {
-			v := strings.Trim(strings.TrimPrefix(line, "VERSION_ID="), `"'`)
-			return v
+			return strings.Trim(strings.TrimPrefix(line, "VERSION_ID="), `"'`)
 		}
 	}
 	return ""
@@ -805,8 +892,6 @@ func (p Cuda) skipNonfatal(deps *Deps, plan cuda.PlanResult, reason string, extr
 	return nil
 }
 
-// makeAptCacheProbe returns an AvailabilityProbe that shells out to
-// `apt-cache policy <pkg>` via the deps runner.
 func makeAptCacheProbe(ctx context.Context, deps *Deps) cuda.AvailabilityProbe {
 	return func(pkg string) bool {
 		res := deps.Runner.Exec(ctx, runner.CommandSpec{

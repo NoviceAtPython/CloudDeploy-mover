@@ -1,0 +1,73 @@
+# hdr-4k120-cuda-compatible - HDR + CUDA toolkit required, but with
+# the broadest-compat CUDA selection policy.
+#
+# Where hdr-4k120-cuda is strict (CUDA 13 exactly, never the Ubuntu
+# archive), this profile says: "I want CUDA installed and working;
+# I am OK with any major >= 12; Ubuntu's nvidia-cuda-toolkit is a
+# legitimate fallback." That makes it the profile-of-choice for:
+#
+#   * cloud VMs where the host's Ubuntu release has no official
+#     NVIDIA CUDA apt repo (e.g. Ubuntu 25.10 today, where
+#     `https://developer.download.nvidia.com/.../ubuntu2510/` 404s
+#     and the only installable toolkit is Ubuntu archive's
+#     nvidia-cuda-toolkit at 12.4).
+#   * heterogeneous fleets where different VMs may run different
+#     driver/CUDA pairings and the operator wants a single profile
+#     that "works everywhere CUDA can be installed".
+#
+# Trade-off: the installed toolkit major may be 12 OR 13. Downstream
+# code that needs CUDA 13 features will fail on a 12-installed
+# version of this VM. Use hdr-4k120-cuda or hdr-4k120-cuda-ubuntu2404
+# when CUDA 13 is non-negotiable.
+
+profile: hdr-4k120-cuda-compatible
+ubuntu_version: "25.10"
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: required
+  method: apt
+  # latest-compatible: pick the newest installable toolkit major
+  # the host can actually install. min_major sets a soft floor.
+  selection_policy: latest-compatible
+  min_major: "12"
+  # allow Ubuntu's nvidia-cuda-toolkit (CUDA 12.4 on 25.10) when the
+  # NVIDIA CUDA apt repo has nothing newer. Combined with min_major=12
+  # the archive is accepted; without that combination it would still
+  # be filtered.
+  allow_ubuntu_archive_fallback: true
+  compile_smoke_test: true
+  package_name: ""
+  runfile_url: ""
+  runfile_sha256: ""
+  runfile_max_attempts: 3
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

@@ -75,11 +75,9 @@ func TestHDRProfileSpec(t *testing.T) {
 	}
 }
 
-// TestHDRCudaProfileSpec exercises the HDR-plus-required-CUDA profile
-// used for VM testing the cuda phase end-to-end. After the CUDA 13.0.2
-// runfile was discovered to be reproducibly corrupt on the production
-// mirror, the profile defaults to method=apt and ships with no
-// runfile URL pinned.
+// TestHDRCudaProfileSpec locks the strict CUDA-13-only invariants for
+// hdr-4k120-cuda: exact-major=13, no Ubuntu archive fallback, compile
+// smoke test on, runfile pin held empty pending a known-good artifact.
 func TestHDRCudaProfileSpec(t *testing.T) {
 	dir := repoConfigDir(t)
 	p, err := LoadProfile(dir, "hdr-4k120-cuda")
@@ -95,6 +93,18 @@ func TestHDRCudaProfileSpec(t *testing.T) {
 	if strings.ToLower(p.CUDA.Method) != "apt" {
 		t.Errorf("hdr-4k120-cuda: cuda.method must be 'apt' while no known-good runfile is pinned; got %q", p.CUDA.Method)
 	}
+	if strings.ToLower(p.CUDA.SelectionPolicy) != "exact-major" {
+		t.Errorf("hdr-4k120-cuda: cuda.selection_policy must be exact-major (strict CUDA 13); got %q", p.CUDA.SelectionPolicy)
+	}
+	if p.CUDA.ExpectedMajor != "13" {
+		t.Errorf("hdr-4k120-cuda: cuda.expected_major must be \"13\"; got %q", p.CUDA.ExpectedMajor)
+	}
+	if p.CUDA.AllowUbuntuArchiveFallback {
+		t.Error("hdr-4k120-cuda: cuda.allow_ubuntu_archive_fallback must be false (Ubuntu archive ships CUDA 12)")
+	}
+	if !p.CUDA.CompileSmokeTest {
+		t.Error("hdr-4k120-cuda: cuda.compile_smoke_test must be true (CUDA-required must prove nvcc works)")
+	}
 	if strings.TrimSpace(p.CUDA.RunfileURL) != "" {
 		t.Errorf("hdr-4k120-cuda: cuda.runfile_url must be empty (CUDA 13.0.2 mirror is corrupt); got %q", p.CUDA.RunfileURL)
 	}
@@ -103,6 +113,35 @@ func TestHDRCudaProfileSpec(t *testing.T) {
 	}
 	if err := ValidateProfile(p); err != nil {
 		t.Errorf("ValidateProfile(hdr-4k120-cuda): %v", err)
+	}
+}
+
+// TestHDRCudaCompatibleProfileSpec locks the broad-compat invariants
+// for hdr-4k120-cuda-compatible: latest-compatible policy, min_major=12,
+// Ubuntu archive fallback allowed, compile smoke test on.
+func TestHDRCudaCompatibleProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-cuda-compatible")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-cuda-compatible): %v", err)
+	}
+	if strings.ToLower(p.CUDA.Mode) != "required" {
+		t.Errorf("compat: cuda.mode must be 'required'; got %q", p.CUDA.Mode)
+	}
+	if strings.ToLower(p.CUDA.SelectionPolicy) != "latest-compatible" {
+		t.Errorf("compat: cuda.selection_policy must be latest-compatible; got %q", p.CUDA.SelectionPolicy)
+	}
+	if p.CUDA.MinMajor != "12" {
+		t.Errorf("compat: cuda.min_major must be \"12\"; got %q", p.CUDA.MinMajor)
+	}
+	if !p.CUDA.AllowUbuntuArchiveFallback {
+		t.Error("compat: cuda.allow_ubuntu_archive_fallback must be true")
+	}
+	if !p.CUDA.CompileSmokeTest {
+		t.Error("compat: cuda.compile_smoke_test must be true")
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-cuda-compatible): %v", err)
 	}
 }
 
@@ -137,6 +176,18 @@ func TestHDRCuda2404ProfileSpec(t *testing.T) {
 	}
 	if p.Deploy.AutoUpgradeUbuntu {
 		t.Error("deploy.auto_upgrade_ubuntu must be false: this profile must NOT upgrade off 24.04")
+	}
+	if strings.ToLower(p.CUDA.SelectionPolicy) != "exact-major" {
+		t.Errorf("cuda.selection_policy must be exact-major (strict CUDA 13); got %q", p.CUDA.SelectionPolicy)
+	}
+	if p.CUDA.ExpectedMajor != "13" {
+		t.Errorf("cuda.expected_major must be \"13\"; got %q", p.CUDA.ExpectedMajor)
+	}
+	if p.CUDA.AllowUbuntuArchiveFallback {
+		t.Error("cuda.allow_ubuntu_archive_fallback must be false on the strict profile")
+	}
+	if !p.CUDA.CompileSmokeTest {
+		t.Error("cuda.compile_smoke_test must be true")
 	}
 	if err := ValidateProfile(p); err != nil {
 		t.Errorf("ValidateProfile(hdr-4k120-cuda-ubuntu2404): %v", err)
@@ -266,6 +317,17 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Sunshine.ForceAV1HDR10 = false
 		}, "force_av1_hdr10"},
 		{"bad cuda method", func(p *Profile) { p.CUDA.Method = "snap" }, "cuda.method"},
+		{"bad cuda selection_policy", func(p *Profile) { p.CUDA.SelectionPolicy = "yolo" }, "cuda.selection_policy"},
+		{"bad cuda expected_major", func(p *Profile) { p.CUDA.ExpectedMajor = "13.0" }, "cuda.expected_major"},
+		{"bad cuda min_major", func(p *Profile) { p.CUDA.MinMajor = "twelve" }, "cuda.min_major"},
+		{"exact-major missing expected_major", func(p *Profile) {
+			p.CUDA.SelectionPolicy = "exact-major"
+			p.CUDA.ExpectedMajor = ""
+		}, "expected_major"},
+		{"min-major missing min_major", func(p *Profile) {
+			p.CUDA.SelectionPolicy = "min-major"
+			p.CUDA.MinMajor = ""
+		}, "min_major"},
 	}
 	base := func() *Profile {
 		return &Profile{

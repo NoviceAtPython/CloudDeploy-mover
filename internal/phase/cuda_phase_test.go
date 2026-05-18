@@ -92,7 +92,12 @@ func TestCudaPhase_AlreadyInstalledShortCircuits(t *testing.T) {
 }
 
 func TestCudaPhase_AlreadyInstalledWrongMajor_RequiredFails(t *testing.T) {
-	deps := cudaPhaseDeps(t, cudaTestProfile("auto", "https://example/cuda/13.0.2/x.run"))
+	p := cudaTestProfile("auto", "https://example/cuda/13.0.2/x.run")
+	// Express the "wrong major is fatal" expectation explicitly via
+	// selection policy now that derived ExpectedMajor is gone.
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	deps := cudaPhaseDeps(t, p)
 	tmpdir := t.TempDir()
 	// nvcc 12.x present but profile expects CUDA 13. Short-circuit
 	// must NOT fire; with no apt repo and a failing download, the
@@ -495,6 +500,10 @@ func TestCudaPhase_VerifyFailsWhenLayoutMissing(t *testing.T) {
 func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 	url := "https://example/cuda/13.0.2/x.run"
 	p := cudaTestProfile("runfile", url)
+	// Express the "wrong major is fatal" expectation explicitly:
+	// post-install nvcc must report CUDA 13 or the phase fails.
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
 	p.CUDA.RunfileMaxAttempts = 1
 	deps := cudaPhaseDeps(t, p)
 	tmpdir := t.TempDir()
@@ -516,14 +525,283 @@ func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected fatal mismatch error")
 	}
-	if !strings.Contains(err.Error(), "mismatch") {
-		t.Errorf("error should mention mismatch: %v", err)
+	// New phrasing: "selection_policy=exact-major requires major 13".
+	if !strings.Contains(err.Error(), "exact-major") && !strings.Contains(err.Error(), "mismatch") {
+		t.Errorf("error should mention the selection policy or mismatch: %v", err)
 	}
 }
 
 // -----------------------------------------------------------------------------
 // state shape
 // -----------------------------------------------------------------------------
+
+// -----------------------------------------------------------------------------
+// smoke test
+// -----------------------------------------------------------------------------
+
+func TestCudaPhase_SmokeCompileSuccessMarksDone(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+	snippet := filepath.Join(t.TempDir(), "clouddeploy-cuda.sh")
+
+	srcSeen := ""
+	binSeen := ""
+	compileCalls := 0
+	runCalls := 0
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn: func(_ context.Context, _ *Deps, src, bin string) error {
+			compileCalls++
+			srcSeen = src
+			binSeen = bin
+			return nil
+		},
+		SmokeRunFn: func(context.Context, *Deps, string) error {
+			runCalls++
+			return nil
+		},
+		ProfileSnippetPathOverride: snippet,
+		RunfileTmpDirOverride:      tmpdir,
+		SmokeDirOverride:           smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if compileCalls != 1 {
+		t.Errorf("SmokeCompileFn called %d times; want 1", compileCalls)
+	}
+	if runCalls != 1 {
+		t.Errorf("SmokeRunFn called %d times; want 1", runCalls)
+	}
+	if filepath.Dir(srcSeen) != smokeDir || filepath.Base(srcSeen) != "smoke.cu" {
+		t.Errorf("smoke source should land under SmokeDirOverride as smoke.cu; got %q", srcSeen)
+	}
+	if filepath.Dir(binSeen) != smokeDir || filepath.Base(binSeen) != "smoke" {
+		t.Errorf("smoke binary should land under SmokeDirOverride as smoke; got %q", binSeen)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["compile_smoke_test"] != true {
+		t.Errorf("details.compile_smoke_test must be true; got %v", d["compile_smoke_test"])
+	}
+	if d["compile_smoke_test_passed"] != true {
+		t.Errorf("details.compile_smoke_test_passed must be true; got %v", d["compile_smoke_test_passed"])
+	}
+	if d["runtime_smoke_test_passed"] != true {
+		t.Errorf("details.runtime_smoke_test_passed must be true; got %v", d["runtime_smoke_test_passed"])
+	}
+	// The .cu file must actually be on disk (so collect-logs can grab it).
+	if _, err := os.Stat(srcSeen); err != nil {
+		t.Errorf("smoke.cu missing on disk: %v", err)
+	}
+}
+
+func TestCudaPhase_SmokeCompileFailureFailsRequiredMode(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
+			return errors.New("simulated nvcc: error: a previous error has been ignored")
+		},
+		RunfileTmpDirOverride: tmpdir,
+		SmokeDirOverride:      smokeDir,
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal smoke-compile failure in required mode")
+	}
+	if !strings.Contains(err.Error(), "compile smoke test failed") {
+		t.Errorf("error should mention compile smoke test failure: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+func TestCudaPhase_SmokeCompileFailureOptionalSkipsNonfatal(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.Mode = "optional"
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:        func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn:      func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn:        func(context.Context, *Deps, string, string) error { return errors.New("simulated compile failure") },
+		RunfileTmpDirOverride: tmpdir,
+		SmokeDirOverride:      smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("optional + compile fail must skip nonfatal; got err: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusSkipped {
+		t.Errorf("status: got %q want skipped", got)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["compile_smoke_test_passed"] != false {
+		t.Errorf("details.compile_smoke_test_passed must be false; got %v", d["compile_smoke_test_passed"])
+	}
+}
+
+func TestCudaPhase_AlreadyInstalledRunsSmoke(t *testing.T) {
+	p := cudaTestProfile("auto", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+	snippet := filepath.Join(t.TempDir(), "clouddeploy-cuda.sh")
+
+	smokeCalls := 0
+	ph := Cuda{
+		NvccProbeFn:    func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{Major: "13", Minor: "0"} },
+		CudaLayoutOKFn: func() bool { return true },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
+			smokeCalls++
+			return nil
+		},
+		SmokeRunFn:                 func(context.Context, *Deps, string) error { return nil },
+		ProfileSnippetPathOverride: snippet,
+		SmokeDirOverride:           smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if smokeCalls != 1 {
+		t.Errorf("already-installed path must run smoke when compile_smoke_test=true; got %d compile calls", smokeCalls)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Errorf("status: got %q want done", got)
+	}
+}
+
+func TestCudaPhase_CompileSmokeFalseSkipsSmoke(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = false
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+
+	compileCalls := 0
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
+			compileCalls++
+			return nil
+		},
+		RunfileTmpDirOverride: tmpdir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if compileCalls != 0 {
+		t.Errorf("compile_smoke_test=false: compile must not run; got %d calls", compileCalls)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["compile_smoke_test"] != false {
+		t.Errorf("details.compile_smoke_test must be false; got %v", d["compile_smoke_test"])
+	}
+	if _, ok := d["compile_smoke_test_passed"]; ok {
+		t.Errorf("details must not record compile_smoke_test_passed when smoke is off; got %v", d["compile_smoke_test_passed"])
+	}
+}
+
+func TestCudaPhase_SmokeRunFailureIsNonFatalEvenInRequired(t *testing.T) {
+	// "Some headless/cloud contexts may not expose a usable CUDA
+	// device before reboot/driver reload." Compile success must let
+	// the phase succeed even if running the binary fails.
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn:   func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn: func(context.Context, *Deps, string) error {
+			return errors.New("CUDA error: no CUDA-capable device is detected")
+		},
+		RunfileTmpDirOverride: tmpdir,
+		SmokeDirOverride:      smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("required + compile-pass + run-fail must NOT fail the phase; got err: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Errorf("status: got %q want done", got)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["runtime_smoke_test_passed"] != false {
+		t.Errorf("details.runtime_smoke_test_passed must be false; got %v", d["runtime_smoke_test_passed"])
+	}
+	if d["compile_smoke_test_passed"] != true {
+		t.Errorf("details.compile_smoke_test_passed must remain true; got %v", d["compile_smoke_test_passed"])
+	}
+}
 
 // -----------------------------------------------------------------------------
 // diagnostic hint

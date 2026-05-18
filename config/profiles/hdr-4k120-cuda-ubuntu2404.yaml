@@ -61,16 +61,16 @@ nvidia:
   prefer_server: false
 
 cuda:
-  # required: phase fails the deploy if it cannot install + verify
-  # nvcc.
+  # Strict CUDA-13-only profile, just like hdr-4k120-cuda but pinned
+  # to Ubuntu 24.04 LTS so the ubuntu2404 NVIDIA CUDA apt repo (which
+  # actually exists) can satisfy the install.
   mode: required
-  package_name: ""
-  # apt: bootstrap the official NVIDIA CUDA apt repo
-  # (cuda-keyring_1.1-1, ubuntu2404 distro slug) and install a
-  # `cuda-toolkit-13-N` package toolkit-only. The candidate ladder
-  # filters Ubuntu's CUDA-12 `nvidia-cuda-toolkit` out (driver 580
-  # pairs with CUDA 13).
   method: apt
+  selection_policy: exact-major
+  expected_major: "13"
+  allow_ubuntu_archive_fallback: false
+  compile_smoke_test: true
+  package_name: ""
   runfile_url: ""
   runfile_sha256: ""
   runfile_max_attempts: 3

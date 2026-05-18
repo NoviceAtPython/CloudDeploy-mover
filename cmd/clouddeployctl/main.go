@@ -542,10 +542,14 @@ func newDoctorCudaCmd() *cobra.Command {
 			}
 			mode := cuda.ModeNone
 			method := cuda.MethodAuto
+			policy := cuda.PolicyLatestCompatible
 			packageName := ""
 			runfileURL := ""
 			runfileSHA := ""
 			runfileMaxAttempts := 0
+			driverMajor := profileDriverMajor(deps)
+			selection := cuda.Selection{DriverPreferredMajor: cuda.PreferredMajorForDriver(driverMajor)}
+			compileSmokeTest := false
 			if deps.Profile != nil {
 				if m, perr := cuda.ParseMode(deps.Profile.CUDA.Mode); perr == nil {
 					mode = m
@@ -553,13 +557,20 @@ func newDoctorCudaCmd() *cobra.Command {
 				if mt, perr := cuda.ParseMethod(deps.Profile.CUDA.Method); perr == nil {
 					method = mt
 				}
+				if pol, perr := cuda.ParseSelectionPolicy(deps.Profile.CUDA.SelectionPolicy); perr == nil {
+					policy = pol
+				}
 				packageName = deps.Profile.CUDA.PackageName
 				runfileURL = deps.Profile.CUDA.RunfileURL
 				runfileSHA = deps.Profile.CUDA.RunfileSHA256
 				runfileMaxAttempts = deps.Profile.CUDA.RunfileMaxAttempts
+				selection.Policy = policy
+				selection.ExpectedMajor = deps.Profile.CUDA.ExpectedMajor
+				selection.MinMajor = deps.Profile.CUDA.MinMajor
+				selection.AllowUbuntuArchiveFallback = deps.Profile.CUDA.AllowUbuntuArchiveFallback
+				compileSmokeTest = deps.Profile.CUDA.CompileSmokeTest
 			}
 			plan := cuda.Plan(mode)
-			expectedMajor := cuda.ExpectedMajor(packageName, runfileURL)
 
 			// Probe the host for nvcc.
 			_, nvccErr := lookExecutable("nvcc")
@@ -567,36 +578,42 @@ func newDoctorCudaCmd() *cobra.Command {
 
 			fmt.Println("doctor cuda:")
 			if deps.Profile != nil {
-				fmt.Printf("  Profile                 : %s\n", deps.Profile.Profile)
+				fmt.Printf("  Profile                       : %s\n", deps.Profile.Profile)
 			} else {
-				fmt.Printf("  Profile                 : (no profile loaded)\n")
+				fmt.Printf("  Profile                       : (no profile loaded)\n")
 			}
-			fmt.Printf("  cuda.mode               : %s\n", plan.Mode)
-			fmt.Printf("  cuda.method             : %s\n", method)
-			fmt.Printf("  Will attempt install    : %v\n", plan.WillAttemptInstall && method != cuda.MethodNone)
-			fmt.Printf("  Fails deploy on error   : %v\n", plan.FailsDeployOnError)
-			fmt.Printf("  Expected major (pin)    : %s\n", evOrUnknown(expectedMajor))
-			fmt.Printf("  cuda.package_name       : %s\n", evOrUnknown(packageName))
-			fmt.Printf("  cuda.runfile_url        : %s\n", evOrUnknown(runfileURL))
-			fmt.Printf("  cuda.runfile_sha256     : %s\n", evOrUnknown(runfileSHA))
-			fmt.Printf("  cuda.runfile_max_attempts: %d (effective: %d)\n",
+			fmt.Printf("  cuda.mode                     : %s\n", plan.Mode)
+			fmt.Printf("  cuda.method                   : %s\n", method)
+			fmt.Printf("  cuda.selection_policy         : %s\n", policy)
+			fmt.Printf("  cuda.expected_major           : %s\n", evOrUnknown(selection.ExpectedMajor))
+			fmt.Printf("  cuda.min_major                : %s\n", evOrUnknown(selection.MinMajor))
+			fmt.Printf("  cuda.allow_ubuntu_archive_fallback: %v\n", selection.AllowUbuntuArchiveFallback)
+			fmt.Printf("  cuda.compile_smoke_test       : %v\n", compileSmokeTest)
+			fmt.Printf("  nvidia.driver_major           : %s\n", evOrUnknown(driverMajor))
+			fmt.Printf("  driver-preferred CUDA major   : %s\n", evOrUnknown(selection.DriverPreferredMajor))
+			fmt.Printf("  Will attempt install          : %v\n", plan.WillAttemptInstall && method != cuda.MethodNone)
+			fmt.Printf("  Fails deploy on error         : %v\n", plan.FailsDeployOnError)
+			fmt.Printf("  cuda.package_name             : %s\n", evOrUnknown(packageName))
+			fmt.Printf("  cuda.runfile_url              : %s\n", evOrUnknown(runfileURL))
+			fmt.Printf("  cuda.runfile_sha256           : %s\n", evOrUnknown(runfileSHA))
+			fmt.Printf("  cuda.runfile_max_attempts     : %d (effective: %d)\n",
 				runfileMaxAttempts,
 				cuda.ResolveRunfileMaxAttempts(runfileMaxAttempts, os.Getenv("CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS")))
-			fmt.Printf("  nvcc on PATH            : %v\n", nvccPresent)
+			fmt.Printf("  nvcc on PATH                  : %v\n", nvccPresent)
 			fmt.Println()
-			fmt.Println("Apt candidate ladder (for the chosen driver_major + required-major):")
-			ladder := cuda.CandidateLadder(cuda.CandidateOptions{
-				PreferredMajor: profileDriverMajor(deps),
-				ExplicitName:   packageName,
-				RequiredMajor:  expectedMajor,
-			})
-			for _, c := range ladder {
+			fmt.Println("Apt candidate ladder (policy-filtered):")
+			for _, c := range cuda.CandidateLadder(selection.CandidateOptions(packageName)) {
 				fmt.Printf("  - %s\n", c)
 			}
 			fmt.Println()
 			fmt.Println("Rationale:")
 			fmt.Printf("  %s\n", plan.Rationale)
 			fmt.Println()
+			fmt.Println("Selection policy semantics:")
+			fmt.Println("  - latest-compatible : pick newest installable; honor min_major as soft floor.")
+			fmt.Println("  - exact-major       : nvcc reported major must equal expected_major.")
+			fmt.Println("  - min-major         : nvcc reported major must be >= min_major.")
+			fmt.Println("  - any               : any parseable nvcc satisfies (broad-compat).")
 			fmt.Println("Runfile retry policy:")
 			fmt.Println("  - same (sha256, size) that already failed --check => refuse to redownload.")
 			fmt.Println("  - 3 consecutive --check failures => give up.")
