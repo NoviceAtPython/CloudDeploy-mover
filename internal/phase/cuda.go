@@ -70,11 +70,16 @@ type Cuda struct {
 	RepoProbeFn            cuda.RepoAvailabilityProbe
 	CurrentUbuntuVersionFn func() string
 	NvccProbeFn            func(ctx context.Context, deps *Deps) cuda.NvccRelease
-	CudaLayoutOKFn         func() bool
-	HTTPHeadFn             func(ctx context.Context, deps *Deps, url string) bool
-	DownloadFn             func(ctx context.Context, deps *Deps, url, dst string) (size int64, err error)
-	RunfileCheckFn         func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
-	RunfileInstallFn       func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
+
+	// CudaLayoutFn lets tests inject the source-aware layout probe.
+	// Production: walks both LayoutNvidiaCanonical and
+	// LayoutUbuntuArchive paths via os.Stat. nil = real probe.
+	CudaLayoutFn func() cuda.CudaLayout
+
+	HTTPHeadFn       func(ctx context.Context, deps *Deps, url string) bool
+	DownloadFn       func(ctx context.Context, deps *Deps, url, dst string) (size int64, err error)
+	RunfileCheckFn   func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
+	RunfileInstallFn func(ctx context.Context, deps *Deps, runfile, tmpdir string) error
 
 	// SmokeCompileFn lets tests inject the `nvcc -o bin src.cu` step.
 	// Receives the path to the staged .cu and the desired binary path.
@@ -180,16 +185,24 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 	// the configured selection policy. Still run the smoke test (when
 	// CompileSmokeTest=true) so a stale-headers regression on a
 	// previously-passing host surfaces during apply.
-	if rel, ok := p.alreadyInstalledMatches(ctx, deps, selection); ok {
+	if rel, layout, ok := p.alreadyInstalledMatches(ctx, deps, selection); ok {
 		baseDetails := map[string]any{
-			"mode":             string(plan.Mode),
-			"method":           string(method),
-			"selection_policy": string(selection.Policy),
-			"source":           "already-installed",
-			"nvcc_version":     rel.Full(),
-			"cuda_major":       rel.Major,
-			"expected_major":   selection.EffectivePinnedMajor(),
-			"verified_layout":  true,
+			"mode":                   string(plan.Mode),
+			"method":                 string(method),
+			"selection_policy":       string(selection.Policy),
+			"source":                 "already-installed",
+			"nvcc_version":           rel.Full(),
+			"cuda_major":             rel.Major,
+			"selected_major":         rel.Major,
+			"driver_preferred_major": selection.DriverPreferredMajor,
+			"required_major":         selection.ExpectedMajor,
+			"min_major":              selection.MinMajor,
+			"expected_major":         selection.EffectivePinnedMajor(),
+			"layout_kind":            string(layout.Kind),
+			"layout_nvcc":            layout.NvccPath,
+			"layout_headers":         layout.Headers,
+			"layout_libs":            layout.Libs,
+			"verified_layout":        true,
 		}
 		if err := p.runSmokeIfRequested(ctx, deps, compileSmokeTest, baseDetails, log); err != nil {
 			if plan.FailsDeployOnError {
@@ -626,22 +639,60 @@ func (p Cuda) verifyAndFinish(
 	log *slog.Logger,
 ) error {
 	rel := p.readNvccRelease(ctx, deps)
-	layoutOK := p.cudaLayoutOK()
+	layout := p.detectCudaLayout()
 
+	// Richer state-of-record fields. The pre-existing `expected_major`
+	// key stays for backwards compat (set to the strict pin, the min
+	// floor, or the driver-preferred fallback - whichever Selection
+	// considers "operator-pinned"), but doctor / collect-logs should
+	// prefer these clearer keys.
 	details["mode"] = string(plan.Mode)
 	details["selection_policy"] = string(selection.Policy)
 	details["nvcc_version"] = rel.Full()
 	details["cuda_major"] = rel.Major
+	details["selected_major"] = rel.Major
+	details["selected_package"] = stringOr(details, "package", "")
+	details["driver_preferred_major"] = selection.DriverPreferredMajor
+	details["required_major"] = selection.ExpectedMajor
+	details["min_major"] = selection.MinMajor
 	details["expected_major"] = selection.EffectivePinnedMajor()
-	details["verified_layout"] = layoutOK
+	details["layout_kind"] = string(layout.Kind)
+	details["layout_nvcc"] = layout.NvccPath
+	details["layout_headers"] = layout.Headers
+	details["layout_libs"] = layout.Libs
+	details["verified_layout"] = layout.Kind != cuda.LayoutMissing
 
-	if rel.Major == "" || !layoutOK {
-		err := fmt.Errorf("cuda verification failed: nvcc_release=%q layout_ok=%v (need /usr/local/cuda/bin/nvcc + include + lib64)",
-			rel.Full(), layoutOK)
+	// Source-aware layout requirement.
+	expected := cuda.LayoutFromInstallSource(
+		stringOr(details, "source", ""),
+		stringOr(details, "package", ""),
+		boolOr(details, "archive_fallback", false),
+	)
+	if rel.Major == "" {
+		err := fmt.Errorf("cuda verification failed: nvcc_release=%q (could not parse `nvcc --version`)", rel.Full())
 		if plan.FailsDeployOnError {
 			return p.fail(deps, plan, "cuda post-install verification failed", err)
 		}
 		return p.skipNonfatal(deps, plan, "cuda verification failed; mode=optional", details)
+	}
+	if layout.Kind == cuda.LayoutMissing {
+		err := fmt.Errorf("cuda verification failed: no usable toolkit layout on disk (looked for /usr/local/cuda/{bin/nvcc,include,lib64} AND /usr/bin/nvcc + /usr/include/cuda_runtime.h|/usr/lib/cuda/include + libcudart)")
+		if plan.FailsDeployOnError {
+			return p.fail(deps, plan, "cuda post-install verification failed", err)
+		}
+		return p.skipNonfatal(deps, plan, "cuda verification failed; mode=optional", details)
+	}
+	if expected != "" && layout.Kind != expected {
+		// Strict path: a runfile install or NVIDIA-repo apt install
+		// MUST land /usr/local/cuda; we refuse to declare success if
+		// the host instead reports only the Ubuntu archive layout
+		// (which would mean the canonical install silently no-op'd).
+		err := fmt.Errorf("cuda verification failed: install source=%q expects %q layout but host shows %q",
+			details["source"], expected, layout.Kind)
+		if plan.FailsDeployOnError {
+			return p.fail(deps, plan, "cuda layout does not match install source", err)
+		}
+		return p.skipNonfatal(deps, plan, "cuda layout mismatch; mode=optional", details)
 	}
 	if ok, why := selection.SatisfiesNvcc(rel); !ok {
 		err := fmt.Errorf("cuda selection policy not satisfied: %s", why)
@@ -668,16 +719,17 @@ func (p Cuda) verifyAndFinish(
 	return nil
 }
 
-func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, selection cuda.Selection) (cuda.NvccRelease, bool) {
-	if !p.cudaLayoutOK() {
-		return cuda.NvccRelease{}, false
+func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, selection cuda.Selection) (cuda.NvccRelease, cuda.CudaLayout, bool) {
+	layout := p.detectCudaLayout()
+	if layout.Kind == cuda.LayoutMissing {
+		return cuda.NvccRelease{}, layout, false
 	}
 	rel := p.readNvccRelease(ctx, deps)
 	if rel.Major == "" {
-		return cuda.NvccRelease{}, false
+		return cuda.NvccRelease{}, layout, false
 	}
 	ok, _ := selection.SatisfiesNvcc(rel)
-	return rel, ok
+	return rel, layout, ok
 }
 
 func (p Cuda) readNvccRelease(ctx context.Context, deps *Deps) cuda.NvccRelease {
@@ -699,23 +751,85 @@ func (p Cuda) readNvccRelease(ctx context.Context, deps *Deps) cuda.NvccRelease 
 	return cuda.ParseNvccRelease(res.Stdout)
 }
 
-func (p Cuda) cudaLayoutOK() bool {
-	if p.CudaLayoutOKFn != nil {
-		return p.CudaLayoutOKFn()
+// detectCudaLayout returns the on-disk evidence of an installed CUDA
+// toolkit. It accepts EITHER:
+//
+//   - LayoutNvidiaCanonical (/usr/local/cuda/{bin/nvcc,include,lib64}),
+//     produced by NVIDIA's runfile and the official CUDA apt repo, OR
+//   - LayoutUbuntuArchive (nvcc on PATH + /usr/include/cuda_runtime.h
+//     OR /usr/lib/cuda/include + libcudart somewhere reasonable),
+//     produced by Ubuntu's `nvidia-cuda-toolkit` package.
+//
+// On non-Linux developer hosts the probe defaults to "missing" so
+// tests that exercise the verifier must wire CudaLayoutFn explicitly.
+func (p Cuda) detectCudaLayout() cuda.CudaLayout {
+	if p.CudaLayoutFn != nil {
+		return p.CudaLayoutFn()
 	}
 	if runtime.GOOS != "linux" {
-		return true
+		return cuda.CudaLayout{Kind: cuda.LayoutMissing, Notes: []string{"non-linux developer host"}}
 	}
-	for _, sub := range []string{
-		filepath.Join(cuda.CudaRoot, "bin", "nvcc"),
-		filepath.Join(cuda.CudaRoot, "include"),
-		filepath.Join(cuda.CudaRoot, "lib64"),
-	} {
+	canonical := true
+	canonicalNvcc := filepath.Join(cuda.CudaRoot, "bin", "nvcc")
+	canonicalInc := filepath.Join(cuda.CudaRoot, "include")
+	canonicalLib := filepath.Join(cuda.CudaRoot, "lib64")
+	for _, sub := range []string{canonicalNvcc, canonicalInc, canonicalLib} {
 		if _, err := os.Stat(sub); err != nil {
-			return false
+			canonical = false
+			break
 		}
 	}
-	return true
+	if canonical {
+		return cuda.CudaLayout{
+			Kind: cuda.LayoutNvidiaCanonical, NvccPath: canonicalNvcc,
+			Headers: canonicalInc, Libs: canonicalLib,
+		}
+	}
+	// Ubuntu archive layout: nvcc on PATH, headers + libs in either
+	// of the two locations the package ships them.
+	out := cuda.CudaLayout{Kind: cuda.LayoutMissing}
+	if _, err := os.Stat("/usr/bin/nvcc"); err == nil {
+		out.NvccPath = "/usr/bin/nvcc"
+	}
+	for _, h := range []string{"/usr/include/cuda_runtime.h", "/usr/lib/cuda/include"} {
+		if _, err := os.Stat(h); err == nil {
+			out.Headers = h
+			break
+		}
+	}
+	for _, l := range []string{"/usr/lib/cuda/lib64", "/usr/lib/x86_64-linux-gnu"} {
+		// We accept either an explicit /usr/lib/cuda/lib64 dir OR a
+		// matching libcudart.so* under multiarch lib. Stat the dir
+		// + check the libcudart pattern lazily.
+		info, err := os.Stat(l)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if l == "/usr/lib/cuda/lib64" {
+			out.Libs = l
+			break
+		}
+		// Look for libcudart.so* under multiarch.
+		entries, derr := os.ReadDir(l)
+		if derr != nil {
+			continue
+		}
+		for _, e := range entries {
+			name := e.Name()
+			if strings.HasPrefix(name, "libcudart.so") {
+				out.Libs = filepath.Join(l, name)
+				break
+			}
+		}
+		if out.Libs != "" {
+			break
+		}
+	}
+	if out.NvccPath != "" && out.Headers != "" && out.Libs != "" {
+		out.Kind = cuda.LayoutUbuntuArchive
+		out.Notes = append(out.Notes, "Ubuntu archive nvidia-cuda-toolkit layout")
+	}
+	return out
 }
 
 func (p Cuda) profileSnippetPath() string {
@@ -935,6 +1049,22 @@ func makeAptCacheProbe(ctx context.Context, deps *Deps) cuda.AvailabilityProbe {
 		}
 		return false
 	}
+}
+
+// stringOr returns details[key] if it's a non-empty string, else def.
+func stringOr(details map[string]any, key, def string) string {
+	if v, ok := details[key].(string); ok && v != "" {
+		return v
+	}
+	return def
+}
+
+// boolOr returns details[key] if it's a bool, else def.
+func boolOr(details map[string]any, key string, def bool) bool {
+	if v, ok := details[key].(bool); ok {
+		return v
+	}
+	return def
 }
 
 func tailLines(s string, n int) string {

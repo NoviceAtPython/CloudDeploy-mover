@@ -79,9 +79,14 @@ ConditionPathExists={{ .StatePath }}
 Type=oneshot
 RemainAfterExit=no
 EnvironmentFile=-{{ .EnvFile }}
+ExecStartPre=/bin/mkdir -p /var/log/clouddeploy
 ExecStart={{ .Binary }} resume --profile {{ .Profile }} --state-path {{ .StatePath }}
-StandardOutput=journal
-StandardError=journal
+# Append to a dedicated host log so the operator can grep without
+# going through journalctl. systemd 240+ supports append: directly;
+# every Ubuntu we target ships 245+.
+StandardOutput=append:/var/log/clouddeploy/continue.log
+StandardError=append:/var/log/clouddeploy/continue.log
+SyslogIdentifier=clouddeploy-continue
 
 [Install]
 WantedBy=multi-user.target

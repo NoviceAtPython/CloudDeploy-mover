@@ -54,6 +54,31 @@ func stagedNvccProbe(before, after cuda.NvccRelease) func(context.Context, *Deps
 	}
 }
 
+// layoutCanonicalFn / layoutMissingFn / layoutUbuntuArchiveFn pair
+// the test-side replacements for the deleted CudaLayoutOKFn -
+// CudaLayoutFn returns the richer cuda.CudaLayout used by the
+// source-aware verifier.
+func layoutCanonicalFn() func() cuda.CudaLayout {
+	return func() cuda.CudaLayout {
+		return cuda.CudaLayout{
+			Kind: cuda.LayoutNvidiaCanonical, NvccPath: "/usr/local/cuda/bin/nvcc",
+			Headers: "/usr/local/cuda/include", Libs: "/usr/local/cuda/lib64",
+		}
+	}
+}
+func layoutMissingFn() func() cuda.CudaLayout {
+	return func() cuda.CudaLayout { return cuda.CudaLayout{Kind: cuda.LayoutMissing} }
+}
+func layoutUbuntuArchiveFn() func() cuda.CudaLayout {
+	return func() cuda.CudaLayout {
+		return cuda.CudaLayout{
+			Kind: cuda.LayoutUbuntuArchive, NvccPath: "/usr/bin/nvcc",
+			Headers: "/usr/include/cuda_runtime.h",
+			Libs:    "/usr/lib/x86_64-linux-gnu/libcudart.so.12",
+		}
+	}
+}
+
 // -----------------------------------------------------------------------------
 // already-installed short-circuit
 // -----------------------------------------------------------------------------
@@ -65,7 +90,7 @@ func TestCudaPhase_AlreadyInstalledShortCircuits(t *testing.T) {
 		// nvcc returns 13.0; layout OK; profile pinned 13 via the
 		// runfile URL ExpectedMajor parser.
 		NvccProbeFn:                func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{Major: "13", Minor: "0"} },
-		CudaLayoutOKFn:             func() bool { return true },
+		CudaLayoutFn:               layoutCanonicalFn(),
 		ProfileSnippetPathOverride: snippet,
 	}
 	if err := ph.Run(context.Background(), deps); err != nil {
@@ -108,7 +133,7 @@ func TestCudaPhase_AlreadyInstalledWrongMajor_RequiredFails(t *testing.T) {
 			called++
 			return cuda.NvccRelease{Major: "12", Minor: "4"}
 		},
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
 		DownloadFn: func(context.Context, *Deps, string, string) (int64, error) {
@@ -164,8 +189,8 @@ func TestCudaPhase_RunfilePath_Required_NoURL_FailsFatal(t *testing.T) {
 	p := cudaTestProfile("runfile", "")
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn: func() bool { return false },
-		NvccProbeFn:    func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		CudaLayoutFn: layoutMissingFn(),
+		NvccProbeFn:  func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 	}
 	err := ph.Run(context.Background(), deps)
 	if err == nil {
@@ -184,8 +209,8 @@ func TestCudaPhase_RunfilePath_Optional_NoURL_SkipsNonfatal(t *testing.T) {
 	p.CUDA.Mode = "optional"
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn: func() bool { return false },
-		NvccProbeFn:    func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		CudaLayoutFn: layoutMissingFn(),
+		NvccProbeFn:  func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 	}
 	if err := ph.Run(context.Background(), deps); err != nil {
 		t.Fatalf("Run: %v", err)
@@ -205,7 +230,7 @@ func TestCudaPhase_RunfilePath_HappyPath(t *testing.T) {
 
 	gotToolkitOnly := false
 	ph := Cuda{
-		CudaLayoutOKFn: func() bool { return true },
+		CudaLayoutFn: layoutCanonicalFn(),
 		// nvcc release missing pre-install, present post-install.
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
@@ -253,7 +278,7 @@ func TestCudaPhase_RunfilePath_RefusesSameSHARetry(t *testing.T) {
 
 	checkCalls := 0
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -296,7 +321,7 @@ func TestCudaPhase_RunfilePath_HTMLDisguise(t *testing.T) {
 	tmpdir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -325,7 +350,7 @@ func TestCudaPhase_RunfilePath_SHAMismatch(t *testing.T) {
 	tmpdir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -357,7 +382,7 @@ func TestCudaPhase_AptPath_FallsBackToRunfileOnRequiredMissingCandidate(t *testi
 
 	probedNames := []string{}
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return true },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -398,7 +423,7 @@ func TestCudaPhase_AptPath_RefusesDriverMetaPackage(t *testing.T) {
 	p.CUDA.PackageName = "cuda-drivers"
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return true },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -422,7 +447,7 @@ func TestCudaPhase_AptPath_MethodAptNoRepo_RequiredFails(t *testing.T) {
 	// NVIDIA CUDA apt repo + required = fatal.
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -470,7 +495,9 @@ func TestCudaPhase_AptPath_NoNvidiaRepo_ArchiveFallbackInstallsUbuntuToolkit(t *
 
 	probedNames := []string{}
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		// Archive install path: host has Ubuntu archive layout, NOT
+		// /usr/local/cuda. The verifier must accept this.
+		CudaLayoutFn:           layoutUbuntuArchiveFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -530,7 +557,7 @@ func TestCudaPhase_AptPath_NoRepo_NoArchiveFallback_RequiredFails(t *testing.T) 
 	p.CUDA.AllowUbuntuArchiveFallback = false
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -561,7 +588,7 @@ func TestCudaPhase_AptPath_StrictExact13_NoArchiveFallback_RequiredFails(t *test
 	p.CUDA.AllowUbuntuArchiveFallback = false
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -592,8 +619,8 @@ func TestCudaPhase_AptPath_ArchiveOnlyPathSkipsKeyringBootstrap(t *testing.T) {
 	repoProbeCalls := 0
 	httpHeadCalls := 0
 	ph := Cuda{
-		CudaLayoutOKFn: func() bool { return true },
-		NvccProbeFn:    stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		CudaLayoutFn: layoutUbuntuArchiveFn(),
+		NvccProbeFn:  stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
 		RepoProbeFn: func(string) bool {
 			repoProbeCalls++
 			return false
@@ -630,7 +657,7 @@ func TestCudaPhase_AptPath_OptionalSkipsWhenRepoMissing(t *testing.T) {
 	p.CUDA.Mode = "optional"
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -656,11 +683,11 @@ func TestCudaPhase_VerifyFailsWhenLayoutMissing(t *testing.T) {
 
 	calls := 0
 	ph := Cuda{
-		CudaLayoutOKFn: func() bool {
+		CudaLayoutFn: func() cuda.CudaLayout {
 			calls++
-			// Always false: pre-check (alreadyInstalledMatches) and
-			// post-install verifyAndFinish both fail.
-			return false
+			// Always LayoutMissing: pre-check (alreadyInstalledMatches)
+			// and post-install verifyAndFinish both fail.
+			return cuda.CudaLayout{Kind: cuda.LayoutMissing}
 		},
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{Major: "13", Minor: "0"} },
 		RepoProbeFn:            func(string) bool { return false },
@@ -681,7 +708,7 @@ func TestCudaPhase_VerifyFailsWhenLayoutMissing(t *testing.T) {
 		t.Errorf("error should mention verification: %v", err)
 	}
 	if calls < 2 {
-		t.Errorf("CudaLayoutOKFn should have been called pre- and post-install; got %d calls", calls)
+		t.Errorf("CudaLayoutFn should have been called pre- and post-install; got %d calls", calls)
 	}
 }
 
@@ -697,7 +724,7 @@ func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 	tmpdir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -724,6 +751,154 @@ func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
+// source-aware layout verifier
+// -----------------------------------------------------------------------------
+
+// TestCudaPhase_ArchiveFallback_AcceptsUbuntuLayout is the regression
+// test for the live-VM bug fixed in this commit: archive_fallback=true
+// + Ubuntu archive layout (no /usr/local/cuda) + smoke compile success
+// must reach phase done.
+func TestCudaPhase_ArchiveFallback_AcceptsUbuntuLayout(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+	snippet := filepath.Join(t.TempDir(), "clouddeploy-cuda.sh")
+
+	smokeCalls := 0
+	ph := Cuda{
+		// The whole point: Ubuntu archive layout, no /usr/local/cuda.
+		CudaLayoutFn:           layoutUbuntuArchiveFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		ProbeFn:                func(pkg string) bool { return pkg == "nvidia-cuda-toolkit" },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
+			smokeCalls++
+			return nil
+		},
+		SmokeRunFn:                 func(context.Context, *Deps, string) error { return nil },
+		ProfileSnippetPathOverride: snippet,
+		SmokeDirOverride:           smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("archive-fallback + Ubuntu layout must reach done; got: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Fatalf("status: got %q want done", got)
+	}
+	if smokeCalls != 1 {
+		t.Errorf("smoke compile should have run once; got %d calls", smokeCalls)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["layout_kind"] != "ubuntu-archive" {
+		t.Errorf("layout_kind: got %v want ubuntu-archive", d["layout_kind"])
+	}
+	if d["layout_nvcc"] != "/usr/bin/nvcc" {
+		t.Errorf("layout_nvcc: got %v want /usr/bin/nvcc", d["layout_nvcc"])
+	}
+	if d["archive_fallback"] != true {
+		t.Errorf("archive_fallback: got %v want true", d["archive_fallback"])
+	}
+	if d["selected_package"] != "nvidia-cuda-toolkit" {
+		t.Errorf("selected_package: got %v want nvidia-cuda-toolkit", d["selected_package"])
+	}
+	if d["selected_major"] != "12" {
+		t.Errorf("selected_major: got %v want 12", d["selected_major"])
+	}
+	if d["min_major"] != "12" {
+		t.Errorf("min_major: got %v want 12", d["min_major"])
+	}
+	if d["driver_preferred_major"] != "13" {
+		t.Errorf("driver_preferred_major: got %v want 13 (driver 580)", d["driver_preferred_major"])
+	}
+	if d["required_major"] != "" {
+		t.Errorf("required_major should be empty for latest-compatible; got %v", d["required_major"])
+	}
+}
+
+// TestCudaPhase_NvidiaRepoSource_RequiresCanonicalLayout pins the
+// load-bearing strict-side check: an apt install that came from the
+// NVIDIA CUDA apt repo (package != nvidia-cuda-toolkit, archive_fallback
+// =false) must produce /usr/local/cuda. If the host instead reports
+// only Ubuntu archive layout, the deploy must fail rather than
+// silently accept (e.g. someone installed nvidia-cuda-toolkit earlier).
+func TestCudaPhase_NvidiaRepoSource_RequiresCanonicalLayout(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.CompileSmokeTest = false
+	deps := cudaPhaseDeps(t, p)
+
+	ph := Cuda{
+		// Host has ONLY Ubuntu archive layout, even though we just
+		// "installed" cuda-toolkit-13-0 via the NVIDIA repo.
+		CudaLayoutFn:           layoutUbuntuArchiveFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return true },
+		CurrentUbuntuVersionFn: func() string { return "24.04" },
+		ProbeFn:                func(pkg string) bool { return pkg == "cuda-toolkit-13-0" },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("NVIDIA-repo source + Ubuntu-only layout must fail")
+	}
+	if !strings.Contains(err.Error(), "layout") {
+		t.Errorf("error should mention layout mismatch: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
+	}
+	d := deps.State.Get(CudaName).Details
+	_ = d // fail-path details are minimal by design (see p.fail)
+}
+
+// TestCudaPhase_StateDetailsDistinguishDriverPreferredFromSelected
+// asserts the clearer state-of-record fields: driver_preferred_major
+// reflects what NVIDIA pairs with the configured driver, while
+// selected_major reflects what was actually installed. They diverge
+// on the compatibility profile (driver 580 prefers CUDA 13, but the
+// archive installs CUDA 12).
+func TestCudaPhase_StateDetailsDistinguishDriverPreferredFromSelected(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutUbuntuArchiveFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		ProbeFn:                func(pkg string) bool { return pkg == "nvidia-cuda-toolkit" },
+		SmokeCompileFn:         func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:             func(context.Context, *Deps, string) error { return nil },
+		SmokeDirOverride:       smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["driver_preferred_major"] != "13" {
+		t.Errorf("driver_preferred_major: got %v want 13", d["driver_preferred_major"])
+	}
+	if d["selected_major"] != "12" {
+		t.Errorf("selected_major: got %v want 12", d["selected_major"])
+	}
+	// On the compat path, required_major must NOT report "13" — it
+	// reports the empty string because nothing requires 13 strictly.
+	if d["required_major"] != "" {
+		t.Errorf("required_major should be empty under latest-compatible; got %v", d["required_major"])
+	}
+}
+
+// -----------------------------------------------------------------------------
 // smoke test
 // -----------------------------------------------------------------------------
 
@@ -743,7 +918,7 @@ func TestCudaPhase_SmokeCompileSuccessMarksDone(t *testing.T) {
 	runCalls := 0
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -808,7 +983,7 @@ func TestCudaPhase_SmokeCompileFailureFailsRequiredMode(t *testing.T) {
 	smokeDir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -847,7 +1022,7 @@ func TestCudaPhase_SmokeCompileFailureOptionalSkipsNonfatal(t *testing.T) {
 	smokeDir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -884,8 +1059,8 @@ func TestCudaPhase_AlreadyInstalledRunsSmoke(t *testing.T) {
 
 	smokeCalls := 0
 	ph := Cuda{
-		NvccProbeFn:    func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{Major: "13", Minor: "0"} },
-		CudaLayoutOKFn: func() bool { return true },
+		NvccProbeFn:  func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{Major: "13", Minor: "0"} },
+		CudaLayoutFn: layoutCanonicalFn(),
 		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
 			smokeCalls++
 			return nil
@@ -915,7 +1090,7 @@ func TestCudaPhase_CompileSmokeFalseSkipsSmoke(t *testing.T) {
 
 	compileCalls := 0
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -959,7 +1134,7 @@ func TestCudaPhase_SmokeRunFailureIsNonFatalEvenInRequired(t *testing.T) {
 	smokeDir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -1003,7 +1178,7 @@ func TestCudaPhase_CorruptRunfileHintInFatalError(t *testing.T) {
 	tmpdir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -1046,7 +1221,7 @@ func TestCudaPhase_CorruptRunfileHintInOptionalSkipDetails(t *testing.T) {
 	tmpdir := t.TempDir()
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return false },
+		CudaLayoutFn:           layoutMissingFn(),
 		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },
@@ -1091,7 +1266,7 @@ func TestCudaPhase_PersistsDetailsOnSuccess(t *testing.T) {
 	snippet := filepath.Join(t.TempDir(), "clouddeploy-cuda.sh")
 
 	ph := Cuda{
-		CudaLayoutOKFn:         func() bool { return true },
+		CudaLayoutFn:           layoutCanonicalFn(),
 		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
 		RepoProbeFn:            func(string) bool { return false },
 		CurrentUbuntuVersionFn: func() string { return "25.10" },

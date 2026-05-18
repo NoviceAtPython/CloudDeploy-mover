@@ -86,6 +86,29 @@ func TestMajorMatches(t *testing.T) {
 	}
 }
 
+func TestLayoutFromInstallSource(t *testing.T) {
+	cases := []struct {
+		name            string
+		source          string
+		pkg             string
+		archiveFallback bool
+		want            LayoutKind
+	}{
+		{"runfile -> canonical", "runfile", "", false, LayoutNvidiaCanonical},
+		{"apt nvidia repo cuda-toolkit-13-0 -> canonical", "apt", "cuda-toolkit-13-0", false, LayoutNvidiaCanonical},
+		{"apt nvidia repo metapackage -> canonical", "apt", "cuda-toolkit", false, LayoutNvidiaCanonical},
+		{"apt nvidia-cuda-toolkit -> archive", "apt", "nvidia-cuda-toolkit", false, LayoutUbuntuArchive},
+		{"apt archive_fallback=true -> archive even if pkg name not nvidia-cuda-toolkit", "apt", "anything", true, LayoutUbuntuArchive},
+		{"already-installed -> any layout", "already-installed", "", false, ""},
+		{"unknown source -> any layout", "", "", false, ""},
+	}
+	for _, c := range cases {
+		if got := LayoutFromInstallSource(c.source, c.pkg, c.archiveFallback); got != c.want {
+			t.Errorf("%s: got %q want %q", c.name, got, c.want)
+		}
+	}
+}
+
 func TestProfileSnippetBody(t *testing.T) {
 	body := ProfileSnippetBody()
 	for _, want := range []string{"/usr/local/cuda/bin", "/usr/local/cuda/lib64", "clouddeployctl"} {

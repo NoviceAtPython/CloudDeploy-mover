@@ -9,6 +9,40 @@ import (
 // the NVIDIA apt packages both lay down.
 const CudaRoot = "/usr/local/cuda"
 
+// LayoutKind describes how an installed CUDA toolkit is laid out on
+// disk. The verifier accepts different layouts depending on the
+// install source (NVIDIA repo / runfile vs. Ubuntu archive package).
+type LayoutKind string
+
+const (
+	// LayoutNvidiaCanonical: the layout NVIDIA's official runfile +
+	// CUDA apt packages produce.
+	//   /usr/local/cuda/bin/nvcc
+	//   /usr/local/cuda/include/cuda_runtime.h
+	//   /usr/local/cuda/lib64/libcudart.so*
+	LayoutNvidiaCanonical LayoutKind = "nvidia-canonical"
+
+	// LayoutUbuntuArchive: the layout Ubuntu's `nvidia-cuda-toolkit`
+	// archive package produces (currently CUDA 12.x on 24.04+25.10):
+	//   /usr/bin/nvcc                                       (PATH)
+	//   /usr/include/cuda_runtime.h        OR /usr/lib/cuda/include
+	//   /usr/lib/x86_64-linux-gnu/libcudart.so*
+	//                                      OR /usr/lib/cuda/lib64
+	LayoutUbuntuArchive LayoutKind = "ubuntu-archive"
+
+	// LayoutMissing: no nvcc / no usable headers / no usable libs.
+	LayoutMissing LayoutKind = "missing"
+)
+
+// CudaLayout is the verifier's view of an installed toolkit.
+type CudaLayout struct {
+	Kind     LayoutKind
+	NvccPath string   // path to nvcc, "" if absent
+	Headers  string   // path to the include dir that satisfies
+	Libs     string   // path to the lib dir that satisfies
+	Notes    []string // additional diagnostic findings (e.g. which fallback)
+}
+
 // ProfileSnippetPath is where the post-install side drops a
 // CloudDeploy-owned PATH/LD_LIBRARY_PATH snippet so login shells
 // pick CUDA up. v2 sets these inline; v3 persists them.
@@ -91,4 +125,29 @@ func MajorMatches(actual NvccRelease, expected string) bool {
 		return actual.Major != ""
 	}
 	return actual.Major == expected
+}
+
+// LayoutFromInstallSource reports the layout kind that the verifier
+// SHOULD expect given how the toolkit was installed in this run.
+//
+//   - "runfile"           -> LayoutNvidiaCanonical (the runfile installer
+//     unpacks to /usr/local/cuda).
+//   - "apt" with package == "nvidia-cuda-toolkit", OR archive_fallback=true
+//     -> LayoutUbuntuArchive.
+//   - "apt" with any cuda-toolkit-* / cuda-toolkit metapackage from
+//     the NVIDIA CUDA apt repo -> LayoutNvidiaCanonical.
+//   - "already-installed" -> "" (verifier accepts EITHER layout).
+//
+// Returning "" means "any of the known good layouts is OK".
+func LayoutFromInstallSource(source, pkg string, archiveFallback bool) LayoutKind {
+	switch strings.TrimSpace(source) {
+	case "runfile":
+		return LayoutNvidiaCanonical
+	case "apt":
+		if archiveFallback || pkg == "nvidia-cuda-toolkit" {
+			return LayoutUbuntuArchive
+		}
+		return LayoutNvidiaCanonical
+	}
+	return "" // already-installed and unknown: accept any layout
 }

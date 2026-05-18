@@ -151,13 +151,18 @@ func TestUbuntuUpgrade_DoReleaseUpgrade_NotImplementedYet(t *testing.T) {
 }
 
 func TestUbuntuUpgrade_AntiRebootLoop(t *testing.T) {
-	// Simulate: previous run stashed pre_version=24.04 and we rebooted
-	// but the host is still on 24.04. The phase must refuse to loop.
+	// Simulate: previous run reached dist-upgrade-complete /
+	// reboot-required AND we rebooted, but the host is still on
+	// 24.04. The phase must refuse to loop.
 	deps := upgradeDeps(t, profileForUpgrade("25.10", true, true, "force"))
 
-	// Pre-seed state with pre_version=24.04 from a previous attempt.
+	// Pre-seed state with pre_version=24.04 AND stage that indicates
+	// the dist-upgrade actually finished.
 	p := deps.State.Get(UbuntuUpgradeName)
-	p.Details = map[string]any{"pre_version": "24.04"}
+	p.Details = map[string]any{
+		"pre_version": "24.04",
+		"stage":       string(UbuntuStageRebootRequired),
+	}
 
 	ph := UbuntuUpgrade{
 		CurrentVersionFn: func() string { return "24.04" },
@@ -171,6 +176,89 @@ func TestUbuntuUpgrade_AntiRebootLoop(t *testing.T) {
 	}
 	if got := deps.State.Get(UbuntuUpgradeName).Status; got != state.StatusFailedFatal {
 		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+// TestUbuntuUpgrade_StageEarly_RetriesNotFatal exercises the
+// interrupted-before-rewrite case: pre_version is set but stage is
+// "started" / "third-party-sources-disabled". The phase should NOT
+// fire the anti-loop guard; it should re-run idempotently.
+//
+// This test does NOT exercise the full rewrite path (that needs an
+// apt.Transaction with a real env). Instead it asserts that the Run
+// dispatch does NOT short-circuit to failed_fatal on the anti-loop
+// guard when stage is early. We make a custom UbuntuUpgrade with a
+// no-op direct-codename hook to keep the test cross-platform.
+func TestUbuntuUpgrade_StageEarly_RetriesNotFatal(t *testing.T) {
+	for _, stage := range []UbuntuUpgradeStage{
+		"", UbuntuStageStarted, UbuntuStageThirdPartyDisabled,
+	} {
+		t.Run("stage="+string(stage), func(t *testing.T) {
+			deps := upgradeDeps(t, profileForUpgrade("25.10", true, true, "force"))
+			ph := deps.State.Get(UbuntuUpgradeName)
+			ph.Details = map[string]any{
+				"pre_version": "24.04",
+				"stage":       string(stage),
+			}
+
+			ran := false
+			phase := UbuntuUpgrade{
+				CurrentVersionFn: func() string { return "24.04" },
+				DirectRewriteHookFn: func() error {
+					ran = true
+					return nil // simulate successful continuation
+				},
+			}
+			err := phase.Run(context.Background(), deps)
+			// Hook returns nil but the real path requires an apt
+			// transaction. We just assert the anti-loop guard didn't
+			// fire (i.e. the phase status is not failed_fatal with
+			// the "did not make progress" reason).
+			if err != nil && strings.Contains(err.Error(), "did not make progress") {
+				t.Errorf("anti-loop fired on stage %q (should retry): %v", stage, err)
+			}
+			if got := deps.State.Get(UbuntuUpgradeName).Status; got == state.StatusFailedFatal {
+				if reason := deps.State.Get(UbuntuUpgradeName).Reason; strings.Contains(reason, "did not make progress") {
+					t.Errorf("anti-loop status set on stage %q (should retry): %q", stage, reason)
+				}
+			}
+			if !ran {
+				t.Errorf("DirectRewriteHookFn should have been invoked for stage %q (retry path)", stage)
+			}
+		})
+	}
+}
+
+// TestUbuntuUpgrade_StageMid_ContinuesIdempotent: stage indicates
+// "sources-rewritten" or "dist-upgrade-started" — the phase must
+// NOT anti-loop-fail; it must continue idempotently.
+func TestUbuntuUpgrade_StageMid_ContinuesIdempotent(t *testing.T) {
+	for _, stage := range []UbuntuUpgradeStage{
+		UbuntuStageSourcesRewritten, UbuntuStageDistUpgradeStarted,
+	} {
+		t.Run("stage="+string(stage), func(t *testing.T) {
+			deps := upgradeDeps(t, profileForUpgrade("25.10", true, true, "force"))
+			ph := deps.State.Get(UbuntuUpgradeName)
+			ph.Details = map[string]any{
+				"pre_version": "24.04",
+				"stage":       string(stage),
+			}
+
+			ran := false
+			phase := UbuntuUpgrade{
+				CurrentVersionFn:    func() string { return "24.04" },
+				DirectRewriteHookFn: func() error { ran = true; return nil },
+			}
+			_ = phase.Run(context.Background(), deps)
+			if got := deps.State.Get(UbuntuUpgradeName).Status; got == state.StatusFailedFatal {
+				if reason := deps.State.Get(UbuntuUpgradeName).Reason; strings.Contains(reason, "did not make progress") {
+					t.Errorf("anti-loop status set on mid-stage %q: %q", stage, reason)
+				}
+			}
+			if !ran {
+				t.Errorf("DirectRewriteHookFn must run on mid-stage %q", stage)
+			}
+		})
 	}
 }
 
@@ -277,9 +365,62 @@ func TestRewriteAptCodename_NoMatch_Errors(t *testing.T) {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	err := rewriteAptCodename(dir, sourcesList, "noble", "questing", log)
 	if err == nil {
-		t.Fatalf("expected error when no file mentions the from-codename")
+		t.Fatalf("expected error when no file mentions either codename")
 	}
 	if !strings.Contains(err.Error(), "noble") {
 		t.Errorf("error should name the missing codename: %v", err)
+	}
+}
+
+// TestRewriteAptCodename_IdempotentWhenAlreadyAtTarget is the
+// resume-after-interrupted-upgrade case: the previous run already
+// rewrote sources but the dist-upgrade didn't complete. Resuming
+// should NOT fail just because the source files no longer mention
+// the from-codename.
+func TestRewriteAptCodename_IdempotentWhenAlreadyAtTarget(t *testing.T) {
+	dir := t.TempDir()
+	ubuntuSources := filepath.Join(dir, "ubuntu.sources")
+	if err := os.WriteFile(ubuntuSources, []byte("Suites: questing questing-updates questing-backports\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sourcesList := filepath.Join(dir, "sources.list")
+	if err := os.WriteFile(sourcesList, []byte("deb http://archive.ubuntu.com/ubuntu/ questing main\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if err := rewriteAptCodename(dir, sourcesList, "noble", "questing", log); err != nil {
+		t.Errorf("rewriteAptCodename must be idempotent when sources are already at target; got: %v", err)
+	}
+	// Files must be untouched (still target codename only).
+	b, _ := os.ReadFile(ubuntuSources)
+	if !strings.Contains(string(b), "questing") {
+		t.Errorf("ubuntu.sources lost its codename: %q", string(b))
+	}
+}
+
+// TestRewriteAptCodename_MixedRewriteAndAlreadyTarget exercises the
+// case where one file still has the old codename (we rewrite it) and
+// the other already has the new one (we leave it alone).
+func TestRewriteAptCodename_MixedRewriteAndAlreadyTarget(t *testing.T) {
+	dir := t.TempDir()
+	ubuntuSources := filepath.Join(dir, "ubuntu.sources")
+	if err := os.WriteFile(ubuntuSources, []byte("Suites: noble\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	sourcesList := filepath.Join(dir, "sources.list")
+	if err := os.WriteFile(sourcesList, []byte("deb http://archive.ubuntu.com/ubuntu/ questing main\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
+	if err := rewriteAptCodename(dir, sourcesList, "noble", "questing", log); err != nil {
+		t.Fatalf("mixed rewrite must succeed; got: %v", err)
+	}
+	b, _ := os.ReadFile(ubuntuSources)
+	if !strings.Contains(string(b), "questing") || strings.Contains(string(b), "noble") {
+		t.Errorf("ubuntu.sources not rewritten: %q", string(b))
+	}
+	b2, _ := os.ReadFile(sourcesList)
+	if !strings.Contains(string(b2), "questing") {
+		t.Errorf("sources.list lost target codename: %q", string(b2))
 	}
 }

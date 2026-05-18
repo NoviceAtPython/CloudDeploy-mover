@@ -57,6 +57,7 @@ func newRoot() *cobra.Command {
 	}
 	root.PersistentFlags().String("profile", "hdr-4k120", "deploy profile from config/profiles/<name>.yaml")
 	root.PersistentFlags().String("state-path", state.DefaultPath, "path to the CloudDeploy state file")
+	root.PersistentFlags().String("lock-path", state.DefaultLockPath, "path to the CloudDeploy state lock file")
 	root.PersistentFlags().String("config-dir", defaultConfigDir, "path to the config/ directory")
 	root.PersistentFlags().Bool("dry-run", false, "do not make destructive changes; print what would happen")
 	root.PersistentFlags().Bool("verbose", false, "verbose logging")
@@ -391,7 +392,54 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorSystemCmd())
 	doctor.AddCommand(newDoctorKwinCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
+	doctor.AddCommand(newDoctorLockCmd())
 	return doctor
+}
+
+func newDoctorLockCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "lock",
+		Short: "Inspect the clouddeployctl state lock (read-only)",
+		Long: `Report whether /var/lib/clouddeploy/state.lock exists and whether
+the recorded PID is still alive. Useful when an apply/resume run
+errors with "lock is held by another clouddeployctl process".
+
+Typical recovery flow when the lock looks stale:
+
+    sudo clouddeployctl doctor lock          # confirm holder is dead
+    sudo ps -fp <pid>                        # paranoia check
+    sudo journalctl -u clouddeploy-v3-continue.service -n 200 --no-pager
+    sudo rm /var/lib/clouddeploy/state.lock  # only if holder is dead
+    sudo clouddeployctl resume               # retry`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			path, _ := cmd.Flags().GetString("lock-path")
+			info := state.Inspect(path)
+			fmt.Println("doctor lock:")
+			fmt.Printf("  path                 : %s\n", info.Path)
+			fmt.Printf("  exists               : %v\n", info.Exists)
+			if !info.Exists {
+				fmt.Println("  (no holder; clouddeployctl can acquire freely)")
+				return nil
+			}
+			if info.ReadErr != nil {
+				fmt.Printf("  pid                  : (could not read: %v)\n", info.ReadErr)
+				fmt.Println("  recovery             : sudo rm", info.Path)
+				return nil
+			}
+			fmt.Printf("  pid                  : %d\n", info.PID)
+			fmt.Printf("  holder process alive : %v\n", info.HolderLive)
+			if info.HolderLive {
+				fmt.Printf("  recovery             : another clouddeployctl run is active. Inspect with:\n")
+				fmt.Printf("                           sudo ps -fp %d\n", info.PID)
+				fmt.Printf("                           sudo journalctl -u clouddeploy-v3-continue.service -n 200 --no-pager\n")
+			} else {
+				fmt.Printf("  recovery             : holder is dead. Stale lock:\n")
+				fmt.Printf("                           sudo rm %s\n", info.Path)
+				fmt.Printf("                           sudo clouddeployctl resume\n")
+			}
+			return nil
+		},
+	}
 }
 
 func newDoctorAptCmd() *cobra.Command {

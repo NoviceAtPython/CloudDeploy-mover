@@ -288,3 +288,61 @@ func TestLockStaleEntryIsStolen(t *testing.T) {
 	}
 	_ = l.Release()
 }
+
+// TestInspect_NoLock returns Exists=false; HolderLive=false.
+func TestInspect_NoLock(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	info := Inspect(path)
+	if info.Exists {
+		t.Errorf("Exists: got true, want false")
+	}
+	if info.PID != 0 {
+		t.Errorf("PID: got %d want 0", info.PID)
+	}
+	if info.HolderLive {
+		t.Errorf("HolderLive: got true, want false")
+	}
+}
+
+// TestInspect_LiveHolder: lock taken by this process is reported as
+// alive.
+func TestInspect_LiveHolder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	l, err := Acquire(path)
+	if err != nil {
+		t.Fatalf("Acquire: %v", err)
+	}
+	defer l.Release()
+	info := Inspect(path)
+	if !info.Exists {
+		t.Fatalf("Exists: got false, want true")
+	}
+	if info.PID != os.Getpid() {
+		t.Errorf("PID: got %d want %d", info.PID, os.Getpid())
+	}
+	if !info.HolderLive {
+		t.Errorf("HolderLive: got false, want true (self is alive)")
+	}
+}
+
+// TestInspect_StaleHolder: a lock file with a dead PID is reported
+// as HolderLive=false; the operator can rm and retry.
+func TestInspect_StaleHolder(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "state.lock")
+	if err := os.WriteFile(path, []byte("9999998\n"), 0o644); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	info := Inspect(path)
+	if !info.Exists {
+		t.Fatalf("Exists: got false, want true")
+	}
+	if info.PID != 9999998 {
+		t.Errorf("PID: got %d want 9999998", info.PID)
+	}
+	if info.HolderLive {
+		t.Errorf("HolderLive: got true, want false (PID 9999998 should be dead)")
+	}
+}

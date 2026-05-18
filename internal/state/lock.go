@@ -72,7 +72,10 @@ func Acquire(path string) (*Lock, error) {
 			_ = os.Remove(path)
 			continue
 		}
-		return nil, fmt.Errorf("%w (held by pid %d, lock=%s)", ErrLocked, holder, path)
+		return nil, fmt.Errorf("%w (held by pid %d, lock=%s). "+
+			"Inspect the holder with: ps -fp %d  |  journalctl -u clouddeploy-v3-continue.service -n 200 --no-pager. "+
+			"If the holder is gone, remove %s and retry.",
+			ErrLocked, holder, path, holder, path)
 	}
 	return nil, fmt.Errorf("state: could not acquire lock %s after stealing a stale entry", path)
 }
@@ -88,6 +91,39 @@ func (l *Lock) Release() error {
 		return fmt.Errorf("state: release lock: %w", err)
 	}
 	return nil
+}
+
+// LockInfo describes what `doctor lock` sees on disk. Used by the
+// `clouddeployctl doctor lock` subcommand to give the operator a
+// clear "is the lock real or stale" diagnostic.
+type LockInfo struct {
+	Path       string
+	Exists     bool
+	PID        int
+	ReadErr    error
+	HolderLive bool
+}
+
+// Inspect is a read-only probe that does NOT take or release any
+// lock. The CLI's `doctor lock` calls this so we never accidentally
+// fight with a real holder while diagnosing.
+func Inspect(path string) LockInfo {
+	if path == "" {
+		path = DefaultLockPath
+	}
+	out := LockInfo{Path: path}
+	if _, err := os.Stat(path); err != nil {
+		return out
+	}
+	out.Exists = true
+	pid, err := readPID(path)
+	if err != nil {
+		out.ReadErr = err
+		return out
+	}
+	out.PID = pid
+	out.HolderLive = processAlive(pid)
+	return out
 }
 
 // readPID reads "pid\n" from path and returns the integer.

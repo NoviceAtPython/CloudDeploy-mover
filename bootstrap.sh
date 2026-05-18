@@ -32,6 +32,23 @@
 #                            not invoke `apply`. Useful for first-time
 #                            builds where the operator wants to inspect
 #                            the binary first. Default 1.
+#   GH_TOKEN                 GitHub Personal Access Token. Required only
+#                            when CLOUDDEPLOY_REPO_URL points at a
+#                            private repository. Bootstrap funnels the
+#                            token through a GIT_ASKPASS shim so it
+#                            never appears in `ps` or `git remote -v`.
+#
+# Private-clone invocation (sudo strips GH_TOKEN unless you opt in
+# explicitly):
+#
+#   sudo -E GH_TOKEN="$GH_TOKEN" PROFILE=hdr-4k120-cuda-compatible \
+#       bash ./bootstrap.sh
+#
+# Or with an env-file owned by root:
+#
+#   sudo install -m 0600 /dev/null /root/clouddeploy-v3.env
+#   sudo ${EDITOR:-nano} /root/clouddeploy-v3.env   # GH_TOKEN=ghp_...
+#   sudo bash -c 'set -a; . /root/clouddeploy-v3.env; bash ./bootstrap.sh'
 #
 # This script is intentionally small. Anything that needs conditionals
 # beyond "is Go installed?" belongs in clouddeployctl, not here.
@@ -49,6 +66,37 @@ CLOUDDEPLOY_REPO_URL="${CLOUDDEPLOY_REPO_URL:-https://github.com/NoviceAtPython/
 CLOUDDEPLOY_BRANCH="${CLOUDDEPLOY_BRANCH:-v3}"
 CLOUDDEPLOY_GO_VERSION="${CLOUDDEPLOY_GO_VERSION:-1.22.7}"
 CLOUDDEPLOY_RUN="${CLOUDDEPLOY_RUN:-1}"
+
+wait_for_apt_lock() {
+    # Wait up to ~3 minutes for apt-daily / unattended-upgrades /
+    # someone-else's apt to release the dpkg + apt locks. We don't try
+    # to stop those services here - bootstrap is best-effort and may
+    # run without root for the early "is Go installed?" path - we just
+    # poll the locks.
+    local deadline=$((SECONDS + 180))
+    local locks=(
+        /var/lib/dpkg/lock-frontend
+        /var/lib/dpkg/lock
+        /var/lib/apt/lists/lock
+        /var/cache/apt/archives/lock
+    )
+    while (( SECONDS < deadline )); do
+        local busy=""
+        for f in "${locks[@]}"; do
+            if [[ -e "$f" ]] && command -v fuser >/dev/null 2>&1 \
+                && fuser "$f" >/dev/null 2>&1; then
+                busy="${busy} $f"
+            fi
+        done
+        if [[ -z "$busy" ]]; then
+            return 0
+        fi
+        log "Waiting for apt/dpkg locks:${busy}"
+        sleep 5
+    done
+    log "WARNING: apt/dpkg locks still held after 3m; proceeding"
+    return 0
+}
 
 ensure_go() {
     # We need Go 1.21+ for log/slog and a few other stdlib pieces.
@@ -70,7 +118,9 @@ ensure_go() {
     # Try apt first.
     if command -v apt-get >/dev/null 2>&1; then
         log "Installing golang-go via apt..."
+        wait_for_apt_lock
         DEBIAN_FRONTEND=noninteractive apt-get update -qq
+        wait_for_apt_lock
         if DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends golang-go ca-certificates git curl; then
             installed_version="$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')"
             log "apt installed Go ${installed_version}"
@@ -110,17 +160,46 @@ CLOUDDEPLOY_GO_PROFILE
 
 ensure_repo() {
     install -d -m 0755 "$(dirname "${CLOUDDEPLOY_REPO_DIR}")"
+
+    # Private-clone support. The repo is currently private; sudo loses
+    # the GH_TOKEN env by default, so the recommended invocation is:
+    #
+    #   sudo -E GH_TOKEN="$GH_TOKEN" PROFILE=... bash bootstrap.sh
+    #
+    # We translate GH_TOKEN into a GIT_ASKPASS shim so neither the URL
+    # nor the process list ever contains the token (the URL-embedded
+    # form `https://${GH_TOKEN}@github.com/...` shows up in `ps` and
+    # in `git remote -v` output).
+    local git_env=()
+    if [[ -n "${GH_TOKEN:-}" ]]; then
+        local askpass_dir askpass
+        askpass_dir="$(mktemp -d /tmp/clouddeploy-askpass.XXXXXX)"
+        askpass="${askpass_dir}/askpass.sh"
+        cat > "${askpass}" <<'CLOUDDEPLOY_GIT_ASKPASS'
+#!/usr/bin/env bash
+# clouddeployctl bootstrap: feed GH_TOKEN to git via askpass.
+case "${1:-}" in
+    Username*) echo "x-access-token" ;;
+    Password*) echo "${GH_TOKEN}" ;;
+esac
+CLOUDDEPLOY_GIT_ASKPASS
+        chmod 0700 "${askpass}"
+        git_env=(env "GH_TOKEN=${GH_TOKEN}" "GIT_ASKPASS=${askpass}" "GIT_TERMINAL_PROMPT=0")
+        # Best-effort cleanup. trap may already be set; we append.
+        trap 'rm -rf "${askpass_dir}" 2>/dev/null || true' EXIT
+    fi
+
     if [[ -d "${CLOUDDEPLOY_REPO_DIR}/.git" ]]; then
         log "Updating ${CLOUDDEPLOY_REPO_DIR} (branch ${CLOUDDEPLOY_BRANCH})"
-        git -C "${CLOUDDEPLOY_REPO_DIR}" fetch --tags --prune origin "${CLOUDDEPLOY_BRANCH}"
-        git -C "${CLOUDDEPLOY_REPO_DIR}" checkout -B "${CLOUDDEPLOY_BRANCH}" "origin/${CLOUDDEPLOY_BRANCH}"
+        "${git_env[@]}" git -C "${CLOUDDEPLOY_REPO_DIR}" fetch --tags --prune origin "${CLOUDDEPLOY_BRANCH}"
+        "${git_env[@]}" git -C "${CLOUDDEPLOY_REPO_DIR}" checkout -B "${CLOUDDEPLOY_BRANCH}" "origin/${CLOUDDEPLOY_BRANCH}"
         return 0
     fi
     if [[ -e "${CLOUDDEPLOY_REPO_DIR}" ]]; then
         die "${CLOUDDEPLOY_REPO_DIR} exists but is not a git checkout. Remove it or set CLOUDDEPLOY_REPO_DIR."
     fi
     log "Cloning ${CLOUDDEPLOY_REPO_URL} (branch ${CLOUDDEPLOY_BRANCH}) into ${CLOUDDEPLOY_REPO_DIR}"
-    git clone --branch "${CLOUDDEPLOY_BRANCH}" "${CLOUDDEPLOY_REPO_URL}" "${CLOUDDEPLOY_REPO_DIR}"
+    "${git_env[@]}" git clone --branch "${CLOUDDEPLOY_BRANCH}" "${CLOUDDEPLOY_REPO_URL}" "${CLOUDDEPLOY_REPO_DIR}"
 }
 
 build_binary() {
