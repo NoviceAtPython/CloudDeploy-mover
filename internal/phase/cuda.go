@@ -17,7 +17,14 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/ubuntu"
 )
+
+// ubuntuCodenameFromTable is a tiny wrapper around the ubuntu package
+// so callers in this file don't grow an `ubuntu.` import noise burden.
+func ubuntuCodenameFromTable(version string) string {
+	return ubuntu.CodenameForVersion(version)
+}
 
 // CudaName is the canonical state-key.
 const CudaName = "cuda"
@@ -223,12 +230,30 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 
 	// Resolve method=auto -> apt or runfile.
 	effectiveMethod := method
-	repoDistro := ""
+	repoSel := cuda.RepoSelection{Tried: []string{}}
+	hostVersion := p.currentUbuntuVersion()
 	if effectiveMethod == cuda.MethodAuto || effectiveMethod == cuda.MethodApt {
-		repoDistro = p.detectRepoDistro(ctx, deps)
+		var candidates []string
+		if deps.Profile != nil {
+			candidates = deps.Profile.CUDA.CudaRepoDistroCandidates
+		}
+		allowCross := deps.Profile != nil && deps.Profile.CUDA.AllowCrossDistroCudaRepo
+		resolved := cuda.ResolveCudaRepoCandidates(hostVersion, candidates, allowCross)
+		probe := p.RepoProbeFn
+		if probe == nil {
+			probe = func(distro string) bool {
+				return p.httpHead(ctx, deps, cuda.KeyringURL(distro))
+			}
+		}
+		repoSel = cuda.PickReachableRepoDistro(hostVersion, resolved, probe)
+		log.Info("phase cuda: NVIDIA CUDA repo probe",
+			"tried", repoSel.Tried,
+			"selected", repoSel.Selected,
+			"cross_distro", repoSel.CrossDistro,
+			"host_native", repoSel.HostNative)
 	}
 	if effectiveMethod == cuda.MethodAuto {
-		if repoDistro != "" {
+		if repoSel.Selected != "" {
 			effectiveMethod = cuda.MethodApt
 		} else {
 			effectiveMethod = cuda.MethodRunfile
@@ -237,7 +262,7 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 
 	switch effectiveMethod {
 	case cuda.MethodApt:
-		return p.runAptPath(ctx, deps, plan, repoDistro, driverMajor, explicitName, selection, compileSmokeTest, log)
+		return p.runAptPath(ctx, deps, plan, repoSel, hostVersion, driverMajor, explicitName, selection, compileSmokeTest, log)
 	case cuda.MethodRunfile:
 		return p.runRunfilePath(ctx, deps, plan, runfileURL, runfileSHA, runfileMaxAttempts, selection, compileSmokeTest, log)
 	}
@@ -253,28 +278,42 @@ func (p Cuda) runAptPath(
 	ctx context.Context,
 	deps *Deps,
 	plan cuda.PlanResult,
-	repoDistro string,
+	repoSel cuda.RepoSelection,
+	hostVersion string,
 	driverMajor string,
 	explicitName string,
 	selection cuda.Selection,
 	compileSmokeTest bool,
 	log *slog.Logger,
 ) error {
+	repoDistro := repoSel.Selected
+	hostCodename := ubuntuCodename(hostVersion)
+	fallbackReason := ""
+
 	// archiveOnly: no official NVIDIA CUDA apt repo for this Ubuntu
-	// version, but the profile allows Ubuntu's archive fallback. We
-	// skip cuda-keyring bootstrap entirely and rely on whatever
-	// nvidia-cuda-toolkit is already in the host's apt sources. The
-	// candidate ladder + selection policy still decide whether that
-	// archive package is acceptable (it MUST satisfy the policy; see
-	// CandidateLadder).
+	// version among the configured candidates, but the profile allows
+	// Ubuntu's archive fallback. We skip cuda-keyring bootstrap
+	// entirely and rely on whatever nvidia-cuda-toolkit is already in
+	// the host's apt sources.
 	archiveOnly := repoDistro == "" && selection.AllowUbuntuArchiveFallback
+	if archiveOnly {
+		fallbackReason = "no reachable NVIDIA CUDA apt repo among candidates; allow_ubuntu_archive_fallback=true"
+	}
 	if repoDistro == "" && !archiveOnly {
-		err := fmt.Errorf("no official NVIDIA CUDA apt repo detected for this Ubuntu version, and cuda.allow_ubuntu_archive_fallback=false; try cuda.method=runfile, set cuda.allow_ubuntu_archive_fallback=true to accept Ubuntu's CUDA 12 archive, or use a profile that targets a release with a CUDA apt repo (e.g. hdr-4k120-cuda-ubuntu2404)")
+		err := fmt.Errorf("no reachable NVIDIA CUDA apt repo among candidates %v, and cuda.allow_ubuntu_archive_fallback=false; try cuda.method=runfile, set cuda.allow_ubuntu_archive_fallback=true to accept Ubuntu's CUDA 12 archive, or pin cuda.cuda_repo_distro_candidates to a slug that exists (e.g. ubuntu2404)", repoSel.Tried)
 		if plan.FailsDeployOnError {
 			return p.fail(deps, plan, "no CUDA apt repo available", err)
 		}
 		return p.skipNonfatal(deps, plan, "no CUDA apt repo available; mode=optional -> skipped",
-			map[string]any{"method": "apt", "repo_distro": "", "selection_policy": string(selection.Policy)})
+			map[string]any{
+				"method":                 "apt",
+				"selection_policy":       string(selection.Policy),
+				"host_ubuntu_version":    hostVersion,
+				"host_codename":          hostCodename,
+				"cuda_repo_distro_tried": repoSel.Tried,
+				"selected_repo_distro":   "",
+				"cross_distro_cuda_repo": false,
+			})
 	}
 	if !archiveOnly {
 		if err := p.ensureCudaAptRepo(ctx, deps, repoDistro); err != nil {
@@ -284,17 +323,31 @@ func (p Cuda) runAptPath(
 			return p.skipNonfatal(deps, plan, "ensure CUDA apt repo failed; mode=optional -> skipped",
 				map[string]any{"method": "apt", "repo_distro": repoDistro, "err": err.Error()})
 		}
+		if repoSel.CrossDistro {
+			log.Warn("phase cuda: using NVIDIA CUDA apt repo from a different Ubuntu distro than the host",
+				"host_native", repoSel.HostNative,
+				"selected_repo", repoDistro,
+				"reason", "host-native NVIDIA CUDA repo unreachable for this Ubuntu version")
+		}
 	} else {
-		log.Info("phase cuda: no official NVIDIA CUDA apt repo for this Ubuntu; using Ubuntu archive fallback (no cuda-keyring bootstrap)",
+		log.Info("phase cuda: no NVIDIA CUDA apt repo reachable; using Ubuntu archive fallback (no cuda-keyring bootstrap)",
 			"selection_policy", string(selection.Policy),
-			"min_major", selection.MinMajor)
+			"min_major", selection.MinMajor,
+			"tried", repoSel.Tried)
 	}
 
 	probe := p.ProbeFn
 	if probe == nil {
 		probe = makeAptCacheProbe(ctx, deps)
 	}
+	// Apply prefer_major as the driver-preferred-major override:
+	// the candidate ladder puts that major first in the ordering.
+	// strict policies (exact-major / min-major) still authoritatively
+	// filter on top.
 	opts := selection.CandidateOptions(explicitName)
+	if deps.Profile != nil && strings.TrimSpace(deps.Profile.CUDA.PreferMajor) != "" {
+		opts.PreferredMajor = strings.TrimSpace(deps.Profile.CUDA.PreferMajor)
+	}
 	pkg := cuda.DiscoverCandidate(opts, probe)
 
 	// Diagnostic value persisted to state.Details for both
@@ -302,6 +355,19 @@ func (p Cuda) runAptPath(
 	repoDisplay := repoDistro
 	if archiveOnly {
 		repoDisplay = "ubuntu-archive"
+	}
+	baseRepoDetails := func() map[string]any {
+		m := map[string]any{
+			"host_ubuntu_version":    hostVersion,
+			"host_codename":          hostCodename,
+			"cuda_repo_distro_tried": repoSel.Tried,
+			"selected_repo_distro":   repoDisplay,
+			"cross_distro_cuda_repo": repoSel.CrossDistro,
+		}
+		if fallbackReason != "" {
+			m["fallback_reason"] = fallbackReason
+		}
+		return m
 	}
 
 	if pkg == "" {
@@ -318,19 +384,17 @@ func (p Cuda) runAptPath(
 				deps.Profile.CUDA.RunfileMaxAttempts, selection, compileSmokeTest, log)
 		}
 		if plan.FailsDeployOnError {
-			err := fmt.Errorf("no installable CUDA toolkit candidate satisfies selection_policy=%q (expected_major=%q min_major=%q allow_ubuntu_archive_fallback=%v); ladder=%v",
+			err := fmt.Errorf("no installable CUDA toolkit candidate satisfies selection_policy=%q (expected_major=%q min_major=%q allow_ubuntu_archive_fallback=%v); ladder=%v; repo_tried=%v",
 				selection.Policy, selection.ExpectedMajor, selection.MinMajor,
-				selection.AllowUbuntuArchiveFallback, cuda.CandidateLadder(opts))
+				selection.AllowUbuntuArchiveFallback, cuda.CandidateLadder(opts), repoSel.Tried)
 			return p.fail(deps, plan, "no CUDA apt candidate matches selection policy", err)
 		}
-		return p.skipNonfatal(deps, plan, "no installable CUDA toolkit candidate; mode=optional -> skipped",
-			map[string]any{
-				"method":           "apt",
-				"repo_distro":      repoDisplay,
-				"archive_fallback": archiveOnly,
-				"selection_policy": string(selection.Policy),
-				"candidates":       cuda.CandidateLadder(opts),
-			})
+		skipDetails := baseRepoDetails()
+		skipDetails["method"] = "apt"
+		skipDetails["archive_fallback"] = archiveOnly
+		skipDetails["selection_policy"] = string(selection.Policy)
+		skipDetails["candidates"] = cuda.CandidateLadder(opts)
+		return p.skipNonfatal(deps, plan, "no installable CUDA toolkit candidate; mode=optional -> skipped", skipDetails)
 	}
 
 	if isDriverMetaPackage(pkg) {
@@ -342,6 +406,7 @@ func (p Cuda) runAptPath(
 		"package", pkg,
 		"repo", repoDisplay,
 		"archive_fallback", archiveOnly,
+		"cross_distro_cuda_repo", repoSel.CrossDistro,
 		"selection_policy", string(selection.Policy),
 		"expected_major", selection.ExpectedMajor,
 		"min_major", selection.MinMajor)
@@ -352,17 +417,22 @@ func (p Cuda) runAptPath(
 		if plan.FailsDeployOnError {
 			return p.fail(deps, plan, "cuda apt install failed; mode=required", err)
 		}
-		return p.skipNonfatal(deps, plan, "cuda apt install failed; mode=optional",
-			map[string]any{"method": "apt", "package": pkg, "err": err.Error()})
+		failDetails := baseRepoDetails()
+		failDetails["method"] = "apt"
+		failDetails["package"] = pkg
+		failDetails["err"] = err.Error()
+		return p.skipNonfatal(deps, plan, "cuda apt install failed; mode=optional", failDetails)
 	}
 
-	return p.verifyAndFinish(ctx, deps, plan, selection, compileSmokeTest, map[string]any{
-		"method":           "apt",
-		"repo_distro":      repoDisplay,
-		"archive_fallback": archiveOnly,
-		"package":          pkg,
-		"source":           "apt",
-	}, log)
+	successDetails := baseRepoDetails()
+	successDetails["method"] = "apt"
+	successDetails["archive_fallback"] = archiveOnly
+	successDetails["package"] = pkg
+	successDetails["source"] = "apt"
+	// repo_distro is the legacy alias; baseRepoDetails records the
+	// clearer selected_repo_distro + cross_distro_cuda_repo pair.
+	successDetails["repo_distro"] = repoDisplay
+	return p.verifyAndFinish(ctx, deps, plan, selection, compileSmokeTest, successDetails, log)
 }
 
 func (p Cuda) ensureCudaAptRepo(ctx context.Context, deps *Deps, distro string) error {
@@ -954,18 +1024,11 @@ func (p Cuda) smokeRun(ctx context.Context, deps *Deps, bin string) error {
 // repo probing helpers
 // -----------------------------------------------------------------------------
 
-func (p Cuda) detectRepoDistro(ctx context.Context, deps *Deps) string {
-	v := p.currentUbuntuVersion()
-	if v == "" {
-		return ""
-	}
-	probe := p.RepoProbeFn
-	if probe == nil {
-		probe = func(distro string) bool {
-			return p.httpHead(ctx, deps, cuda.KeyringURL(distro))
-		}
-	}
-	return cuda.DetectRepoDistro(v, probe)
+// ubuntuCodename maps a VERSION_ID to its codename via the existing
+// internal/ubuntu table. Returns "" for unknown versions so the
+// state-details field becomes empty rather than misleading.
+func ubuntuCodename(version string) string {
+	return ubuntuCodenameFromTable(version)
 }
 
 func (p Cuda) currentUbuntuVersion() string {

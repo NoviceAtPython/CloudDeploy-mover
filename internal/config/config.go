@@ -172,6 +172,46 @@ type CUDAConfig struct {
 	// the next reboot loads the driver fully) and never gates the
 	// phase status today.
 	CompileSmokeTest bool `yaml:"compile_smoke_test"`
+
+	// PreferMajor is a *soft* preference. Under latest-compatible /
+	// min-major / any policies the candidate ladder is reordered so
+	// PreferMajor's packages come first. Under exact-major the
+	// preference is ignored (ExpectedMajor is authoritative).
+	// Operationally: v2 demonstrated CUDA 13 works on Ubuntu 25.10 via
+	// NVIDIA's `ubuntu2404` repo, so the compat profile sets
+	// prefer_major="13" to keep that newest-known-good selection even
+	// when an older-major archive package is also available.
+	PreferMajor string `yaml:"prefer_major"`
+
+	// PreferNewest documents intent under latest-compatible (which
+	// already picks newest). Recorded in state.Details so operators
+	// reading `state show` can see what the profile asked for; the
+	// candidate ladder is unchanged.
+	PreferNewest bool `yaml:"prefer_newest"`
+
+	// AllowCrossDistroCudaRepo unlocks the "try ubuntu2404 from a
+	// 25.10 host" trick v2 uses. When false (default), only the
+	// host-native NVIDIA CUDA apt repo (or `auto-host` resolved to
+	// the host slug) is considered. When true, the
+	// CudaRepoDistroCandidates list is walked in order.
+	AllowCrossDistroCudaRepo bool `yaml:"allow_cross_distro_cuda_repo"`
+
+	// CudaRepoDistroCandidates is the ordered list of NVIDIA CUDA
+	// apt-repo distro slugs the phase probes. The literal
+	// "auto-host" expands to the host's slug at probe time. Empty
+	// defaults to ["auto-host"], which preserves single-distro
+	// behavior. Non-auto-host entries are dropped when
+	// AllowCrossDistroCudaRepo=false.
+	//
+	// Example (broad compat / strict modern):
+	//   cuda_repo_distro_candidates:
+	//     - auto-host    # ubuntu2510 on 25.10, ubuntu2404 on 24.04, ...
+	//     - ubuntu2404   # cross-distro fallback when the host slug 404s
+	//
+	// Example (native-only diagnostic profile):
+	//   cuda_repo_distro_candidates:
+	//     - auto-host
+	CudaRepoDistroCandidates []string `yaml:"cuda_repo_distro_candidates"`
 }
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
@@ -279,6 +319,22 @@ func ValidateProfile(p *Profile) error {
 	}
 	if selPolicy == "min-major" && strings.TrimSpace(p.CUDA.MinMajor) == "" {
 		return fmt.Errorf("config: profile %q: cuda.selection_policy=min-major requires cuda.min_major to be set", p.Profile)
+	}
+	if !isNumericMajorOrEmpty(p.CUDA.PreferMajor) {
+		return fmt.Errorf("config: profile %q: cuda.prefer_major must be a positive integer string (e.g. \"13\"), got %q", p.Profile, p.CUDA.PreferMajor)
+	}
+	for _, c := range p.CUDA.CudaRepoDistroCandidates {
+		if !isValidRepoCandidate(c) {
+			return fmt.Errorf("config: profile %q: cuda.cuda_repo_distro_candidates entry %q is not \"auto-host\" or a slug like \"ubuntu2404\"", p.Profile, c)
+		}
+	}
+	if len(p.CUDA.CudaRepoDistroCandidates) > 0 && !p.CUDA.AllowCrossDistroCudaRepo {
+		// Allow if every entry is the auto-host literal.
+		for _, c := range p.CUDA.CudaRepoDistroCandidates {
+			if strings.TrimSpace(strings.ToLower(c)) != "auto-host" {
+				return fmt.Errorf("config: profile %q: cuda.cuda_repo_distro_candidates contains a non-auto-host entry (%q) but cuda.allow_cross_distro_cuda_repo is false", p.Profile, c)
+			}
+		}
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":
@@ -412,6 +468,29 @@ func ValidateGPU(g *GPUProfile) error {
 		return fmt.Errorf("config: gpu profile %q: streaming.hdr must be yes/no/limited, got %q", g.Filename, g.Streaming.HDR)
 	}
 	return nil
+}
+
+// isValidRepoCandidate accepts "auto-host" (case-insensitive) or a
+// slug shaped like ubuntuXXXX (X = digit). Anything else - a typo, a
+// non-Ubuntu distro slug, etc. - is rejected at validation time.
+func isValidRepoCandidate(s string) bool {
+	v := strings.ToLower(strings.TrimSpace(s))
+	if v == "auto-host" {
+		return true
+	}
+	if !strings.HasPrefix(v, "ubuntu") {
+		return false
+	}
+	rest := strings.TrimPrefix(v, "ubuntu")
+	if len(rest) < 4 {
+		return false
+	}
+	for _, c := range rest {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // isNumericMajorOrEmpty accepts "" or a positive ASCII-digit major,

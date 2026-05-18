@@ -637,6 +637,16 @@ func newDoctorCudaCmd() *cobra.Command {
 			fmt.Printf("  cuda.min_major                : %s\n", evOrUnknown(selection.MinMajor))
 			fmt.Printf("  cuda.allow_ubuntu_archive_fallback: %v\n", selection.AllowUbuntuArchiveFallback)
 			fmt.Printf("  cuda.compile_smoke_test       : %v\n", compileSmokeTest)
+			if deps.Profile != nil {
+				fmt.Printf("  cuda.prefer_major             : %s\n", evOrUnknown(deps.Profile.CUDA.PreferMajor))
+				fmt.Printf("  cuda.prefer_newest            : %v\n", deps.Profile.CUDA.PreferNewest)
+				fmt.Printf("  cuda.allow_cross_distro_cuda_repo: %v\n", deps.Profile.CUDA.AllowCrossDistroCudaRepo)
+				cands := deps.Profile.CUDA.CudaRepoDistroCandidates
+				if len(cands) == 0 {
+					cands = []string{"auto-host"}
+				}
+				fmt.Printf("  cuda.cuda_repo_distro_candidates: %v\n", cands)
+			}
 			fmt.Printf("  nvidia.driver_major           : %s\n", evOrUnknown(driverMajor))
 			fmt.Printf("  driver-preferred CUDA major   : %s\n", evOrUnknown(selection.DriverPreferredMajor))
 			fmt.Printf("  Will attempt install          : %v\n", plan.WillAttemptInstall && method != cuda.MethodNone)

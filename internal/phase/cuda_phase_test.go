@@ -751,6 +751,220 @@ func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 // -----------------------------------------------------------------------------
 
 // -----------------------------------------------------------------------------
+// cross-distro NVIDIA CUDA repo fallback
+// -----------------------------------------------------------------------------
+
+// TestCudaPhase_CrossDistro_Ubuntu2510_Falls_To_Ubuntu2404 is the
+// central scenario for the cross-distro CUDA repo design: Ubuntu
+// 25.10 host, ubuntu2510 NVIDIA repo missing, ubuntu2404 reachable.
+// Phase MUST install cuda-toolkit-13-N from ubuntu2404 and MUST NOT
+// fall through to Ubuntu's CUDA 12.4 archive package.
+func TestCudaPhase_CrossDistro_Ubuntu2510_Falls_To_Ubuntu2404(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.PreferMajor = "13"
+	p.CUDA.PreferNewest = true
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowCrossDistroCudaRepo = true
+	p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+	snippet := filepath.Join(t.TempDir(), "clouddeploy-cuda.sh")
+
+	repoTried := []string{}
+	ph := Cuda{
+		CudaLayoutFn:           layoutCanonicalFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		RepoProbeFn: func(distro string) bool {
+			repoTried = append(repoTried, distro)
+			return distro == "ubuntu2404"
+		},
+		ProbeFn: func(pkg string) bool {
+			return pkg == "cuda-toolkit-13-0"
+		},
+		SmokeCompileFn:             func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:                 func(context.Context, *Deps, string) error { return nil },
+		ProfileSnippetPathOverride: snippet,
+		SmokeDirOverride:           smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("cross-distro path must reach done; got: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Fatalf("status: got %q want done", got)
+	}
+	if len(repoTried) != 2 || repoTried[0] != "ubuntu2510" || repoTried[1] != "ubuntu2404" {
+		t.Errorf("repo probe order: got %v want [ubuntu2510 ubuntu2404]", repoTried)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["host_ubuntu_version"] != "25.10" {
+		t.Errorf("host_ubuntu_version: got %v want 25.10", d["host_ubuntu_version"])
+	}
+	if d["host_codename"] != "questing" {
+		t.Errorf("host_codename: got %v want questing", d["host_codename"])
+	}
+	if d["selected_repo_distro"] != "ubuntu2404" {
+		t.Errorf("selected_repo_distro: got %v want ubuntu2404", d["selected_repo_distro"])
+	}
+	if d["cross_distro_cuda_repo"] != true {
+		t.Errorf("cross_distro_cuda_repo: got %v want true", d["cross_distro_cuda_repo"])
+	}
+	tried, _ := d["cuda_repo_distro_tried"].([]string)
+	if len(tried) != 2 || tried[0] != "ubuntu2510" || tried[1] != "ubuntu2404" {
+		t.Errorf("cuda_repo_distro_tried: got %v want [ubuntu2510 ubuntu2404]", tried)
+	}
+	if d["package"] != "cuda-toolkit-13-0" {
+		t.Errorf("package: got %v want cuda-toolkit-13-0 (must NOT downgrade to nvidia-cuda-toolkit)", d["package"])
+	}
+	if d["selected_major"] != "13" {
+		t.Errorf("selected_major: got %v want 13", d["selected_major"])
+	}
+}
+
+// TestCudaPhase_CrossDistro_NoneReachable_FallsToArchive: both NVIDIA
+// repo slugs miss; archive fallback is allowed; phase installs
+// nvidia-cuda-toolkit and records fallback_reason.
+func TestCudaPhase_CrossDistro_NoneReachable_FallsToArchive(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowCrossDistroCudaRepo = true
+	p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutUbuntuArchiveFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		RepoProbeFn:            func(string) bool { return false },
+		ProbeFn:                func(pkg string) bool { return pkg == "nvidia-cuda-toolkit" },
+		SmokeCompileFn:         func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:             func(context.Context, *Deps, string) error { return nil },
+		SmokeDirOverride:       smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["selected_repo_distro"] != "ubuntu-archive" {
+		t.Errorf("selected_repo_distro: got %v want ubuntu-archive", d["selected_repo_distro"])
+	}
+	if d["archive_fallback"] != true {
+		t.Errorf("archive_fallback: got %v want true", d["archive_fallback"])
+	}
+	if fr, _ := d["fallback_reason"].(string); !strings.Contains(fr, "archive_fallback") {
+		t.Errorf("fallback_reason should name the knob; got %q", fr)
+	}
+	tried, _ := d["cuda_repo_distro_tried"].([]string)
+	if len(tried) != 2 || tried[0] != "ubuntu2510" || tried[1] != "ubuntu2404" {
+		t.Errorf("cuda_repo_distro_tried: got %v want [ubuntu2510 ubuntu2404]", tried)
+	}
+}
+
+// TestCudaPhase_CrossDistro_Strict_NoArchiveFallback_RequiredFails:
+// hdr-4k120-cuda strict on 25.10. ubuntu2510 missing, ubuntu2404
+// missing, archive fallback OFF -> fatal (no silent downgrade).
+func TestCudaPhase_CrossDistro_Strict_NoArchiveFallback_RequiredFails(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.AllowCrossDistroCudaRepo = true
+	p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
+	p.CUDA.AllowUbuntuArchiveFallback = false
+	deps := cudaPhaseDeps(t, p)
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutMissingFn(),
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		RepoProbeFn:            func(string) bool { return false },
+		ProbeFn:                func(string) bool { return true },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("strict + no reachable repo + no archive fallback must be fatal")
+	}
+	if !strings.Contains(err.Error(), "no CUDA apt repo") {
+		t.Errorf("error should mention no CUDA apt repo: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+// TestCudaPhase_CrossDistro_Strict_Ubuntu2404Reachable_Installs13:
+// strict hdr-4k120-cuda on 25.10 succeeds when ubuntu2404 is
+// reachable.
+func TestCudaPhase_CrossDistro_Strict_Ubuntu2404Reachable_Installs13(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.AllowCrossDistroCudaRepo = true
+	p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
+	p.CUDA.AllowUbuntuArchiveFallback = false
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutCanonicalFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		RepoProbeFn:            func(distro string) bool { return distro == "ubuntu2404" },
+		ProbeFn:                func(pkg string) bool { return strings.HasPrefix(pkg, "cuda-toolkit-13-") },
+		SmokeCompileFn:         func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:             func(context.Context, *Deps, string) error { return nil },
+		SmokeDirOverride:       smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("strict + ubuntu2404 reachable must reach done; got: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["selected_repo_distro"] != "ubuntu2404" {
+		t.Errorf("selected_repo_distro: got %v want ubuntu2404", d["selected_repo_distro"])
+	}
+	if d["cross_distro_cuda_repo"] != true {
+		t.Errorf("cross_distro_cuda_repo: got %v want true", d["cross_distro_cuda_repo"])
+	}
+	if d["selected_major"] != "13" {
+		t.Errorf("selected_major: got %v want 13", d["selected_major"])
+	}
+}
+
+// TestCudaPhase_NativeProfile_OnlyProbesAutoHost: native diagnostic
+// profile must NOT probe ubuntu2404 when allow_cross_distro_cuda_repo
+// =false.
+func TestCudaPhase_NativeProfile_OnlyProbesAutoHost(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.AllowCrossDistroCudaRepo = false
+	p.CUDA.CudaRepoDistroCandidates = []string{"auto-host"}
+	deps := cudaPhaseDeps(t, p)
+
+	repoTried := []string{}
+	ph := Cuda{
+		CudaLayoutFn:           layoutMissingFn(),
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		RepoProbeFn: func(distro string) bool {
+			repoTried = append(repoTried, distro)
+			return false
+		},
+	}
+	_ = ph.Run(context.Background(), deps)
+	if len(repoTried) != 1 || repoTried[0] != "ubuntu2510" {
+		t.Errorf("native profile must only probe auto-host; got %v", repoTried)
+	}
+}
+
+// -----------------------------------------------------------------------------
 // source-aware layout verifier
 // -----------------------------------------------------------------------------
 

@@ -51,6 +51,12 @@ type RepoAvailabilityProbe func(distro string) bool
 // DetectRepoDistro resolves a v2-style slug for an Ubuntu version and
 // returns it iff the probe confirms it is reachable. Returns "" on
 // any non-Ubuntu / unknown / unreachable case.
+//
+// DEPRECATED for new callers: prefer ResolveCudaRepoCandidates +
+// PickReachableRepoDistro, which support the cross-distro repo ladder
+// (e.g. fall back to `ubuntu2404` from a 25.10 host the way v2 does).
+// Kept exported because tests + the old "single-distro probe" path
+// still exercise it.
 func DetectRepoDistro(versionID string, probe RepoAvailabilityProbe) string {
 	distro := RepoDistroForUbuntuVersion(versionID)
 	if distro == "" {
@@ -66,4 +72,90 @@ func DetectRepoDistro(versionID string, probe RepoAvailabilityProbe) string {
 		return ""
 	}
 	return distro
+}
+
+// AutoHostRepoCandidate is the literal that ResolveCudaRepoCandidates
+// expands into the host's slug at probe time.
+const AutoHostRepoCandidate = "auto-host"
+
+// ResolveCudaRepoCandidates turns the operator-configured candidate
+// list into the actual ordered probe list:
+//
+//   - `auto-host` -> RepoDistroForUbuntuVersion(hostVersion). When the
+//     host is non-Ubuntu / unknown, auto-host expands to "" (and is
+//     dropped, since probing an empty slug is nonsense).
+//   - All other entries are kept verbatim.
+//   - Duplicate entries are removed (first wins).
+//   - When `allowCrossDistro=false`, any non-auto-host entry is
+//     dropped silently — the profile's intent is "native only".
+//
+// An empty configured list defaults to [AutoHostRepoCandidate].
+//
+// The returned slice is never nil; callers can range over it freely.
+func ResolveCudaRepoCandidates(hostVersion string, configured []string, allowCrossDistro bool) []string {
+	if len(configured) == 0 {
+		configured = []string{AutoHostRepoCandidate}
+	}
+	hostSlug := RepoDistroForUbuntuVersion(hostVersion)
+	seen := make(map[string]bool, len(configured))
+	out := make([]string, 0, len(configured))
+	for _, c := range configured {
+		v := strings.TrimSpace(c)
+		if strings.EqualFold(v, AutoHostRepoCandidate) {
+			if hostSlug == "" {
+				continue
+			}
+			v = hostSlug
+		} else if !allowCrossDistro {
+			continue
+		}
+		if v == "" || seen[v] {
+			continue
+		}
+		seen[v] = true
+		out = append(out, v)
+	}
+	return out
+}
+
+// RepoSelection is the result of walking the candidate ladder.
+type RepoSelection struct {
+	// Selected is the first reachable slug in `Tried` (i.e., the one
+	// the phase should bootstrap). "" when no candidate was reachable.
+	Selected string
+	// Tried is the ordered list of slugs the resolver probed. Useful
+	// for state.Details so an operator can see what the deploy
+	// attempted in what order.
+	Tried []string
+	// CrossDistro reports whether Selected differs from the host's
+	// native slug.
+	CrossDistro bool
+	// HostNative is the slug that "would have been" auto-host (for
+	// diagnostics, even when the resolver ultimately picked a
+	// different one).
+	HostNative string
+}
+
+// PickReachableRepoDistro probes each `candidates` slug with `probe`
+// and returns the first that probes true. The returned RepoSelection
+// records what was tried + whether the selection ended up cross-distro.
+func PickReachableRepoDistro(hostVersion string, candidates []string, probe RepoAvailabilityProbe) RepoSelection {
+	out := RepoSelection{
+		Tried:      []string{},
+		HostNative: RepoDistroForUbuntuVersion(hostVersion),
+	}
+	for _, slug := range candidates {
+		out.Tried = append(out.Tried, slug)
+		if probe == nil {
+			continue
+		}
+		if probe(slug) {
+			out.Selected = slug
+			break
+		}
+	}
+	if out.Selected != "" && out.HostNative != "" && out.Selected != out.HostNative {
+		out.CrossDistro = true
+	}
+	return out
 }

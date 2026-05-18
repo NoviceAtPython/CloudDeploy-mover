@@ -41,10 +41,22 @@ cuda:
   # the host can actually install. min_major sets a soft floor.
   selection_policy: latest-compatible
   min_major: "12"
-  # allow Ubuntu's nvidia-cuda-toolkit (CUDA 12.4 on 25.10) when the
-  # NVIDIA CUDA apt repo has nothing newer. Combined with min_major=12
-  # the archive is accepted; without that combination it would still
-  # be filtered.
+  # prefer_major + prefer_newest are soft hints to the candidate
+  # ladder so an installable CUDA 13 from cross-distro NVIDIA
+  # ubuntu2404 wins over Ubuntu archive's CUDA 12.4.
+  prefer_major: "13"
+  prefer_newest: true
+  # Cross-distro NVIDIA CUDA repo ladder: try the host-native slug
+  # first, then ubuntu2404 (v2 demonstrated CUDA 13 installs cleanly
+  # on Ubuntu 25.10 via the ubuntu2404 CUDA repo).
+  allow_cross_distro_cuda_repo: true
+  cuda_repo_distro_candidates:
+    - auto-host
+    - ubuntu2404
+  # Archive fallback is a LAST resort: only fires when no NVIDIA CUDA
+  # repo candidate in the ladder above is reachable. Combined with
+  # min_major=12 the archive is accepted; without that combination it
+  # would still be filtered.
   allow_ubuntu_archive_fallback: true
   compile_smoke_test: true
   package_name: ""

@@ -12,29 +12,25 @@
 # that derive from this one (ML workloads on top of the gaming VM)
 # need a working nvcc.
 #
-# !! KNOWN GAP on Ubuntu 25.10 (2026-05-18) !!
-# --------------------------------------------
-# NVIDIA does NOT publish a CUDA apt repo for Ubuntu 25.10 (questing),
-# and the CUDA 13.0.2 toolkit-only runfile on the production NVIDIA
-# mirror is reproducibly corrupt (its `--check` step rejects its own
-# embedded MD5). With cuda.method=apt (the new safe default here),
-# this profile WILL fail with:
+# Ubuntu 25.10 strategy (cross-distro NVIDIA CUDA repo)
+# -----------------------------------------------------
+# NVIDIA does NOT publish an ubuntu2510 CUDA apt repo (as of 2026-05).
+# v2 demonstrated that CUDA 13 installs cleanly on 25.10 by using the
+# NVIDIA ubuntu2404 CUDA repo as a cross-distro fallback. v3 follows
+# the same approach via the cuda_repo_distro_candidates ladder
+# below. The strict policy still refuses Ubuntu's CUDA 12 archive
+# and the unversioned cuda-toolkit metapackage.
 #
-#   phase cuda (mode=required): no CUDA apt repo available:
-#   no official NVIDIA CUDA apt repo detected for this Ubuntu version
+# If for some reason ubuntu2404 also becomes unreachable AND no
+# known-good CUDA 13 runfile is pinned, this profile will fail loudly
+# with a "no reachable NVIDIA CUDA apt repo" message rather than
+# silently downgrading to CUDA 12 - that is the strict contract.
+# Use `hdr-4k120-cuda-compatible` if you need a profile that allows
+# the archive fallback.
 #
-# The failure is by design: v3 refuses to silently install Ubuntu's
-# 12.x `nvidia-cuda-toolkit` when the configured driver_major (580)
-# pairs with CUDA 13. If you need a working v3 CUDA-required deploy
-# TODAY, use the Ubuntu 24.04 (noble) variant instead, which pins to
-# the known-working ubuntu2404 NVIDIA CUDA apt repo:
-#
-#   sudo PROFILE=hdr-4k120-cuda-ubuntu2404 bash bootstrap.sh
-#
-# This profile is kept in-tree so that, once NVIDIA ships an
-# ubuntu2510 CUDA apt repo OR a non-corrupt CUDA 13 runfile becomes
-# available (and its sha256 can be pinned), the 25.10 path can be
-# flipped on without re-creating the profile.
+# The CUDA 13.0.2 toolkit-only runfile is still reproducibly corrupt
+# on NVIDIA's production mirror; the runfile_url stays empty until a
+# known-good (URL, sha256) pair is captured.
 
 profile: hdr-4k120-cuda
 ubuntu_version: "25.10"
@@ -64,6 +60,17 @@ cuda:
   allow_ubuntu_archive_fallback: false
   compile_smoke_test: true
   package_name: ""
+
+  # Cross-distro NVIDIA CUDA repo ladder. v2 demonstrated CUDA 13
+  # works on Ubuntu 25.10 by installing from NVIDIA's ubuntu2404
+  # CUDA repo even when no ubuntu2510 repo exists yet. v3 follows
+  # the same trick:
+  #   - auto-host: ubuntu2510 on 25.10, ubuntu2404 on 24.04
+  #   - ubuntu2404: the known-good cross-distro fallback today
+  allow_cross_distro_cuda_repo: true
+  cuda_repo_distro_candidates:
+    - auto-host
+    - ubuntu2404
   # runfile_url: intentionally unset (see KNOWN GAP block above for
   # the 13.0.2-corruption story). When a known-good CUDA 13 runfile
   # is captured, set BOTH runfile_url and runfile_sha256 and switch

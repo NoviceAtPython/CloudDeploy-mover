@@ -105,6 +105,19 @@ func TestHDRCudaProfileSpec(t *testing.T) {
 	if !p.CUDA.CompileSmokeTest {
 		t.Error("hdr-4k120-cuda: cuda.compile_smoke_test must be true (CUDA-required must prove nvcc works)")
 	}
+	if !p.CUDA.AllowCrossDistroCudaRepo {
+		t.Error("hdr-4k120-cuda: cuda.allow_cross_distro_cuda_repo must be true (cross-distro CUDA 13 via ubuntu2404 is the supported path on 25.10)")
+	}
+	wantCandidates := []string{"auto-host", "ubuntu2404"}
+	if len(p.CUDA.CudaRepoDistroCandidates) != len(wantCandidates) {
+		t.Errorf("hdr-4k120-cuda: cuda.cuda_repo_distro_candidates got %v want %v", p.CUDA.CudaRepoDistroCandidates, wantCandidates)
+	} else {
+		for i, c := range wantCandidates {
+			if p.CUDA.CudaRepoDistroCandidates[i] != c {
+				t.Errorf("hdr-4k120-cuda: cuda.cuda_repo_distro_candidates[%d] got %q want %q", i, p.CUDA.CudaRepoDistroCandidates[i], c)
+			}
+		}
+	}
 	if strings.TrimSpace(p.CUDA.RunfileURL) != "" {
 		t.Errorf("hdr-4k120-cuda: cuda.runfile_url must be empty (CUDA 13.0.2 mirror is corrupt); got %q", p.CUDA.RunfileURL)
 	}
@@ -140,8 +153,42 @@ func TestHDRCudaCompatibleProfileSpec(t *testing.T) {
 	if !p.CUDA.CompileSmokeTest {
 		t.Error("compat: cuda.compile_smoke_test must be true")
 	}
+	if !p.CUDA.AllowCrossDistroCudaRepo {
+		t.Error("compat: cuda.allow_cross_distro_cuda_repo must be true")
+	}
+	if p.CUDA.PreferMajor != "13" {
+		t.Errorf("compat: cuda.prefer_major must be \"13\"; got %q", p.CUDA.PreferMajor)
+	}
+	if !p.CUDA.PreferNewest {
+		t.Error("compat: cuda.prefer_newest must be true")
+	}
 	if err := ValidateProfile(p); err != nil {
 		t.Errorf("ValidateProfile(hdr-4k120-cuda-compatible): %v", err)
+	}
+}
+
+// TestHDRCudaNativeProfileSpec exercises the diagnostic native-only
+// profile. It pins auto-host with no cross-distro / archive / runfile
+// fallback so a failure is the answer to "does NVIDIA officially
+// support the host's Ubuntu version yet?".
+func TestHDRCudaNativeProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-cuda-native")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-cuda-native): %v", err)
+	}
+	if p.CUDA.AllowCrossDistroCudaRepo {
+		t.Error("native: cuda.allow_cross_distro_cuda_repo must be false (host-only)")
+	}
+	if p.CUDA.AllowUbuntuArchiveFallback {
+		t.Error("native: cuda.allow_ubuntu_archive_fallback must be false")
+	}
+	wantCandidates := []string{"auto-host"}
+	if len(p.CUDA.CudaRepoDistroCandidates) != len(wantCandidates) || p.CUDA.CudaRepoDistroCandidates[0] != wantCandidates[0] {
+		t.Errorf("native: cuda.cuda_repo_distro_candidates got %v want %v", p.CUDA.CudaRepoDistroCandidates, wantCandidates)
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-cuda-native): %v", err)
 	}
 }
 
@@ -328,6 +375,15 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.CUDA.SelectionPolicy = "min-major"
 			p.CUDA.MinMajor = ""
 		}, "min_major"},
+		{"bad cuda prefer_major", func(p *Profile) { p.CUDA.PreferMajor = "13.0" }, "cuda.prefer_major"},
+		{"bad cuda repo distro candidate", func(p *Profile) {
+			p.CUDA.AllowCrossDistroCudaRepo = true
+			p.CUDA.CudaRepoDistroCandidates = []string{"redhat9"}
+		}, "cuda_repo_distro_candidates"},
+		{"cross-distro candidate without flag", func(p *Profile) {
+			p.CUDA.AllowCrossDistroCudaRepo = false
+			p.CUDA.CudaRepoDistroCandidates = []string{"auto-host", "ubuntu2404"}
+		}, "allow_cross_distro_cuda_repo"},
 	}
 	base := func() *Profile {
 		return &Profile{

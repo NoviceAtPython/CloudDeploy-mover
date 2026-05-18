@@ -63,11 +63,16 @@ nvidia:
 cuda:
   # Strict CUDA-13-only profile, just like hdr-4k120-cuda but pinned
   # to Ubuntu 24.04 LTS so the ubuntu2404 NVIDIA CUDA apt repo (which
-  # actually exists) can satisfy the install.
+  # actually exists) can satisfy the install. auto-host expands to
+  # ubuntu2404 on this profile, so the candidate list is intentionally
+  # short.
   mode: required
   method: apt
   selection_policy: exact-major
   expected_major: "13"
+  allow_cross_distro_cuda_repo: false
+  cuda_repo_distro_candidates:
+    - auto-host
   allow_ubuntu_archive_fallback: false
   compile_smoke_test: true
   package_name: ""

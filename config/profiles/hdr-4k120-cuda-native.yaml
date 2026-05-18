@@ -1,0 +1,75 @@
+# hdr-4k120-cuda-native - host-native NVIDIA CUDA repo only.
+#
+# This profile is a diagnostic tool. It probes ONLY the
+# host-native NVIDIA CUDA apt repo (auto-host expands to ubuntu2510
+# on Ubuntu 25.10, ubuntu2404 on Ubuntu 24.04, ...). No cross-distro
+# fallback (`ubuntu2404` from a 25.10 host is forbidden), no
+# Ubuntu-archive fallback, no runfile.
+#
+# Use cases
+# ---------
+#   * Operators verifying whether NVIDIA officially supports the
+#     current Ubuntu version. A success here proves "NVIDIA ships
+#     a CUDA repo for this Ubuntu version that installs cleanly".
+#   * Bisecting "does CUDA 13 work natively on 25.10 yet?" without
+#     hiding the answer behind a cross-distro repo bend.
+#
+# Expected behavior on Ubuntu 25.10 today: the phase fails fast with
+# "no reachable NVIDIA CUDA apt repo" because ubuntu2510 does not
+# exist on NVIDIA's mirror. That failure is the answer to the
+# diagnostic question.
+#
+# Use `hdr-4k120-cuda` or `hdr-4k120-cuda-compatible` for the
+# pragmatic "install whatever works" path; this profile is
+# intentionally rigid.
+
+profile: hdr-4k120-cuda-native
+ubuntu_version: "25.10"
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: required
+  method: apt
+  selection_policy: exact-major
+  expected_major: "13"
+  # auto-host only. No cross-distro fallback, no archive fallback,
+  # no runfile. A failure here is diagnostic.
+  allow_cross_distro_cuda_repo: false
+  cuda_repo_distro_candidates:
+    - auto-host
+  allow_ubuntu_archive_fallback: false
+  compile_smoke_test: true
+  package_name: ""
+  runfile_url: ""
+  runfile_sha256: ""
+  runfile_max_attempts: 3
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false
