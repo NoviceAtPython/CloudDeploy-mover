@@ -76,7 +76,10 @@ func TestHDRProfileSpec(t *testing.T) {
 }
 
 // TestHDRCudaProfileSpec exercises the HDR-plus-required-CUDA profile
-// used for VM testing the cuda phase end-to-end.
+// used for VM testing the cuda phase end-to-end. After the CUDA 13.0.2
+// runfile was discovered to be reproducibly corrupt on the production
+// mirror, the profile defaults to method=apt and ships with no
+// runfile URL pinned.
 func TestHDRCudaProfileSpec(t *testing.T) {
 	dir := repoConfigDir(t)
 	p, err := LoadProfile(dir, "hdr-4k120-cuda")
@@ -88,6 +91,15 @@ func TestHDRCudaProfileSpec(t *testing.T) {
 	}
 	if strings.ToLower(p.CUDA.Mode) != "required" {
 		t.Errorf("hdr-4k120-cuda: cuda.mode must be 'required', got %q", p.CUDA.Mode)
+	}
+	if strings.ToLower(p.CUDA.Method) != "apt" {
+		t.Errorf("hdr-4k120-cuda: cuda.method must be 'apt' while no known-good runfile is pinned; got %q", p.CUDA.Method)
+	}
+	if strings.TrimSpace(p.CUDA.RunfileURL) != "" {
+		t.Errorf("hdr-4k120-cuda: cuda.runfile_url must be empty (CUDA 13.0.2 mirror is corrupt); got %q", p.CUDA.RunfileURL)
+	}
+	if strings.TrimSpace(p.CUDA.RunfileSHA256) != "" {
+		t.Errorf("hdr-4k120-cuda: cuda.runfile_sha256 must be empty until a known-good artifact is captured; got %q", p.CUDA.RunfileSHA256)
 	}
 	if err := ValidateProfile(p); err != nil {
 		t.Errorf("ValidateProfile(hdr-4k120-cuda): %v", err)

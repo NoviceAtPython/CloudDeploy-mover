@@ -22,6 +22,30 @@ import (
 // CudaName is the canonical state-key.
 const CudaName = "cuda"
 
+// RunfileCheckCorruptHint is the operator-facing diagnostic emitted
+// whenever the NVIDIA runfile's `--check` step fails (its embedded MD5
+// does not match the runfile body). It is also appended to the final
+// error string when the runfile loop exhausts attempts so the operator
+// sees actionable guidance, not just "exhausted".
+//
+// Background: the CUDA 13.0.2 toolkit-only runfile
+//
+//	https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
+//
+// is reproducibly corrupt on the production mirror as of 2026-05-18:
+// clean (non-resumed) downloads consistently yield the same sha256
+// (81a5d0d0870ba2022efb0a531dcc60adbdc2bbff7b3ef19d6fd6d8105406c775),
+// and `sh cuda_*_linux.run --check` rejects them with
+// "MD5 sum is different from a7389036e857482d4465dc2d5b6370d8".
+// This means the upstream artifact itself (or its mirrored copy)
+// disagrees with its own embedded checksum — re-downloading cannot
+// help, and v3's RetryDecider correctly refuses to retry the same SHA.
+const RunfileCheckCorruptHint = "NVIDIA runfile internal checksum failed; artifact/cache likely corrupt. " +
+	"Re-downloading the same SHA cannot help. " +
+	"Try cuda.method=apt (the official NVIDIA CUDA apt repo is the recommended path), " +
+	"or pin a different cuda.runfile_url (a different CUDA 13.x version) AND set cuda.runfile_sha256 " +
+	"to a value that passes `sh cuda_*_linux.run --check`."
+
 // Cuda phase: real v2-equivalent CUDA toolkit install. Honors
 // cuda.Mode (none/optional/required) and cuda.Method (auto/apt/runfile/none),
 // drops a /etc/profile.d/clouddeploy-cuda.sh after a successful install,
@@ -441,7 +465,8 @@ func (p Cuda) runRunfilePath(
 		if checkErr != nil {
 			lastErr = fmt.Errorf("runfile --check failed (attempt %d): %w", attempt, checkErr)
 			log.Warn("phase cuda: runfile --check failed",
-				"attempt", attempt, "sha256", actualSHA, "err", checkErr)
+				"attempt", attempt, "sha256", actualSHA, "size", size, "err", checkErr)
+			log.Error("phase cuda: hint", "hint", RunfileCheckCorruptHint)
 			_ = os.Remove(runfilePath)
 			continue
 		}
@@ -469,13 +494,26 @@ func (p Cuda) runRunfilePath(
 		}, expectedMajor, log)
 	}
 
-	// All attempts exhausted.
-	finalErr := fmt.Errorf("runfile install failed after %d attempts: %w", maxAttempts, lastErr)
+	// All attempts exhausted. Always surface the corrupt-runfile hint
+	// at this point: even if the failure mode wasn't a `--check`
+	// failure on the last attempt, the operator typically wants
+	// "what to do next" without paging back through logs.
+	log.Error("phase cuda: runfile path exhausted attempts; hint follows",
+		"attempts", maxAttempts, "last_err", lastErr)
+	log.Error("phase cuda: hint", "hint", RunfileCheckCorruptHint)
+	finalErr := fmt.Errorf("runfile install failed after %d attempts: %w. %s",
+		maxAttempts, lastErr, RunfileCheckCorruptHint)
 	if plan.FailsDeployOnError {
 		return p.fail(deps, plan, "runfile install exhausted attempts", finalErr)
 	}
 	return p.skipNonfatal(deps, plan, "runfile install exhausted attempts; mode=optional",
-		map[string]any{"method": "runfile", "runfile_url": url, "attempts": maxAttempts, "err": finalErr.Error()})
+		map[string]any{
+			"method":      "runfile",
+			"runfile_url": url,
+			"attempts":    maxAttempts,
+			"err":         finalErr.Error(),
+			"hint":        RunfileCheckCorruptHint,
+		})
 }
 
 func (p Cuda) downloadRunfile(ctx context.Context, deps *Deps, url, dst string) (int64, error) {

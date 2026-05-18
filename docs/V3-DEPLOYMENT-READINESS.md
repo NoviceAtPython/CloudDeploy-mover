@@ -160,7 +160,7 @@ the operator sees clearly which case applied.
 | Driver-major availability | **Solved** — `nvidia.GatherEvidenceFromHost(opts)` scoped scan. |
 | Open vs closed kernel module | **Solved** — hard/soft requirement split. |
 | Multiple installed driver families | **Solved this commit** — `nvidia.PlanCleanup` + `--repair-driver-family` gate. |
-| Repeated bad-CUDA-runfile retries | **Solved this commit** — `cuda.RetryDecider` wired into the v3 runfile install path; refuses to retry same (sha256, size) that already failed `--check`. |
+| Repeated bad-CUDA-runfile retries | **Solved** — `cuda.RetryDecider` wired into the v3 runfile install path; refuses to retry same (sha256, size) that already failed `--check`. As of 2026-05-18, the CUDA 13.0.2 toolkit-only runfile on the production NVIDIA mirror is reproducibly corrupt (`--check` rejects its own embedded MD5), so `hdr-4k120-cuda` ships with `cuda.method=apt` and no `runfile_url`. A `--check` failure now logs `RunfileCheckCorruptHint` and includes it in the fatal error / optional-skip details. |
 | CUDA apt package name guessed wrong | **Solved this commit** — `cuda.DiscoverCandidate` tries `cuda-toolkit-13-N`, `cuda-toolkit`, `nvidia-cuda-toolkit` (filtered out when required-major=13), profile override. |
 | CUDA install accidentally clobbers driver | **Solved this commit** — apt path refuses `cuda-drivers` / `cuda-drivers-*`; runfile path uses `--toolkit --override` (never `--driver`). |
 | Reboot/resume ambiguity | **Solved this commit** — `internal/reboot` installs continuation systemd unit; `apply` returns exit 2 when reboot is pending; `--auto-reboot` triggers it; `resume` clears state + disables the unit. |

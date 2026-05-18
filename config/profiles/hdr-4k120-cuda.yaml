@@ -32,12 +32,33 @@ cuda:
   # and the runfile mirror is intermittently corrupting downloads.
   mode: required
   package_name: ""
-  # auto: prefer the NVIDIA CUDA apt repo (cuda-keyring_1.1-1) when
-  # one exists for this Ubuntu version; fall back to the toolkit-only
-  # NVIDIA runfile otherwise. Driver 580 -> CUDA 13.
-  method: auto
-  runfile_url: https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
-  # runfile_sha256: ""   # pin once a known-good SHA is captured
+  # apt: bootstrap the official NVIDIA CUDA apt repository
+  # (cuda-keyring_1.1-1) and install a `cuda-toolkit-13-N` package
+  # toolkit-only. This is the v3 default while no known-good CUDA 13
+  # runfile is pinned (see below).
+  method: apt
+  # runfile_url: intentionally unset.
+  #
+  # The CUDA 13.0.2 toolkit-only runfile
+  #   https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
+  # is reproducibly corrupt on the production mirror as of this commit:
+  #   size  : 4328066903
+  #   sha256: 81a5d0d0870ba2022efb0a531dcc60adbdc2bbff7b3ef19d6fd6d8105406c775
+  #   --check (NVIDIA's embedded MD5 vs the runfile body):
+  #           "different from a7389036e857482d4465dc2d5b6370d8"
+  # v3's runfile path correctly refuses to install it and v3's
+  # RetryDecider refuses to redownload the same bad SHA. Until a
+  # known-good CUDA 13 runfile passes `--check` AND its sha256 is
+  # captured into runfile_sha256 below, we deliberately leave the URL
+  # empty so the cuda phase ONLY uses apt for this profile.
+  #
+  # To re-enable the runfile fallback after capturing a good artifact:
+  #   1. Download the candidate runfile.
+  #   2. Confirm `sh cuda_*_linux.run --check` exits 0.
+  #   3. Capture sha256 and set BOTH fields below; switch method back
+  #      to `auto`.
+  runfile_url: ""
+  runfile_sha256: ""
   runfile_max_attempts: 3
 
 sunshine:

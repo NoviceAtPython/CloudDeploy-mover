@@ -525,6 +525,97 @@ func TestCudaPhase_VerifyFailsWhenMajorMismatch(t *testing.T) {
 // state shape
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// diagnostic hint
+// -----------------------------------------------------------------------------
+
+func TestCudaPhase_CorruptRunfileHintInFatalError(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return false },
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("corrupt-but-not-html"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn: func(context.Context, *Deps, string, string) error {
+			// Mimic NVIDIA's own message so we know the hint fires
+			// even when the upstream wording shows through.
+			return errors.New("Error in MD5 checksums: <varies> is different from a7389036e857482d4465dc2d5b6370d8")
+		},
+		RunfileTmpDirOverride: tmpdir,
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal --check failure")
+	}
+	if !strings.Contains(err.Error(), "NVIDIA runfile internal checksum failed") {
+		t.Errorf("error should embed the corrupt-runfile hint; got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "cuda.method=apt") {
+		t.Errorf("error should suggest cuda.method=apt; got: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	if !strings.Contains(asString(d["err"]), "internal checksum failed") {
+		// state.Details["err"] is nil on fatal path (we use the
+		// shared `fail` helper); the public-facing error string is
+		// the right place to assert. Just ensure mode persisted.
+	}
+	_ = d
+}
+
+func TestCudaPhase_CorruptRunfileHintInOptionalSkipDetails(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.Mode = "optional"
+	p.CUDA.RunfileMaxAttempts = 1
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return false },
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("corrupt-but-not-html"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn: func(context.Context, *Deps, string, string) error {
+			return errors.New("--check fail")
+		},
+		RunfileTmpDirOverride: tmpdir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	hint, ok := d["hint"].(string)
+	if !ok || hint == "" {
+		t.Fatalf("optional-skip details must include `hint`; got %+v", d)
+	}
+	if !strings.Contains(hint, "internal checksum failed") {
+		t.Errorf("hint should match RunfileCheckCorruptHint; got %q", hint)
+	}
+	if !strings.Contains(hint, "cuda.method=apt") {
+		t.Errorf("hint should suggest cuda.method=apt; got %q", hint)
+	}
+}
+
+func asString(v any) string {
+	if s, ok := v.(string); ok {
+		return s
+	}
+	return ""
+}
+
 func TestCudaPhase_PersistsDetailsOnSuccess(t *testing.T) {
 	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
 	p := cudaTestProfile("runfile", url)
