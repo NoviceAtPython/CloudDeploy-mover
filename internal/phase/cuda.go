@@ -247,20 +247,34 @@ func (p Cuda) runAptPath(
 	compileSmokeTest bool,
 	log *slog.Logger,
 ) error {
-	if repoDistro == "" {
-		err := fmt.Errorf("no official NVIDIA CUDA apt repo detected for this Ubuntu version; try cuda.method=runfile or use a profile that targets a release with a CUDA apt repo (e.g. hdr-4k120-cuda-ubuntu2404)")
+	// archiveOnly: no official NVIDIA CUDA apt repo for this Ubuntu
+	// version, but the profile allows Ubuntu's archive fallback. We
+	// skip cuda-keyring bootstrap entirely and rely on whatever
+	// nvidia-cuda-toolkit is already in the host's apt sources. The
+	// candidate ladder + selection policy still decide whether that
+	// archive package is acceptable (it MUST satisfy the policy; see
+	// CandidateLadder).
+	archiveOnly := repoDistro == "" && selection.AllowUbuntuArchiveFallback
+	if repoDistro == "" && !archiveOnly {
+		err := fmt.Errorf("no official NVIDIA CUDA apt repo detected for this Ubuntu version, and cuda.allow_ubuntu_archive_fallback=false; try cuda.method=runfile, set cuda.allow_ubuntu_archive_fallback=true to accept Ubuntu's CUDA 12 archive, or use a profile that targets a release with a CUDA apt repo (e.g. hdr-4k120-cuda-ubuntu2404)")
 		if plan.FailsDeployOnError {
 			return p.fail(deps, plan, "no CUDA apt repo available", err)
 		}
 		return p.skipNonfatal(deps, plan, "no CUDA apt repo available; mode=optional -> skipped",
 			map[string]any{"method": "apt", "repo_distro": "", "selection_policy": string(selection.Policy)})
 	}
-	if err := p.ensureCudaAptRepo(ctx, deps, repoDistro); err != nil {
-		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "ensure CUDA apt repo failed", err)
+	if !archiveOnly {
+		if err := p.ensureCudaAptRepo(ctx, deps, repoDistro); err != nil {
+			if plan.FailsDeployOnError {
+				return p.fail(deps, plan, "ensure CUDA apt repo failed", err)
+			}
+			return p.skipNonfatal(deps, plan, "ensure CUDA apt repo failed; mode=optional -> skipped",
+				map[string]any{"method": "apt", "repo_distro": repoDistro, "err": err.Error()})
 		}
-		return p.skipNonfatal(deps, plan, "ensure CUDA apt repo failed; mode=optional -> skipped",
-			map[string]any{"method": "apt", "repo_distro": repoDistro, "err": err.Error()})
+	} else {
+		log.Info("phase cuda: no official NVIDIA CUDA apt repo for this Ubuntu; using Ubuntu archive fallback (no cuda-keyring bootstrap)",
+			"selection_policy", string(selection.Policy),
+			"min_major", selection.MinMajor)
 	}
 
 	probe := p.ProbeFn
@@ -269,6 +283,13 @@ func (p Cuda) runAptPath(
 	}
 	opts := selection.CandidateOptions(explicitName)
 	pkg := cuda.DiscoverCandidate(opts, probe)
+
+	// Diagnostic value persisted to state.Details for both
+	// success and failure branches.
+	repoDisplay := repoDistro
+	if archiveOnly {
+		repoDisplay = "ubuntu-archive"
+	}
 
 	if pkg == "" {
 		// No apt candidate that matches the policy. Try the runfile
@@ -292,7 +313,8 @@ func (p Cuda) runAptPath(
 		return p.skipNonfatal(deps, plan, "no installable CUDA toolkit candidate; mode=optional -> skipped",
 			map[string]any{
 				"method":           "apt",
-				"repo_distro":      repoDistro,
+				"repo_distro":      repoDisplay,
+				"archive_fallback": archiveOnly,
 				"selection_policy": string(selection.Policy),
 				"candidates":       cuda.CandidateLadder(opts),
 			})
@@ -305,7 +327,8 @@ func (p Cuda) runAptPath(
 
 	log.Info("phase cuda: apt install (toolkit-only)",
 		"package", pkg,
-		"repo", repoDistro,
+		"repo", repoDisplay,
+		"archive_fallback", archiveOnly,
 		"selection_policy", string(selection.Policy),
 		"expected_major", selection.ExpectedMajor,
 		"min_major", selection.MinMajor)
@@ -321,10 +344,11 @@ func (p Cuda) runAptPath(
 	}
 
 	return p.verifyAndFinish(ctx, deps, plan, selection, compileSmokeTest, map[string]any{
-		"method":      "apt",
-		"repo_distro": repoDistro,
-		"package":     pkg,
-		"source":      "apt",
+		"method":           "apt",
+		"repo_distro":      repoDisplay,
+		"archive_fallback": archiveOnly,
+		"package":          pkg,
+		"source":           "apt",
 	}, log)
 }
 

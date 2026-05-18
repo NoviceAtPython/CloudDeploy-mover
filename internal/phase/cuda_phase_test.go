@@ -418,6 +418,8 @@ func TestCudaPhase_AptPath_RefusesDriverMetaPackage(t *testing.T) {
 
 func TestCudaPhase_AptPath_MethodAptNoRepo_RequiredFails(t *testing.T) {
 	p := cudaTestProfile("apt", "")
+	// Archive fallback OFF (default) keeps the strict behavior: no
+	// NVIDIA CUDA apt repo + required = fatal.
 	deps := cudaPhaseDeps(t, p)
 	ph := Cuda{
 		CudaLayoutOKFn:         func() bool { return false },
@@ -434,6 +436,192 @@ func TestCudaPhase_AptPath_MethodAptNoRepo_RequiredFails(t *testing.T) {
 	}
 	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
 		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+// -----------------------------------------------------------------------------
+// archive-fallback path (no NVIDIA CUDA apt repo for the host's Ubuntu)
+// -----------------------------------------------------------------------------
+
+// TestCudaPhase_AptPath_NoNvidiaRepo_ArchiveFallbackInstallsUbuntuToolkit
+// is the hdr-4k120-cuda-compatible case on Ubuntu 25.10: no
+// ubuntu2510 CUDA apt repo, but the profile says it is fine to
+// install Ubuntu's `nvidia-cuda-toolkit`. The phase must:
+//
+//  1. detect no NVIDIA CUDA repo for this distro,
+//  2. skip cuda-keyring bootstrap entirely (would 404 anyway),
+//  3. probe apt-cache against the host's *existing* sources, which
+//     only know nvidia-cuda-toolkit,
+//  4. apt-install nvidia-cuda-toolkit,
+//  5. record repo_distro="ubuntu-archive" + archive_fallback=true in
+//     state.Details.
+func TestCudaPhase_AptPath_NoNvidiaRepo_ArchiveFallbackInstallsUbuntuToolkit(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	deps := cudaPhaseDeps(t, p)
+
+	// Verify ensureCudaAptRepo is NOT invoked by the archive-only
+	// path: every keyring-bootstrap call would route a "curl ...
+	// cuda-keyring..." through deps.Runner. We capture the runner's
+	// log dir as a probe target.
+	httpHeadCalls := 0
+
+	probedNames := []string{}
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return true },
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		HTTPHeadFn: func(context.Context, *Deps, string) bool {
+			httpHeadCalls++
+			return false
+		},
+		ProbeFn: func(pkg string) bool {
+			probedNames = append(probedNames, pkg)
+			// Only nvidia-cuda-toolkit is installable from the host's
+			// existing apt sources (Ubuntu 25.10 archive ships CUDA 12.4).
+			return pkg == "nvidia-cuda-toolkit"
+		},
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:     func(context.Context, *Deps, string) error { return nil },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Fatalf("status: got %q want done", got)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["package"] != "nvidia-cuda-toolkit" {
+		t.Errorf("expected install of nvidia-cuda-toolkit; got package=%v", d["package"])
+	}
+	if d["repo_distro"] != "ubuntu-archive" {
+		t.Errorf("repo_distro: got %v want ubuntu-archive", d["repo_distro"])
+	}
+	if d["archive_fallback"] != true {
+		t.Errorf("archive_fallback: got %v want true", d["archive_fallback"])
+	}
+	if d["source"] != "apt" {
+		t.Errorf("source: got %v want apt", d["source"])
+	}
+	// nvcc 12.4 + min_major=12 must satisfy latest-compatible.
+	if d["nvcc_version"] != "12.4" {
+		t.Errorf("nvcc_version: got %v want 12.4", d["nvcc_version"])
+	}
+	// The candidate ladder must have probed nvidia-cuda-toolkit
+	// (i.e. the archive entry is part of the ladder under
+	// archive_fallback=true).
+	probed := strings.Join(probedNames, ",")
+	if !strings.Contains(probed, "nvidia-cuda-toolkit") {
+		t.Errorf("probe ladder must include nvidia-cuda-toolkit; got %v", probedNames)
+	}
+}
+
+// TestCudaPhase_AptPath_NoRepo_NoArchiveFallback_RequiredFails is the
+// strict variant: same 25.10 conditions but allow_ubuntu_archive_fallback
+// remains false. The phase MUST fail fatal rather than reaching for
+// the archive.
+func TestCudaPhase_AptPath_NoRepo_NoArchiveFallback_RequiredFails(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowUbuntuArchiveFallback = false
+	deps := cudaPhaseDeps(t, p)
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return false },
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		ProbeFn:                func(string) bool { return true }, // would happily install archive if reached
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal: archive_fallback=false + no NVIDIA repo + required")
+	}
+	if !strings.Contains(err.Error(), "no CUDA apt repo") {
+		t.Errorf("error should mention no CUDA apt repo: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+// TestCudaPhase_AptPath_StrictExact13_NoArchiveFallback_RequiredFails:
+// the strict hdr-4k120-cuda case on 25.10. exact-major=13 must NEVER
+// reach the archive even if archive_fallback were on (archive ships
+// CUDA 12). Here we set archive_fallback=false too, so the path
+// short-circuits on the missing NVIDIA repo first — the assertion is
+// that exact-major never silently downgrades to 12.
+func TestCudaPhase_AptPath_StrictExact13_NoArchiveFallback_RequiredFails(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "exact-major"
+	p.CUDA.ExpectedMajor = "13"
+	p.CUDA.AllowUbuntuArchiveFallback = false
+	deps := cudaPhaseDeps(t, p)
+	ph := Cuda{
+		CudaLayoutOKFn:         func() bool { return false },
+		NvccProbeFn:            func(context.Context, *Deps) cuda.NvccRelease { return cuda.NvccRelease{} },
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		ProbeFn:                func(string) bool { return true }, // archive would install if reached
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("strict exact-major=13 + no NVIDIA repo + required must be fatal")
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
+	}
+}
+
+// TestCudaPhase_AptPath_ArchiveOnlyPathSkipsKeyringBootstrap pins the
+// load-bearing observable behavior: the archive-only path must NOT
+// invoke the NVIDIA cuda-keyring HEAD probe. (The probe is the gate
+// that sets repoDistro; once we decided to fall through to archive,
+// asking developer.download.nvidia.com again would be wasted work
+// and would mask real misconfigurations.)
+func TestCudaPhase_AptPath_ArchiveOnlyPathSkipsKeyringBootstrap(t *testing.T) {
+	p := cudaTestProfile("apt", "")
+	p.CUDA.SelectionPolicy = "latest-compatible"
+	p.CUDA.MinMajor = "12"
+	p.CUDA.AllowUbuntuArchiveFallback = true
+	deps := cudaPhaseDeps(t, p)
+
+	repoProbeCalls := 0
+	httpHeadCalls := 0
+	ph := Cuda{
+		CudaLayoutOKFn: func() bool { return true },
+		NvccProbeFn:    stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "12", Minor: "4"}),
+		RepoProbeFn: func(string) bool {
+			repoProbeCalls++
+			return false
+		},
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		HTTPHeadFn: func(context.Context, *Deps, string) bool {
+			httpHeadCalls++
+			return false
+		},
+		ProbeFn:        func(pkg string) bool { return pkg == "nvidia-cuda-toolkit" },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn:     func(context.Context, *Deps, string) error { return nil },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	// The keyring HEAD probe runs at most once (during detectRepoDistro);
+	// the archive-only path must not invoke HTTPHeadFn a second time
+	// trying to bootstrap a keyring URL that doesn't exist.
+	if httpHeadCalls > 1 {
+		t.Errorf("archive-only path made %d HTTP HEAD calls; expected at most 1 (detectRepoDistro only)", httpHeadCalls)
+	}
+	// Repo probe is still called once via detectRepoDistro.
+	if repoProbeCalls != 1 {
+		t.Errorf("repo probe should be invoked exactly once (detectRepoDistro); got %d", repoProbeCalls)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
+		t.Errorf("status: got %q want done", got)
 	}
 }
 
