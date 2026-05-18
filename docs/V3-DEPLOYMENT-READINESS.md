@@ -161,6 +161,7 @@ the operator sees clearly which case applied.
 | Open vs closed kernel module | **Solved** — hard/soft requirement split. |
 | Multiple installed driver families | **Solved this commit** — `nvidia.PlanCleanup` + `--repair-driver-family` gate. |
 | Repeated bad-CUDA-runfile retries | **Solved** — `cuda.RetryDecider` wired into the v3 runfile install path; refuses to retry same (sha256, size) that already failed `--check`. As of 2026-05-18, the CUDA 13.0.2 toolkit-only runfile on the production NVIDIA mirror is reproducibly corrupt (`--check` rejects its own embedded MD5), so `hdr-4k120-cuda` ships with `cuda.method=apt` and no `runfile_url`. A `--check` failure now logs `RunfileCheckCorruptHint` and includes it in the fatal error / optional-skip details. |
+| No NVIDIA CUDA apt repo for Ubuntu 25.10 | **Worked around** (2026-05-18). NVIDIA does not publish `https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2510/...` and Ubuntu 25.10's archive ships `nvidia-cuda-toolkit` at CUDA 12.4 (intentionally filtered out by `cuda.CandidateLadder` when `RequiredMajor=13`). The combined result: `hdr-4k120-cuda` (which targets 25.10) is currently unsatisfiable and fails fatal with a clear "no CUDA apt repo available" message. The new `config/profiles/hdr-4k120-cuda-ubuntu2404.yaml` pins to Ubuntu 24.04 LTS (`auto_upgrade_ubuntu=false`) where NVIDIA's `ubuntu2404` CUDA apt repo is known to exist, giving v3 a working CUDA-required test target today. |
 | CUDA apt package name guessed wrong | **Solved this commit** — `cuda.DiscoverCandidate` tries `cuda-toolkit-13-N`, `cuda-toolkit`, `nvidia-cuda-toolkit` (filtered out when required-major=13), profile override. |
 | CUDA install accidentally clobbers driver | **Solved this commit** — apt path refuses `cuda-drivers` / `cuda-drivers-*`; runfile path uses `--toolkit --override` (never `--driver`). |
 | Reboot/resume ambiguity | **Solved this commit** — `internal/reboot` installs continuation systemd unit; `apply` returns exit 2 when reboot is pending; `--auto-reboot` triggers it; `resume` clears state + disables the unit. |
@@ -188,10 +189,19 @@ Findings from sweeping the codebase for misleading text:
 
 ## 7. Acceptance criteria for the next VM test
 
-The `hdr-4k120` profile now ships with
+Three test profiles cover the supported paths:
+
+| Profile | Ubuntu target | CUDA | Notes |
+| --- | --- | --- | --- |
+| `hdr-4k120` | 25.10 | `mode=none` | Default. Tests ubuntu-upgrade → driver → edid; cuda is skipped. |
+| `hdr-4k120-cuda` | 25.10 | `mode=required`, `method=apt` | **Currently unsatisfiable** (NVIDIA has no ubuntu2510 CUDA repo and the 13.0.2 runfile is corrupt). v3 fails fatal with a clear "no CUDA apt repo available" message. |
+| `hdr-4k120-cuda-ubuntu2404` (this commit) | 24.04 | `mode=required`, `method=apt`, `auto_upgrade_ubuntu=false` | The known-working CUDA-required test target. Uses NVIDIA's `ubuntu2404` CUDA apt repo. |
+
+`hdr-4k120` ships with
 `deploy.auto_upgrade_ubuntu: true` + `deploy.accept_non_lts: true` +
-`deploy.direct_apt_codename_upgrade: auto` + `deploy.auto_reboot: false`.
-That means the next VM test can start from **either**:
+`deploy.direct_apt_codename_upgrade: auto` + `deploy.auto_reboot: false`,
+so the next VM test of the streaming-side path can start from
+**either**:
 
 * a fresh Ubuntu 25.10 cloud image (no release-upgrade hop), or
 * a fresh Ubuntu 24.04 cloud image — the v3 ubuntu-upgrade phase will
@@ -199,7 +209,11 @@ That means the next VM test can start from **either**:
   path v2 uses, because `do-release-upgrade -d` refuses 24.04 → 25.10).
 
 ```bash
+# Streaming-side path (no CUDA):
 sudo CLOUDDEPLOY_RUN=1 PROFILE=hdr-4k120 bash bootstrap.sh
+
+# CUDA-required path on Ubuntu 24.04 LTS:
+sudo CLOUDDEPLOY_RUN=1 PROFILE=hdr-4k120-cuda-ubuntu2404 bash bootstrap.sh
 ```
 
 Expected behaviour:

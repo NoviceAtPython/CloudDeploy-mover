@@ -106,6 +106,43 @@ func TestHDRCudaProfileSpec(t *testing.T) {
 	}
 }
 
+// TestHDRCuda2404ProfileSpec exercises the Ubuntu 24.04 LTS variant
+// added because NVIDIA does not publish a CUDA apt repo for Ubuntu
+// 25.10 and the 13.0.2 runfile is corrupt. This profile is the
+// known-working v3 CUDA-required test target until the 25.10 path is
+// unblocked.
+func TestHDRCuda2404ProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-cuda-ubuntu2404")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-cuda-ubuntu2404): %v", err)
+	}
+	if p.UbuntuVersion != "24.04" {
+		t.Errorf("ubuntu_version must be \"24.04\"; got %q", p.UbuntuVersion)
+	}
+	if !p.Display.HDR {
+		t.Error("display.hdr must be true")
+	}
+	if strings.ToLower(p.CUDA.Mode) != "required" {
+		t.Errorf("cuda.mode must be 'required'; got %q", p.CUDA.Mode)
+	}
+	if strings.ToLower(p.CUDA.Method) != "apt" {
+		t.Errorf("cuda.method must be 'apt' (the ubuntu2404 NVIDIA CUDA repo is the only known-good path); got %q", p.CUDA.Method)
+	}
+	if strings.TrimSpace(p.CUDA.RunfileURL) != "" {
+		t.Errorf("cuda.runfile_url must be empty for the apt-only profile; got %q", p.CUDA.RunfileURL)
+	}
+	if p.NVIDIA.DriverMajor != "580" {
+		t.Errorf("nvidia.driver_major must be 580 (pairs with CUDA 13); got %q", p.NVIDIA.DriverMajor)
+	}
+	if p.Deploy.AutoUpgradeUbuntu {
+		t.Error("deploy.auto_upgrade_ubuntu must be false: this profile must NOT upgrade off 24.04")
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-cuda-ubuntu2404): %v", err)
+	}
+}
+
 // TestHDRWithCudaRequiredValidates is the regression-prevention test
 // for the "HDR forced cuda.mode=none" rule we just removed: HDR +
 // cuda.mode=required must validate cleanly.

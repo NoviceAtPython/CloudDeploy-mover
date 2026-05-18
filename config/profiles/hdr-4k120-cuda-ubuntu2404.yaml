@@ -1,0 +1,103 @@
+# hdr-4k120-cuda-ubuntu2404 - HDR + CUDA toolkit required, pinned to
+# Ubuntu 24.04 (noble) LTS.
+#
+# Why this profile exists
+# -----------------------
+# As of 2026-05-18, NVIDIA does NOT publish an official CUDA apt repo
+# for Ubuntu 25.10 (questing):
+#
+#   https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2510/...
+#       -> 404 (HEAD probe fails)
+#
+# Ubuntu 25.10's archive ships `nvidia-cuda-toolkit` at CUDA 12.4.131,
+# but driver 580 pairs with CUDA 13. v3's candidate ladder filters
+# `nvidia-cuda-toolkit` out when `RequiredMajor=13` (since installing
+# CUDA 12.x where 13 is required would silently downgrade the toolkit
+# stack). The 13.0.2 toolkit-only runfile on NVIDIA's production
+# mirror is also reproducibly corrupt (see hdr-4k120-cuda.yaml).
+#
+# Net effect on Ubuntu 25.10:
+#
+#   - no working apt path (no ubuntu2510 repo)
+#   - no working runfile path (13.0.2 fails --check)
+#   - Ubuntu's nvidia-cuda-toolkit is intentionally filtered (12.x)
+#
+# This profile sidesteps that gap entirely by pinning to Ubuntu 24.04
+# (noble) LTS, where NVIDIA's CUDA apt repo is known to exist:
+#
+#   https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/...
+#
+# Use cases
+# ---------
+#   * VM testing the v3 CUDA-required path end-to-end on a fresh 24.04
+#     cloud image without touching the broken 25.10 path.
+#   * Workloads that need CUDA 13 + driver 580 on an LTS base.
+#
+# Differences vs hdr-4k120-cuda.yaml
+# ----------------------------------
+#   * ubuntu_version: "24.04" (was "25.10")
+#   * deploy.auto_upgrade_ubuntu: false  (do NOT upgrade off 24.04)
+#   * deploy.accept_non_lts: false       (24.04 is LTS; non-LTS gate
+#                                          is irrelevant here)
+#   * cuda.method: apt                   (forces apt; the ubuntu2404
+#                                          CUDA repo is the only
+#                                          known-good path today)
+#
+# Everything else (display, NVIDIA family, Sunshine fork pin, KWin)
+# matches the streaming-side success state.
+
+profile: hdr-4k120-cuda-ubuntu2404
+ubuntu_version: "24.04"
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  # required: phase fails the deploy if it cannot install + verify
+  # nvcc.
+  mode: required
+  package_name: ""
+  # apt: bootstrap the official NVIDIA CUDA apt repo
+  # (cuda-keyring_1.1-1, ubuntu2404 distro slug) and install a
+  # `cuda-toolkit-13-N` package toolkit-only. The candidate ladder
+  # filters Ubuntu's CUDA-12 `nvidia-cuda-toolkit` out (driver 580
+  # pairs with CUDA 13).
+  method: apt
+  runfile_url: ""
+  runfile_sha256: ""
+  runfile_max_attempts: 3
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  # Do NOT upgrade away from 24.04: the whole point of this profile is
+  # to stay on the Ubuntu release that has a working NVIDIA CUDA apt
+  # repo. ubuntu-upgrade will see current==target and mark itself
+  # done; if the host happens to be on a different release the phase
+  # will refuse with a clear "auto_upgrade_ubuntu=false" message and
+  # the operator either fixes the image or switches profiles.
+  auto_upgrade_ubuntu: false
+  # 24.04 is LTS; this knob is informational only.
+  accept_non_lts: false
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false
