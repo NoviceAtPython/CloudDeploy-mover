@@ -43,7 +43,8 @@ func TestAllProfilesParseAndValidate(t *testing.T) {
 }
 
 // TestHDRProfileSpec locks in the hdr-4k120 profile's invariants:
-// fork pin, HDR env, cuda.mode=none.
+// fork pin, HDR env. cuda.mode=none stays the default for the
+// minimal HDR profile; hdr-4k120-cuda owns the CUDA-required variant.
 func TestHDRProfileSpec(t *testing.T) {
 	dir := repoConfigDir(t)
 	p, err := LoadProfile(dir, "hdr-4k120")
@@ -60,7 +61,7 @@ func TestHDRProfileSpec(t *testing.T) {
 		t.Error("hdr-4k120: sunshine.synthesize_hdr10_metadata must be true")
 	}
 	if strings.ToLower(p.CUDA.Mode) != "none" {
-		t.Errorf("hdr-4k120: cuda.mode must be 'none', got %q", p.CUDA.Mode)
+		t.Errorf("hdr-4k120: cuda.mode must be 'none' (minimal HDR profile); got %q", p.CUDA.Mode)
 	}
 	const wantCommit = "464bccf1b6e33bf35138136c6138fd9851e6d906"
 	if p.Sunshine.ForkCommit != wantCommit {
@@ -71,6 +72,48 @@ func TestHDRProfileSpec(t *testing.T) {
 	}
 	if err := ValidateProfile(p); err != nil {
 		t.Errorf("ValidateProfile: %v", err)
+	}
+}
+
+// TestHDRCudaProfileSpec exercises the HDR-plus-required-CUDA profile
+// used for VM testing the cuda phase end-to-end.
+func TestHDRCudaProfileSpec(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120-cuda")
+	if err != nil {
+		t.Fatalf("LoadProfile(hdr-4k120-cuda): %v", err)
+	}
+	if !p.Display.HDR {
+		t.Fatal("hdr-4k120-cuda: display.hdr must be true")
+	}
+	if strings.ToLower(p.CUDA.Mode) != "required" {
+		t.Errorf("hdr-4k120-cuda: cuda.mode must be 'required', got %q", p.CUDA.Mode)
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Errorf("ValidateProfile(hdr-4k120-cuda): %v", err)
+	}
+}
+
+// TestHDRWithCudaRequiredValidates is the regression-prevention test
+// for the "HDR forced cuda.mode=none" rule we just removed: HDR +
+// cuda.mode=required must validate cleanly.
+func TestHDRWithCudaRequiredValidates(t *testing.T) {
+	p := &Profile{
+		Profile: "hdr-required-test",
+		NVIDIA:  NVIDIAConfig{DriverMajor: "580"},
+		CUDA:    CUDAConfig{Mode: "required", Method: "auto"},
+		Display: DisplayConfig{HDR: true},
+		Sunshine: SunshineConfig{
+			Source:                  "fork",
+			ForkRepo:                "https://example/Sunshine",
+			ForkBranch:              "main",
+			ForkCommit:              "abc",
+			ForceAV1HDR10:           true,
+			SynthesizeHDR10Metadata: true,
+		},
+	}
+	if err := ValidateProfile(p); err != nil {
+		t.Fatalf("HDR + cuda.mode=required must validate; got: %v", err)
 	}
 }
 
@@ -173,10 +216,7 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Display.HDR = true
 			p.Sunshine.ForceAV1HDR10 = false
 		}, "force_av1_hdr10"},
-		{"hdr cuda required", func(p *Profile) {
-			p.Display.HDR = true
-			p.CUDA.Mode = "required"
-		}, "cuda.mode=none"},
+		{"bad cuda method", func(p *Profile) { p.CUDA.Method = "snap" }, "cuda.method"},
 	}
 	base := func() *Profile {
 		return &Profile{

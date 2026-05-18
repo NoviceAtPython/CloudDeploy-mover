@@ -64,7 +64,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `resume` | **Real**. Reads state, clears RebootNeeded, replays implemented phases. Disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
 | `phase nvidia-driver` | **Real + dirty-driver cleanup planner.** |
-| `phase cuda` | **Real**. Package-candidate discovery (e.g. `cuda-toolkit-13-0`, `nvidia-cuda-toolkit`) replaces the hard-coded name. |
+| `phase cuda` | **Real (this commit: v2-parity rewrite).** Honors `cuda.method` (auto/apt/runfile/none). Apt path bootstraps `cuda-keyring_1.1-1`, installs toolkit-only (refuses `cuda-drivers*`), prefers `cuda-toolkit-13-N` then `cuda-toolkit`; Ubuntu's `nvidia-cuda-toolkit` is filtered when required-major=13. Runfile path stages under `/var/tmp/clouddeploy-cuda`, curl-retries with size + sha256 logging, runs `--check` before install, uses `RetryDecider` to refuse re-downloading the same corrupt SHA, and invokes `sh runfile --silent --toolkit --override --tmpdir=...`. Post-install verification probes nvcc release, checks `/usr/local/cuda/{bin/nvcc,include,lib64}`, and writes `/etc/profile.d/clouddeploy-cuda.sh`. State.Details records source / package / runfile_url / sha256 / nvcc_version / cuda_major / verified_layout. |
 | `phase edid` | **Real (opt-in).** Invokes `helpers/write-edids.py`, writes `/lib/firmware/edid/<name>.bin`, drops a `/etc/default/grub.d/99-clouddeploy.cfg`, runs `update-initramfs -u` + `update-grub`, sets `RebootNeeded`. Only runs when `display.forced_connector` is set in the profile. |
 | `phase kwin-patch` | Stub. Milestone 4. |
 | `phase sunshine-build` | Stub. Milestone 4. |
@@ -160,8 +160,9 @@ the operator sees clearly which case applied.
 | Driver-major availability | **Solved** — `nvidia.GatherEvidenceFromHost(opts)` scoped scan. |
 | Open vs closed kernel module | **Solved** — hard/soft requirement split. |
 | Multiple installed driver families | **Solved this commit** — `nvidia.PlanCleanup` + `--repair-driver-family` gate. |
-| Repeated bad-CUDA-runfile retries | Mitigated by `cuda.RetryDecider`; runfile install path is M4. |
-| CUDA apt package name guessed wrong | **Solved this commit** — `cuda.DiscoverCandidate` tries `cuda-toolkit-13-0`, `cuda-toolkit-12-4`, `nvidia-cuda-toolkit`, profile override. |
+| Repeated bad-CUDA-runfile retries | **Solved this commit** — `cuda.RetryDecider` wired into the v3 runfile install path; refuses to retry same (sha256, size) that already failed `--check`. |
+| CUDA apt package name guessed wrong | **Solved this commit** — `cuda.DiscoverCandidate` tries `cuda-toolkit-13-N`, `cuda-toolkit`, `nvidia-cuda-toolkit` (filtered out when required-major=13), profile override. |
+| CUDA install accidentally clobbers driver | **Solved this commit** — apt path refuses `cuda-drivers` / `cuda-drivers-*`; runfile path uses `--toolkit --override` (never `--driver`). |
 | Reboot/resume ambiguity | **Solved this commit** — `internal/reboot` installs continuation systemd unit; `apply` returns exit 2 when reboot is pending; `--auto-reboot` triggers it; `resume` clears state + disables the unit. |
 | Unsupported Ubuntu version | **Mitigated this commit** — `internal/ubuntu` gate; `apply` refuses unless `--allow-unsupported`. |
 | Wrong installed family + broken nvidia-smi | **Mitigated this commit** — `nvidia.PlanCleanup` proposes purge of conflicting closed packages when open is required and the closed install is broken. Tests cover the planner. |

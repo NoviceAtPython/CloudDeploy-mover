@@ -1,0 +1,61 @@
+# hdr-4k120-cuda - hdr-4k120 + CUDA toolkit required.
+#
+# This profile is identical to hdr-4k120 except cuda.mode=required:
+# the v3 cuda phase will install the toolkit (NVIDIA apt repo when
+# available, toolkit-only NVIDIA runfile otherwise), verify nvcc,
+# and fail the deploy if it cannot.
+#
+# Use this profile for end-to-end testing of the v3 CUDA path on a
+# fresh cloud VM. The streaming side does NOT depend on the toolkit
+# - HDR over KMS+NVENC works without CUDA - but downstream profiles
+# that derive from this one (ML workloads on top of the gaming VM)
+# need a working nvcc.
+
+profile: hdr-4k120-cuda
+ubuntu_version: "25.10"
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  # required: phase fails the deploy if it cannot install + verify
+  # nvcc. Use mode=optional if you want the deploy to continue when
+  # the official CUDA apt repo is unavailable for this Ubuntu version
+  # and the runfile mirror is intermittently corrupting downloads.
+  mode: required
+  package_name: ""
+  # auto: prefer the NVIDIA CUDA apt repo (cuda-keyring_1.1-1) when
+  # one exists for this Ubuntu version; fall back to the toolkit-only
+  # NVIDIA runfile otherwise. Driver 580 -> CUDA 13.
+  method: auto
+  runfile_url: https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
+  # runfile_sha256: ""   # pin once a known-good SHA is captured
+  runfile_max_attempts: 3
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

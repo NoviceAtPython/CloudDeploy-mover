@@ -31,6 +31,40 @@ func TestCandidateLadder_UnknownDriverSkipsToolkitsBlock(t *testing.T) {
 	}
 }
 
+func TestCandidateLadder_FiltersUbuntuArchiveWhenCuda13Required(t *testing.T) {
+	got := CandidateLadder(CandidateOptions{
+		PreferredMajor: "580",
+		RequiredMajor:  "13",
+	})
+	for _, c := range got {
+		if c == "nvidia-cuda-toolkit" {
+			t.Errorf("CUDA 13 required: Ubuntu's nvidia-cuda-toolkit must be filtered (currently 12.x); got %v", got)
+		}
+	}
+	// The cuda-toolkit metapackage MUST still be there as the
+	// fallback when no major-minor matches.
+	last := got[len(got)-1]
+	if last != "cuda-toolkit" {
+		t.Errorf("last candidate should be cuda-toolkit metapackage when ubuntu archive is filtered; got %v", got)
+	}
+}
+
+func TestCandidateLadder_KeepsUbuntuArchiveForCuda12(t *testing.T) {
+	got := CandidateLadder(CandidateOptions{
+		PreferredMajor: "535",
+		RequiredMajor:  "12",
+	})
+	found := false
+	for _, c := range got {
+		if c == "nvidia-cuda-toolkit" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("CUDA 12 required: nvidia-cuda-toolkit should remain in the ladder; got %v", got)
+	}
+}
+
 func TestCandidateLadder_ExplicitNameShortCircuits(t *testing.T) {
 	got := CandidateLadder(CandidateOptions{ExplicitName: "cuda-toolkit-13-0"})
 	if len(got) != 1 || got[0] != "cuda-toolkit-13-0" {

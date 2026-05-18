@@ -541,12 +541,25 @@ func newDoctorCudaCmd() *cobra.Command {
 				return err
 			}
 			mode := cuda.ModeNone
+			method := cuda.MethodAuto
+			packageName := ""
+			runfileURL := ""
+			runfileSHA := ""
+			runfileMaxAttempts := 0
 			if deps.Profile != nil {
 				if m, perr := cuda.ParseMode(deps.Profile.CUDA.Mode); perr == nil {
 					mode = m
 				}
+				if mt, perr := cuda.ParseMethod(deps.Profile.CUDA.Method); perr == nil {
+					method = mt
+				}
+				packageName = deps.Profile.CUDA.PackageName
+				runfileURL = deps.Profile.CUDA.RunfileURL
+				runfileSHA = deps.Profile.CUDA.RunfileSHA256
+				runfileMaxAttempts = deps.Profile.CUDA.RunfileMaxAttempts
 			}
 			plan := cuda.Plan(mode)
+			expectedMajor := cuda.ExpectedMajor(packageName, runfileURL)
 
 			// Probe the host for nvcc.
 			_, nvccErr := lookExecutable("nvcc")
@@ -559,22 +572,49 @@ func newDoctorCudaCmd() *cobra.Command {
 				fmt.Printf("  Profile                 : (no profile loaded)\n")
 			}
 			fmt.Printf("  cuda.mode               : %s\n", plan.Mode)
-			fmt.Printf("  Will attempt install    : %v\n", plan.WillAttemptInstall)
+			fmt.Printf("  cuda.method             : %s\n", method)
+			fmt.Printf("  Will attempt install    : %v\n", plan.WillAttemptInstall && method != cuda.MethodNone)
 			fmt.Printf("  Fails deploy on error   : %v\n", plan.FailsDeployOnError)
-			fmt.Printf("  Sunshine CUDA module    : %v\n", plan.WillAttemptInstall)
+			fmt.Printf("  Expected major (pin)    : %s\n", evOrUnknown(expectedMajor))
+			fmt.Printf("  cuda.package_name       : %s\n", evOrUnknown(packageName))
+			fmt.Printf("  cuda.runfile_url        : %s\n", evOrUnknown(runfileURL))
+			fmt.Printf("  cuda.runfile_sha256     : %s\n", evOrUnknown(runfileSHA))
+			fmt.Printf("  cuda.runfile_max_attempts: %d (effective: %d)\n",
+				runfileMaxAttempts,
+				cuda.ResolveRunfileMaxAttempts(runfileMaxAttempts, os.Getenv("CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS")))
 			fmt.Printf("  nvcc on PATH            : %v\n", nvccPresent)
+			fmt.Println()
+			fmt.Println("Apt candidate ladder (for the chosen driver_major + required-major):")
+			ladder := cuda.CandidateLadder(cuda.CandidateOptions{
+				PreferredMajor: profileDriverMajor(deps),
+				ExplicitName:   packageName,
+				RequiredMajor:  expectedMajor,
+			})
+			for _, c := range ladder {
+				fmt.Printf("  - %s\n", c)
+			}
 			fmt.Println()
 			fmt.Println("Rationale:")
 			fmt.Printf("  %s\n", plan.Rationale)
 			fmt.Println()
-			fmt.Println("Runfile retry policy (when runfile install lands in Milestone 4):")
+			fmt.Println("Runfile retry policy:")
 			fmt.Println("  - same (sha256, size) that already failed --check => refuse to redownload.")
 			fmt.Println("  - 3 consecutive --check failures => give up.")
 			fmt.Println("  - mode=optional => mark phase failed_nonfatal and continue.")
 			fmt.Println("  - mode=required => mark phase failed_fatal.")
+			fmt.Println("  - apt is always toolkit-only; runfile uses --toolkit (never --driver).")
 			return nil
 		},
 	}
+}
+
+// profileDriverMajor reads the NVIDIA driver major from the profile,
+// or "" if no profile is loaded.
+func profileDriverMajor(deps *phase.Deps) string {
+	if deps == nil || deps.Profile == nil {
+		return ""
+	}
+	return deps.Profile.NVIDIA.DriverMajor
 }
 
 func newDoctorSystemCmd() *cobra.Command {

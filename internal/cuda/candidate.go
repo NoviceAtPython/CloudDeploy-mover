@@ -43,9 +43,17 @@ type AvailabilityProbe func(pkg string) bool
 // ExplicitName, when non-empty, short-circuits the search: if it's
 // installable, return it; otherwise return "". This lets a profile
 // say cuda.package_name=cuda-toolkit-13-0 and skip the heuristic.
+//
+// RequiredMajor, when non-empty, removes candidates that are known to
+// install a different CUDA major. The canonical case is Ubuntu's
+// `nvidia-cuda-toolkit` (currently CUDA 12.x) being a poor match for
+// a profile that needs CUDA 13. With RequiredMajor="13", that
+// candidate is filtered out of the ladder; phase callers then fall
+// through to the runfile path instead of installing the wrong major.
 type CandidateOptions struct {
 	PreferredMajor string
 	ExplicitName   string
+	RequiredMajor  string
 }
 
 // DiscoverCandidate returns the first installable CUDA apt package
@@ -87,24 +95,48 @@ func DiscoverCandidate(opts CandidateOptions, probe AvailabilityProbe) string {
 
 // CandidateLadder returns the ordered list of names DiscoverCandidate
 // would probe. Exported for doctor cuda output + tests.
+//
+// When opts.RequiredMajor is non-empty, candidates that are known to
+// install a different major are filtered out. Today that's only
+// `nvidia-cuda-toolkit` (Ubuntu archive), which currently ships
+// CUDA 12.x — incompatible with a required CUDA 13 deploy.
 func CandidateLadder(opts CandidateOptions) []string {
 	if opts.ExplicitName != "" {
 		return []string{opts.ExplicitName}
 	}
 	cudaMajor := cudaMajorForDriver(opts.PreferredMajor)
 	var out []string
-	// cuda-toolkit-${cudaMajor}-${minor}, newest minor first.
+	// cuda-toolkit-${cudaMajor}-${minor}, newest minor first. NVIDIA
+	// CUDA apt repo path: prefer the explicit major-minor pin.
 	if cudaMajor != "" {
 		for _, minor := range []string{"5", "4", "3", "2", "1", "0"} {
 			out = append(out, fmt.Sprintf("cuda-toolkit-%s-%s", cudaMajor, minor))
 		}
 	}
-	// Always try the metapackage second-to-last; it tracks the
-	// latest CUDA toolkit on the configured NVIDIA repo.
+	// Metapackage on the NVIDIA CUDA apt repo. Tracks the latest
+	// toolkit; safe to prefer over the Ubuntu archive's lagging
+	// nvidia-cuda-toolkit.
 	out = append(out, "cuda-toolkit")
-	// Ubuntu-archive fallback, last.
-	out = append(out, "nvidia-cuda-toolkit")
+	// Ubuntu-archive fallback, last. Filter when it would install a
+	// known-wrong major.
+	if !ubuntuArchiveLagsForMajor(opts.RequiredMajor) {
+		out = append(out, "nvidia-cuda-toolkit")
+	}
 	return out
+}
+
+// ubuntuArchiveLagsForMajor encodes what we currently know about
+// Ubuntu's `nvidia-cuda-toolkit`: it tracks CUDA 12 across the live
+// supported releases (24.04, 25.10). Any RequiredMajor >= "13" should
+// skip it. Returning false (no filtering) when RequiredMajor is empty
+// preserves the legacy behavior for unpinned configs.
+func ubuntuArchiveLagsForMajor(requiredMajor string) bool {
+	switch requiredMajor {
+	case "", "11", "12":
+		return false
+	}
+	// "13" and any future major beyond Ubuntu's lag point.
+	return true
 }
 
 // cudaMajorForDriver maps an NVIDIA driver major to the most likely

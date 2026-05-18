@@ -89,8 +89,41 @@ type NVIDIAConfig struct {
 
 // CUDAConfig governs CUDA installation policy.
 type CUDAConfig struct {
-	Mode        string `yaml:"mode"`         // "none" | "optional" | "required"
-	PackageName string `yaml:"package_name"` // explicit apt package; empty = auto-discover
+	// Mode: "none" | "optional" | "required".
+	Mode string `yaml:"mode"`
+
+	// PackageName: explicit apt package; empty = auto-discover via
+	// internal/cuda.DiscoverCandidate.
+	PackageName string `yaml:"package_name"`
+
+	// Method controls *how* the toolkit is installed:
+	//   "auto"     - default. Prefer apt (NVIDIA CUDA apt repo) when
+	//                an official repo is available for the host's
+	//                Ubuntu version; fall back to runfile otherwise.
+	//   "apt"      - force apt. Fails (mode-aware) if no official
+	//                repo is detected for this Ubuntu version.
+	//   "runfile"  - force the toolkit-only NVIDIA runfile. Never
+	//                installs `cuda-drivers` / driver meta-packages.
+	//   "none"     - disable install entirely (equivalent to mode=none
+	//                for the install side, but state still reflects
+	//                the configured mode for diagnostics).
+	Method string `yaml:"method"`
+
+	// RunfileURL pins the toolkit-only NVIDIA runfile. Used by the
+	// runfile install method. Example:
+	//   https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run
+	RunfileURL string `yaml:"runfile_url"`
+
+	// RunfileSHA256 is the SHA-256 the install path will log and
+	// match against any prior `--check`-failing attempt. Optional but
+	// strongly recommended; with it set, repeated downloads of an
+	// upstream-corrupted artifact are caught after one attempt.
+	RunfileSHA256 string `yaml:"runfile_sha256"`
+
+	// RunfileMaxAttempts caps download+check retry attempts for the
+	// runfile path. Zero falls back to the
+	// `CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS` env var, then 3.
+	RunfileMaxAttempts int `yaml:"runfile_max_attempts"`
 }
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
@@ -174,6 +207,12 @@ func ValidateProfile(p *Profile) error {
 	default:
 		return fmt.Errorf("config: profile %q: cuda.mode must be one of none/optional/required, got %q", p.Profile, p.CUDA.Mode)
 	}
+	switch strings.ToLower(strings.TrimSpace(p.CUDA.Method)) {
+	case "", "auto", "apt", "runfile", "none":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: cuda.method must be one of auto/apt/runfile/none, got %q", p.Profile, p.CUDA.Method)
+	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":
 		// ok
@@ -198,9 +237,11 @@ func ValidateProfile(p *Profile) error {
 		if !p.Sunshine.SynthesizeHDR10Metadata {
 			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.synthesize_hdr10_metadata=true", p.Profile)
 		}
-		if strings.ToLower(p.CUDA.Mode) != "none" {
-			return fmt.Errorf("config: profile %q: HDR profile expects cuda.mode=none (KMS+NVENC path does not need CUDA), got %q", p.Profile, p.CUDA.Mode)
-		}
+		// KMS+NVENC HDR streaming does not require CUDA for the streaming
+		// path; the toolkit is optional. We allow cuda.mode = none /
+		// optional / required so an HDR profile can also test the CUDA
+		// install end-to-end (e.g. hdr-4k120-cuda). No further HDR-CUDA
+		// constraint here.
 	}
 	return nil
 }
