@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -190,6 +191,42 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 	return deps, lock, nil
 }
 
+func recoverInterruptedPhasesOnStartup(deps *phase.Deps, profileName string) error {
+	if deps == nil || deps.State == nil {
+		return nil
+	}
+	recovered := deps.State.RecoverInterruptedRunningPhases(profileName)
+	if len(recovered) == 0 {
+		return nil
+	}
+	sort.Slice(recovered, func(i, j int) bool {
+		return recovered[i].Name < recovered[j].Name
+	})
+
+	fmt.Println()
+	fmt.Println("Detected interrupted CloudDeploy phase(s) from a previous run:")
+	for _, r := range recovered {
+		if r.PreviousStartedAt != nil {
+			fmt.Printf("  - %s (was running since %s)\n", r.Name, r.PreviousStartedAt.Format(time.RFC3339))
+		} else {
+			fmt.Printf("  - %s (was running)\n", r.Name)
+		}
+	}
+	fmt.Println("No active previous clouddeployctl process lock blocked this run, so these phase(s) were marked pending and will be retried.")
+	fmt.Println("Manual recovery guidance, if you prefer to reset explicitly:")
+	for _, r := range recovered {
+		for _, g := range r.Guidance {
+			fmt.Printf("  sudo %s\n", g)
+		}
+	}
+	fmt.Println()
+
+	if err := deps.PersistState(); err != nil {
+		return fmt.Errorf("persist interrupted phase recovery: %w", err)
+	}
+	return nil
+}
+
 // -----------------------------------------------------------------------------
 // apply
 // -----------------------------------------------------------------------------
@@ -251,6 +288,10 @@ in the active profile. When false, the operator must manually run
 			}
 			defer lock.Release()
 
+			if err := recoverInterruptedPhasesOnStartup(deps, profileName(cmd)); err != nil {
+				return err
+			}
+
 			allowUnsup, _ := cmd.Flags().GetBool("allow-unsupported")
 
 			var targetVersion string
@@ -301,6 +342,10 @@ in the active profile. When false, the operator must manually run
 			}
 
 			err = runPhasesAndBanner(ctx, deps, false)
+			releaseErr := lock.Release()
+			if err == nil && releaseErr != nil {
+				return releaseErr
+			}
 
 			if errors.Is(err, phase.ErrRebootRequired) {
 				os.Exit(2)
@@ -373,6 +418,11 @@ func newResumeCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			defer lock.Release()
+
+			if err := recoverInterruptedPhasesOnStartup(deps, profileName(cmd)); err != nil {
+				return err
+			}
 
 			if deps.State.RebootNeeded {
 				deps.State.ClearRebootNeeded()
@@ -381,7 +431,10 @@ func newResumeCmd() *cobra.Command {
 			}
 
 			err = runPhasesAndBanner(ctx, deps, true)
-			lock.Release()
+			releaseErr := lock.Release()
+			if err == nil && releaseErr != nil {
+				return releaseErr
+			}
 
 			if errors.Is(err, phase.ErrRebootRequired) {
 				os.Exit(2)

@@ -19,6 +19,7 @@ func TestRenderUnit_ContainsKeys(t *testing.T) {
 		"ConditionPathExists=/var/lib/clouddeploy/state.json",
 		"[Service]",
 		"Type=oneshot",
+		"TimeoutStartSec=infinity",
 		"EnvironmentFile=-/etc/clouddeploy/continue.env",
 		"ExecStart=/usr/local/bin/clouddeployctl resume --profile hdr-4k120 --state-path /var/lib/clouddeploy/state.json",
 		"WantedBy=multi-user.target",

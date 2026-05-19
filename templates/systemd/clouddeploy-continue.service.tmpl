@@ -10,6 +10,7 @@ ConditionPathExists=/var/lib/clouddeploy/state.json
 [Service]
 Type=oneshot
 RemainAfterExit=no
+TimeoutStartSec=infinity
 EnvironmentFile=-/etc/clouddeploy-wayland.env
 ExecStart=/usr/local/bin/clouddeployctl resume
 StandardOutput=journal

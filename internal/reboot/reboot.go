@@ -78,6 +78,7 @@ ConditionPathExists={{ .StatePath }}
 [Service]
 Type=oneshot
 RemainAfterExit=no
+TimeoutStartSec=infinity
 EnvironmentFile=-{{ .EnvFile }}
 ExecStartPre=/bin/mkdir -p /var/log/clouddeploy
 ExecStart={{ .Binary }} resume --profile {{ .Profile }} --state-path {{ .StatePath }}

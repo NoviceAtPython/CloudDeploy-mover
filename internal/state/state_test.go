@@ -155,6 +155,35 @@ func TestReset_ClearsPhase(t *testing.T) {
 	}
 }
 
+func TestRecoverInterruptedRunningPhases(t *testing.T) {
+	st := New("hdr-4k120")
+	st.MarkRunning("cuda")
+	st.MarkDone("base_packages", nil)
+
+	recovered := st.RecoverInterruptedRunningPhases("hdr-4k120")
+	if len(recovered) != 1 {
+		t.Fatalf("recovered len: got %d want 1 (%#v)", len(recovered), recovered)
+	}
+	if recovered[0].Name != "cuda" {
+		t.Fatalf("recovered phase: got %q want cuda", recovered[0].Name)
+	}
+	if st.Get("cuda").Status != StatusPending {
+		t.Fatalf("cuda status: got %q want pending", st.Get("cuda").Status)
+	}
+	if st.Get("cuda").StartedAt != nil {
+		t.Fatalf("cuda StartedAt should be cleared after recovery")
+	}
+	if st.Get("base_packages").Status != StatusDone {
+		t.Fatalf("done phase should not change; got %q", st.Get("base_packages").Status)
+	}
+	if st.Get("cuda").LastError == "" {
+		t.Fatalf("expected LastError to explain stale running recovery")
+	}
+	if st.Get("cuda").Details["recovery_guidance"] == nil {
+		t.Fatalf("expected recovery guidance details: %#v", st.Get("cuda").Details)
+	}
+}
+
 // TestRebootNeededRoundTrip verifies SetRebootNeeded persists across
 // save/load and ClearRebootNeeded zeroes it.
 func TestRebootNeededRoundTrip(t *testing.T) {

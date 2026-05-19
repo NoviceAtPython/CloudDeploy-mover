@@ -211,7 +211,9 @@ Phase status values:
 
 Phases write **only** when their work completes. A crash mid-phase
 leaves the phase at `running` from the previous invocation; the next
-run treats `running` as "abandoned, retry from scratch."
+mutating run first acquires the process lock, then rewrites stale
+`running` phases to `pending` with interrupted-run recovery guidance
+and retries them from scratch.
 
 The state file is the contract:
 

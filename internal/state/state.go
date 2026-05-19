@@ -83,6 +83,16 @@ type State struct {
 	ResumeTarget string            `json:"resume_target,omitempty"`
 }
 
+// InterruptedPhaseRecovery describes a phase that was still marked
+// running when a new mutating clouddeployctl invocation acquired the
+// process lock. At that point there is no live previous holder, so the
+// old running marker is stale and the phase can be retried.
+type InterruptedPhaseRecovery struct {
+	Name              string
+	PreviousStartedAt *time.Time
+	Guidance          []string
+}
+
 // New returns an empty state for a fresh deploy.
 func New(profile string) *State {
 	now := time.Now().UTC()
@@ -208,6 +218,58 @@ func (s *State) MarkRunning(name string) *Phase {
 	}
 	s.Phases[name] = p
 	return p
+}
+
+// RecoverInterruptedRunningPhases rewrites stale "running" phase
+// markers to "pending" once a fresh mutating invocation has acquired
+// the process lock. This makes interrupted phases visibly retriable in
+// state.json instead of leaving a misleading permanent "running"
+// status after systemd killed a continuation service.
+func (s *State) RecoverInterruptedRunningPhases(profileName string) []InterruptedPhaseRecovery {
+	if s == nil || len(s.Phases) == 0 {
+		return nil
+	}
+	if profileName == "" {
+		profileName = s.Profile
+	}
+	if profileName == "" {
+		profileName = "<profile>"
+	}
+
+	now := time.Now().UTC()
+	var recovered []InterruptedPhaseRecovery
+	for name, p := range s.Phases {
+		if p == nil || p.Status != StatusRunning {
+			continue
+		}
+
+		guidance := []string{
+			fmt.Sprintf("clouddeployctl state reset --phase %s", name),
+			fmt.Sprintf("clouddeployctl resume --profile %s", profileName),
+		}
+		details := map[string]any{
+			"interrupted_detected_at": now.Format(time.RFC3339),
+			"interrupted_recovery":    "phase was running in state, but this invocation acquired the CloudDeploy process lock; retry is allowed",
+			"recovery_guidance":       guidance,
+		}
+		if p.StartedAt != nil {
+			details["previous_started_at"] = p.StartedAt.Format(time.RFC3339)
+		}
+
+		recovered = append(recovered, InterruptedPhaseRecovery{
+			Name:              name,
+			PreviousStartedAt: p.StartedAt,
+			Guidance:          guidance,
+		})
+
+		p.Status = StatusPending
+		p.StartedAt = nil
+		p.CompletedAt = nil
+		p.Reason = "previous invocation ended while this phase was running; retrying"
+		p.LastError = "No active CloudDeploy process lock was found for the previous run."
+		p.Details = details
+	}
+	return recovered
 }
 
 // MarkDone marks a phase complete with the supplied details map. A nil
