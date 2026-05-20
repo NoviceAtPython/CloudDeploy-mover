@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -46,10 +47,11 @@ type KWinPatch struct {
 	LegacySourcesListPath string
 	DebSrcBackupDir       string
 
-	EnsureDebSrcFn  func(context.Context, *Deps) (DebSrcResult, error)
-	SourceVersionFn func(context.Context, *Deps, config.KWinConfig) (string, error)
-	ValidateFn      func(context.Context, *Deps, config.KWinConfig, string) error
-	BuildInstallFn  func(context.Context, *Deps, config.KWinConfig, string, string) ([]string, error)
+	EnsureDebSrcFn   func(context.Context, *Deps) (DebSrcResult, error)
+	VerifyPackagesFn func(context.Context, *Deps, []string, bool) error
+	SourceVersionFn  func(context.Context, *Deps, config.KWinConfig) (string, error)
+	ValidateFn       func(context.Context, *Deps, config.KWinConfig, string) error
+	BuildInstallFn   func(context.Context, *Deps, config.KWinConfig, string, string) ([]string, error)
 }
 
 func (KWinPatch) Name() string { return KWinPatchName }
@@ -117,14 +119,13 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 	markerPath := p.markerPath()
 	details["marker_path"] = markerPath
 	if marker, err := kwinpkg.ReadMarker(markerPath); err == nil && marker.Matches(patchSHA, sourceVersion, cfg.InstallMode, cfg.RuntimeBin) {
-		details["marker_matched"] = true
-		details["installed_packages"] = marker.InstalledPackages
-		deps.State.MarkDone(KWinPatchName, details)
-		_ = deps.PersistState()
-		return nil
-	}
-
-	if strings.EqualFold(cfg.SourceMode, "packaged") {
+		if deps.DryRun || p.verifyPackages(ctx, deps, marker.InstalledPackages, cfg.HoldPackages) == nil {
+			details["marker_matched"] = true
+			details["installed_packages"] = marker.InstalledPackages
+			deps.State.MarkDone(KWinPatchName, details)
+			_ = deps.PersistState()
+			return nil
+		}
 		return p.patchFailure(deps, details, fmt.Errorf("kwin.source_mode=packaged cannot apply %s", patchPath), "packaged KWin fallback requested", cfg)
 	}
 	if cfg.InstallMode != "packages" {
@@ -300,7 +301,8 @@ func (p KWinPatch) buildInstall(ctx context.Context, deps *Deps, cfg config.KWin
 	if res.Err != nil {
 		return nil, fmt.Errorf("patch apply failed: %w stderr=%q", res.Err, tailLines(res.Stderr, 10))
 	}
-	if err := run(ctx, deps, src, []string{"dpkg-buildpackage", "-b", "-uc", "-us"}, 2*time.Hour, false); err != nil {
+	env := []string{fmt.Sprintf("DEB_BUILD_OPTIONS=nocheck parallel=%d", runtime.NumCPU()), "DEB_BUILD_PROFILES=nocheck"}
+	if err := run(ctx, deps, src, []string{"dpkg-buildpackage", "-b", "-uc", "-us"}, 2*time.Hour, false, env...); err != nil {
 		return nil, err
 	}
 	debs, err := filepath.Glob(filepath.Join(work, "*.deb"))
@@ -320,17 +322,14 @@ func (p KWinPatch) buildInstall(ctx context.Context, deps *Deps, cfg config.KWin
 	return pkgs, nil
 }
 
-func run(ctx context.Context, deps *Deps, cwd string, argv []string, timeout time.Duration, sudo bool) error {
+func run(ctx context.Context, deps *Deps, cwd string, argv []string, timeout time.Duration, sudo bool, extraEnv ...string) error {
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv:    argv,
 		Cwd:     cwd,
 		Sudo:    sudo,
 		Timeout: timeout,
 		DryRun:  deps.DryRun,
-		Env: []string{
-			"DEBIAN_FRONTEND=noninteractive",
-			"APT_LISTCHANGES_FRONTEND=none",
-		},
+		Env:     append([]string{"DEBIAN_FRONTEND=noninteractive", "APT_LISTCHANGES_FRONTEND=none"}, extraEnv...),
 	})
 	if res.Err != nil {
 		return fmt.Errorf("%s failed: %w stderr=%q", strings.Join(argv, " "), res.Err, tailLines(res.Stderr, 10))
@@ -417,7 +416,7 @@ func readOptionalTextFile(path string) (string, bool, error) {
 }
 
 func rewriteDeb822DebSrc(text string) (string, bool, bool) {
-	lines := splitPreserveTrailingNewline(text)
+	lines := splitLinesNoTrailingEmpty(text)
 	modified := false
 	enabledBefore := false
 	for i, line := range lines {
@@ -453,7 +452,7 @@ func rewriteDeb822DebSrc(text string) (string, bool, bool) {
 }
 
 func rewriteLegacySourcesDebSrc(text string) (string, bool, bool) {
-	lines := splitPreserveTrailingNewline(text)
+	lines := splitLinesNoTrailingEmpty(text)
 	existing := map[string]bool{}
 	var toAdd []string
 	enabledBefore := false
@@ -503,7 +502,7 @@ func looksLikeUbuntuArchiveLine(line string) bool {
 	return strings.Contains(lower, "ubuntu")
 }
 
-func splitPreserveTrailingNewline(text string) []string {
+func splitLinesNoTrailingEmpty(text string) []string {
 	lines := strings.Split(text, "\n")
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
@@ -563,6 +562,44 @@ func resolveKWinPatchPath(path string) string {
 		return candidates[0]
 	}
 	return path
+}
+
+func (p KWinPatch) verifyPackages(ctx context.Context, deps *Deps, pkgs []string, checkHold bool) error {
+	if p.VerifyPackagesFn != nil {
+		return p.VerifyPackagesFn(ctx, deps, pkgs, checkHold)
+	}
+	if len(pkgs) == 0 {
+		return nil
+	}
+	args := append([]string{"dpkg-query", "-W", "--showformat=${db:Status-Status}\n"}, pkgs...)
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: args, Timeout: 10 * time.Second})
+	if res.Err != nil {
+		return res.Err
+	}
+	for _, status := range strings.Split(strings.TrimSpace(res.Stdout), "\n") {
+		if status != "installed" {
+			return errors.New("package missing or not fully installed")
+		}
+	}
+	if checkHold {
+		res := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: []string{"apt-mark", "showhold"}, Timeout: 10 * time.Second})
+		if res.Err != nil {
+			return res.Err
+		}
+		held := make(map[string]bool)
+		for _, line := range strings.Split(res.Stdout, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" {
+				held[line] = true
+			}
+		}
+		for _, pkg := range pkgs {
+			if !held[pkg] {
+				return fmt.Errorf("package %s not on hold", pkg)
+			}
+		}
+	}
+	return nil
 }
 
 func firstDir(root, pattern string) (string, error) {

@@ -1060,6 +1060,11 @@ func newDoctorKwinPatchCmd() *cobra.Command {
 					if fallback, ok := ph.Details["fallback_reason"].(string); ok && fallback != "" {
 						fmt.Printf("  state fallback reason  : %s\n", fallback)
 					}
+					for _, k := range []string{"deb_src_enabled_before", "deb_src_modified", "deb_src_backup_path", "apt_update_after_deb_src"} {
+						if v, ok := ph.Details[k]; ok {
+							fmt.Printf("  %-23s: %v\n", k, v)
+						}
+					}
 				}
 			}
 			fmt.Println()

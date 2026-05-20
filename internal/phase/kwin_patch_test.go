@@ -38,6 +38,17 @@ func writeTestPatch(t *testing.T) string {
 	return path
 }
 
+func fakeDebSrcOK() func(context.Context, *Deps) (DebSrcResult, error) {
+	return func(context.Context, *Deps) (DebSrcResult, error) {
+		return DebSrcResult{
+			EnabledBefore:        true,
+			Modified:             false,
+			BackupPath:           "",
+			AptUpdateAfterDebSrc: false,
+		}, nil
+	}
+}
+
 func TestKWinPatch_SkipsWhenPatchedHDRFalse(t *testing.T) {
 	p := desktopProfile()
 	p.KWin = config.KWinConfig{PatchedHDR: false}
@@ -240,6 +251,8 @@ func TestKWinPatch_ValidationFailureFatalWhenRequired(t *testing.T) {
 	errValidation := errors.New("patch no longer applies")
 
 	err := (KWinPatch{
+		EnsureDebSrcFn:   fakeDebSrcOK(),
+		VerifyPackagesFn: func(context.Context, *Deps, []string, bool) error { return nil },
 		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
 			return "6.4.5-0ubuntu3", nil
 		},
@@ -269,6 +282,8 @@ func TestKWinPatch_ValidationFailureAllowsPackagedFallback(t *testing.T) {
 	deps.DryRun = false
 
 	err := (KWinPatch{
+		EnsureDebSrcFn:   fakeDebSrcOK(),
+		VerifyPackagesFn: func(context.Context, *Deps, []string, bool) error { return nil },
 		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
 			return "6.4.5-0ubuntu3", nil
 		},
@@ -311,7 +326,9 @@ func TestKWinPatch_MatchingMarkerSkipsRebuild(t *testing.T) {
 	buildCalled := false
 
 	err = (KWinPatch{
-		MarkerPath: markerPath,
+		EnsureDebSrcFn:   fakeDebSrcOK(),
+		VerifyPackagesFn: func(context.Context, *Deps, []string, bool) error { return nil },
+		MarkerPath:       markerPath,
 		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
 			return "6.4.5-0ubuntu3", nil
 		},
@@ -352,7 +369,9 @@ func TestKWinPatch_MarkerMismatchRebuilds(t *testing.T) {
 	buildCalled := false
 
 	err := (KWinPatch{
-		MarkerPath: markerPath,
+		EnsureDebSrcFn:   fakeDebSrcOK(),
+		VerifyPackagesFn: func(context.Context, *Deps, []string, bool) error { return nil },
+		MarkerPath:       markerPath,
 		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
 			return "6.4.5-0ubuntu3", nil
 		},
