@@ -455,3 +455,94 @@ func TestPackageNamesFromDebs(t *testing.T) {
 		t.Fatalf("packageNamesFromDebs: got %v want %v", got, want)
 	}
 }
+
+func TestKWinPatch_SourceModePackaged_RequirePatchTrue(t *testing.T) {
+	patchPath := writeTestPatch(t)
+	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
+	require := true
+	deps.Profile.KWin.RequirePatch = &require
+	deps.Profile.KWin.SourceMode = "packaged"
+	deps.DryRun = false
+
+	err := (KWinPatch{}).Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal error")
+	}
+	got := deps.State.Get(KWinPatchName)
+	if got.Status != state.StatusFailedFatal {
+		t.Fatalf("status: got %q want failed_fatal", got.Status)
+	}
+	if !strings.Contains(got.Reason, "packaged KWin requested") {
+		t.Fatalf("reason: %s", got.Reason)
+	}
+}
+
+func TestKWinPatch_SourceModePackaged_AllowPackagedFallback(t *testing.T) {
+	patchPath := writeTestPatch(t)
+	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
+	require := false
+	deps.Profile.KWin.RequirePatch = &require
+	deps.Profile.KWin.AllowPackagedFallback = true
+	deps.Profile.KWin.SourceMode = "packaged"
+	deps.DryRun = false
+
+	err := (KWinPatch{}).Run(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("run failed: %v", err)
+	}
+	got := deps.State.Get(KWinPatchName)
+	if got.Status != state.StatusSkipped {
+		t.Fatalf("status: got %q want skipped", got.Status)
+	}
+}
+
+func TestKWinPatch_MatchingMarkerVerifyPackagesFailedRebuilds(t *testing.T) {
+	patchPath := writeTestPatch(t)
+	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
+	deps.DryRun = false
+	sum, err := kwinpkg.HashFile(patchPath)
+	if err != nil {
+		t.Fatalf("hash: %v", err)
+	}
+	markerPath := filepath.Join(t.TempDir(), "kwin-patch.json")
+	if err := kwinpkg.WriteMarker(markerPath, kwinpkg.Marker{
+		PatchPath:         patchPath,
+		PatchSHA256:       sum,
+		KWinSourceVersion: "6.4.5-0ubuntu3",
+		BuildDir:          "/opt/clouddeploy-kwin-src",
+		InstalledPackages: []string{"kwin-wayland"},
+		InstallMode:       "packages",
+		Timestamp:         time.Unix(1, 0).UTC(),
+	}); err != nil {
+		t.Fatalf("write marker: %v", err)
+	}
+	buildCalled := false
+
+	err = (KWinPatch{
+		EnsureDebSrcFn: fakeDebSrcOK(),
+		MarkerPath:     markerPath,
+		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
+			return "6.4.5-0ubuntu3", nil
+		},
+		VerifyPackagesFn: func(context.Context, *Deps, []string, bool) error {
+			return errors.New("missing packages")
+		},
+		ValidateFn: func(context.Context, *Deps, config.KWinConfig, string) error {
+			return nil
+		},
+		BuildInstallFn: func(context.Context, *Deps, config.KWinConfig, string, string) ([]string, error) {
+			buildCalled = true
+			return []string{"kwin-wayland", "kwin-common"}, nil
+		},
+	}).Run(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if !buildCalled {
+		t.Fatalf("build/install should run when verifyPackages fails")
+	}
+	got := deps.State.Get(KWinPatchName)
+	if got.Details["marker_verify_failed"] == nil {
+		t.Fatalf("marker_verify_failed not recorded")
+	}
+}

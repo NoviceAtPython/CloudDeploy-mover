@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	kwinpkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/kwin"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	statepkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
@@ -322,6 +323,8 @@ exit 0
 //     been found", "Failed to activate /org/freedesktop/login1
 //     session", "failed to open drm device", "status=1/FAILURE").
 type KWinSession struct {
+	SysfsRoot  string
+	DevDriRoot string
 	// UnitPath overrides the default install path for tests.
 	UnitPath string
 
@@ -910,4 +913,50 @@ func scanFatalSignatures(journalText string) []string {
 		}
 	}
 	return hits
+}
+
+func (p KWinSession) resolveDRMDevice(requested, forcedConnector string) (string, string) {
+	if requested != "" && requested != config.DefaultKwinDRMDevice {
+		return requested, "explicitly requested"
+	}
+
+	sysfs := p.SysfsRoot
+	if sysfs == "" {
+		sysfs = "/sys"
+	}
+	devdri := p.DevDriRoot
+	if devdri == "" {
+		devdri = "/dev/dri"
+	}
+
+	cards, _ := filepath.Glob(filepath.Join(sysfs, "class/drm/card*"))
+
+	if forcedConnector != "" {
+		for _, cardPath := range cards {
+			name := filepath.Base(cardPath)
+			if strings.Contains(name, "-") {
+				continue
+			}
+			connPath := filepath.Join(cardPath, fmt.Sprintf("%s-%s", name, forcedConnector))
+			if _, err := os.Stat(connPath); err == nil {
+				return filepath.Join(devdri, name), "matched forced_connector " + forcedConnector
+			}
+		}
+	}
+
+	for _, cardPath := range cards {
+		name := filepath.Base(cardPath)
+		if strings.Contains(name, "-") {
+			continue
+		}
+		vendorByte, err := os.ReadFile(filepath.Join(cardPath, "device", "vendor"))
+		if err == nil && strings.Contains(strings.ToLower(string(vendorByte)), "0x10de") {
+			return filepath.Join(devdri, name), "nvidia gpu detected"
+		}
+	}
+
+	if _, err := os.Stat(filepath.Join(devdri, "card1")); err == nil {
+		return filepath.Join(devdri, "card1"), "fallback card1 present"
+	}
+	return filepath.Join(devdri, "card0"), "fallback final"
 }

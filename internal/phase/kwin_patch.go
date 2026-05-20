@@ -100,6 +100,10 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 		_ = deps.PersistState()
 		return nil
 	}
+	if strings.EqualFold(cfg.SourceMode, "packaged") {
+		err := fmt.Errorf("kwin.source_mode=packaged cannot satisfy kwin.patched_hdr=true with require_patch=%v", cfg.RequirePatchEnabled())
+		return p.patchFailure(deps, details, err, "packaged KWin requested", cfg)
+	}
 
 	debSrc, err := p.ensureDebSrcEnabled(ctx, deps)
 	if err != nil {
@@ -119,14 +123,23 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 	markerPath := p.markerPath()
 	details["marker_path"] = markerPath
 	if marker, err := kwinpkg.ReadMarker(markerPath); err == nil && marker.Matches(patchSHA, sourceVersion, cfg.InstallMode, cfg.RuntimeBin) {
-		if deps.DryRun || p.verifyPackages(ctx, deps, marker.InstalledPackages, cfg.HoldPackages) == nil {
+		if deps.DryRun {
 			details["marker_matched"] = true
 			details["installed_packages"] = marker.InstalledPackages
 			deps.State.MarkDone(KWinPatchName, details)
 			_ = deps.PersistState()
 			return nil
 		}
-		return p.patchFailure(deps, details, fmt.Errorf("kwin.source_mode=packaged cannot apply %s", patchPath), "packaged KWin fallback requested", cfg)
+		verifyErr := p.verifyPackages(ctx, deps, marker.InstalledPackages, cfg.HoldPackages)
+		if verifyErr == nil {
+			details["marker_matched"] = true
+			details["installed_packages"] = marker.InstalledPackages
+			deps.State.MarkDone(KWinPatchName, details)
+			_ = deps.PersistState()
+			return nil
+		}
+		details["marker_matched"] = true
+		details["marker_verify_failed"] = verifyErr.Error()
 	}
 	if cfg.InstallMode != "packages" {
 		return p.patchFailure(deps, details, fmt.Errorf("kwin.install_mode=%s is not implemented yet; supported now: packages", cfg.InstallMode), "unsupported kwin install mode", cfg)
