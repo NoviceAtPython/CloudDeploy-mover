@@ -4,8 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"time"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
 // DesktopPackagesName is the canonical state-key.
@@ -47,6 +51,11 @@ var DefaultDesktopPackages = []string{
 	// Wayland + Qt6 client libraries.
 	"wayland-utils",
 	"qt6-wayland",
+	// Qt 6.5+ kscreen-doctor pulls libxcb-cursor0 at runtime even
+	// under QT_QPA_PLATFORM=wayland. Without it the binary aborts
+	// before producing any output (the live VM hit this on 25.10).
+	// Cheap to install; harmless under Wayland.
+	"libxcb-cursor0",
 	// Vulkan + Mesa diagnostics. Cheap to install, invaluable when
 	// debugging "why doesn't this compositor see the GPU".
 	"vulkan-tools",
@@ -83,6 +92,7 @@ func (p DesktopPackages) Run(ctx context.Context, deps *Deps) error {
 		log.Info("phase desktop-packages: already done; skipping")
 		return nil
 	}
+	prevStatus := deps.State.Get(DesktopPackagesName).Status
 	deps.State.MarkRunning(DesktopPackagesName)
 	_ = deps.PersistState()
 
@@ -90,9 +100,12 @@ func (p DesktopPackages) Run(ctx context.Context, deps *Deps) error {
 	if p.PackagesOverrideFn != nil {
 		pkgs = p.PackagesOverrideFn()
 	}
+	retryAfterInterruption := prevStatus == state.StatusRunning || startupRecoveredPhase(deps, DesktopPackagesName)
 	details := map[string]any{
-		"packages":   pkgs,
-		"package_ct": len(pkgs),
+		"packages":                 pkgs,
+		"requested_packages":       pkgs,
+		"package_ct":               len(pkgs),
+		"retry_after_interruption": retryAfterInterruption,
 	}
 	log.Info("phase desktop-packages: installing minimum Wayland/KDE/PipeWire stack",
 		"package_ct", len(pkgs))
@@ -106,8 +119,75 @@ func (p DesktopPackages) Run(ctx context.Context, deps *Deps) error {
 		_ = deps.PersistState()
 		return fmt.Errorf("phase desktop-packages: %w", err)
 	}
+	installed, missing := p.verifyInstalled(ctx, deps, pkgs)
+	details["installed_packages"] = installed
+	details["missing_packages"] = missing
+	if len(missing) > 0 {
+		err := fmt.Errorf("desktop package install finished but packages are still missing: %s", strings.Join(missing, ", "))
+		details["err"] = err.Error()
+		deps.State.MarkFailed(DesktopPackagesName, "desktop package verification failed", err, true)
+		deps.State.Get(DesktopPackagesName).Details = details
+		_ = deps.PersistState()
+		return fmt.Errorf("phase desktop-packages: %w", err)
+	}
+	if err := p.markManual(ctx, deps, pkgs); err != nil {
+		log.Warn("phase desktop-packages: apt-mark manual failed (non-fatal)",
+			"err", err)
+		details["apt_mark_manual_warning"] = err.Error()
+	} else {
+		details["apt_mark_manual"] = true
+	}
 	deps.State.MarkDone(DesktopPackagesName, details)
 	_ = deps.PersistState()
 	log.Info("phase desktop-packages: done", "package_ct", len(pkgs))
+	return nil
+}
+
+func startupRecoveredPhase(deps *Deps, phaseName string) bool {
+	if deps == nil || deps.State == nil || deps.State.StartupRecovery == nil {
+		return false
+	}
+	for _, recovered := range deps.State.StartupRecovery.RecoveredPhases {
+		if recovered == phaseName {
+			return true
+		}
+	}
+	return false
+}
+
+func (p DesktopPackages) verifyInstalled(ctx context.Context, deps *Deps, pkgs []string) ([]string, []string) {
+	if deps.DryRun {
+		return append([]string(nil), pkgs...), nil
+	}
+	installed := make([]string, 0, len(pkgs))
+	var missing []string
+	for _, pkg := range pkgs {
+		res := deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv:    []string{"dpkg-query", "-W", "-f=${Status}", pkg},
+			LogFile: "-",
+			Timeout: 15 * time.Second,
+		})
+		if res.Err == nil && strings.TrimSpace(res.Stdout) == "install ok installed" {
+			installed = append(installed, pkg)
+			continue
+		}
+		missing = append(missing, pkg)
+	}
+	return installed, missing
+}
+
+func (p DesktopPackages) markManual(ctx context.Context, deps *Deps, pkgs []string) error {
+	if deps.DryRun || len(pkgs) == 0 {
+		return nil
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    append([]string{"apt-mark", "manual"}, pkgs...),
+		Sudo:    true,
+		LogFile: "-",
+		Timeout: 2 * time.Minute,
+	})
+	if res.Err != nil {
+		return fmt.Errorf("apt-mark manual: %w", res.Err)
+	}
 	return nil
 }

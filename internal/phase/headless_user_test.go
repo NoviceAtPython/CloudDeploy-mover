@@ -14,13 +14,14 @@ import (
 )
 
 func desktopProfile() *config.Profile {
+	t := true
 	return &config.Profile{
 		Profile: "test",
 		NVIDIA:  config.NVIDIAConfig{DriverMajor: "580"},
 		CUDA:    config.CUDAConfig{Mode: "none"},
 		Desktop: config.DesktopConfig{
 			User:         "cloudgamer",
-			EnableLinger: true,
+			EnableLinger: &t,
 			Groups:       []string{"video", "render", "input", "audio", "systemd-journal"},
 			Shell:        "/bin/bash",
 		},
@@ -186,7 +187,8 @@ func TestHeadlessUser_ExistingUserDoesNotCreate_OnlyAddsMissingGroups(t *testing
 
 func TestHeadlessUser_LingerDisabled_DoesNotCallLoginctl(t *testing.T) {
 	deps := headlessUserDeps(t)
-	deps.Profile.Desktop.EnableLinger = false
+	f := false
+	deps.Profile.Desktop.EnableLinger = &f
 
 	lingerCalls := 0
 	ph := HeadlessUser{

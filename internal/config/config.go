@@ -300,11 +300,54 @@ type KWinConfig struct {
 //	               add "kvm" for nested-virt workloads.
 //	shell          login shell. Default /bin/bash. Honored only when
 //	               headless_user actually creates the user.
+// DesktopConfig is the operator-facing knob set. EnableLinger is a
+// pointer so the YAML parser can distinguish "not set" (nil ->
+// default-true) from "explicitly false". Live VM regressions
+// repeatedly hit "linger=false" because the old bool defaulted to
+// false on a missing key.
 type DesktopConfig struct {
 	User         string   `yaml:"user"`
-	EnableLinger bool     `yaml:"enable_linger"`
+	EnableLinger *bool    `yaml:"enable_linger"`
 	Groups       []string `yaml:"groups"`
 	Shell        string   `yaml:"shell"`
+
+	// SessionBackend selects the KWin/Plasma session model. v2's
+	// "realvt" backend is required for the headless NVIDIA Wayland
+	// path to actually open /dev/dri/card*; the simpler "user"
+	// backend (dbus-run-session + kwin_wayland) failed in production
+	// with "Failed to activate login1 session" and "No suitable DRM
+	// devices have been found". Default: "realvt".
+	//
+	//   "realvt"  - chvt to KwinVT, real logind session on /dev/tty<N>,
+	//               PAMName=login, TTY*, UtmpIdentifier/Mode. Required
+	//               for headless NVIDIA Wayland (Milestone 4B).
+	//   "user"    - the Milestone 4A simple system service. Kept as
+	//               an alternative for non-NVIDIA hosts where logind
+	//               session activation isn't a barrier.
+	//   "weston"  - diagnostic fallback. Brings up Weston in KMS mode
+	//               instead of KWin so the operator can prove the
+	//               DRM/KMS path independently of KWin/logind.
+	SessionBackend string `yaml:"session_backend"`
+
+	// KwinVT is the virtual terminal number realvt sessions claim
+	// (and chvt to). Default 7 (matches v2).
+	KwinVT int `yaml:"kwin_vt"`
+
+	// CompositorMode selects which binary the realvt service launches.
+	//   "plasma"  - startplasma-wayland (Plasma session, includes
+	//               kwin_wayland). Default; matches v2's
+	//               plasma-realvt.service.
+	//   "kwin"    - kwin_wayland --drm --no-lockscreen directly. Use
+	//               when Plasma isn't installed (small images).
+	//   "weston"  - weston --backend=drm-backend.so. Diagnostic.
+	CompositorMode string `yaml:"compositor_mode"`
+
+	// KwinDRMDevice is the explicit /dev/dri/cardN the compositor
+	// should target via KWIN_DRM_DEVICES. Empty defaults to
+	// /dev/dri/card1 (NVIDIA's preferred card on the validated VM
+	// after the edid phase) and falls back to /dev/dri/card0 if
+	// card1 is absent at runtime.
+	KwinDRMDevice string `yaml:"kwin_drm_device"`
 }
 
 // DefaultDesktopUser is the account headless_user creates when the
@@ -314,6 +357,20 @@ const DefaultDesktopUser = "cloudgamer"
 // DefaultDesktopShell is the login shell when the profile leaves
 // desktop.shell empty.
 const DefaultDesktopShell = "/bin/bash"
+
+// DefaultSessionBackend is the v2-parity backend (real-VT logind).
+const DefaultSessionBackend = "realvt"
+
+// DefaultCompositorMode is what realvt launches by default.
+const DefaultCompositorMode = "plasma"
+
+// DefaultKwinVT is the virtual terminal the realvt service claims.
+const DefaultKwinVT = 7
+
+// DefaultKwinDRMDevice is the NVIDIA card the validated VM exposes
+// after the edid phase. The kwin_session probe falls back to
+// /dev/dri/card0 if card1 is missing at runtime.
+const DefaultKwinDRMDevice = "/dev/dri/card1"
 
 // DefaultDesktopGroups is the supplementary-group list headless_user
 // uses when the profile leaves desktop.groups empty. These groups
@@ -331,6 +388,11 @@ var DefaultDesktopGroups = []string{"video", "render", "input", "audio", "system
 // filled by the documented defaults. Phases call this instead of
 // reading Profile.Desktop directly so default behavior is consistent
 // across phases.
+//
+// Note: EnableLinger comes back as a non-nil *bool. nil in the input
+// (missing YAML key) becomes pointer-to-true (the safe default for
+// the headless session); a profile that explicitly sets
+// `enable_linger: false` keeps the false pointer.
 func (p *Profile) EffectiveDesktop() DesktopConfig {
 	out := DesktopConfig{}
 	if p != nil {
@@ -345,7 +407,46 @@ func (p *Profile) EffectiveDesktop() DesktopConfig {
 	if len(out.Groups) == 0 {
 		out.Groups = append([]string{}, DefaultDesktopGroups...)
 	}
+	if out.EnableLinger == nil {
+		t := true
+		out.EnableLinger = &t
+	}
+	if strings.TrimSpace(out.SessionBackend) == "" {
+		out.SessionBackend = DefaultSessionBackend
+	}
+	if strings.TrimSpace(out.CompositorMode) == "" {
+		out.CompositorMode = DefaultCompositorMode
+	}
+	if out.KwinVT == 0 {
+		out.KwinVT = DefaultKwinVT
+	}
+	if strings.TrimSpace(out.KwinDRMDevice) == "" {
+		out.KwinDRMDevice = DefaultKwinDRMDevice
+	}
 	return out
+}
+
+// LingerEnabled is a tiny convenience for callers that just want the
+// bool value out of the *bool field. Safe on a zero DesktopConfig:
+// returns true (the documented default).
+func (d DesktopConfig) LingerEnabled() bool {
+	if d.EnableLinger == nil {
+		return true
+	}
+	return *d.EnableLinger
+}
+
+// DesktopLingerExplicit reports whether the operator put an explicit
+// `enable_linger:` line in the profile YAML. Use this at the apply /
+// phase entry point BEFORE calling EffectiveDesktop (which always
+// fills the default pointer).
+//
+// State.Details["linger_defaulted"] should be `!DesktopLingerExplicit()`.
+func (p *Profile) DesktopLingerExplicit() bool {
+	if p == nil {
+		return false
+	}
+	return p.Desktop.EnableLinger != nil
 }
 
 // LoadProfile reads a single profile YAML by name from
@@ -477,6 +578,21 @@ func ValidateProfile(p *Profile) error {
 		if !looksLikePOSIXLogin(g) {
 			return fmt.Errorf("config: profile %q: desktop.groups entry %q is not a safe POSIX group name", p.Profile, g)
 		}
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Desktop.SessionBackend)) {
+	case "", "realvt", "user", "weston":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: desktop.session_backend must be one of realvt/user/weston, got %q", p.Profile, p.Desktop.SessionBackend)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Desktop.CompositorMode)) {
+	case "", "plasma", "kwin", "weston":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: desktop.compositor_mode must be one of plasma/kwin/weston, got %q", p.Profile, p.Desktop.CompositorMode)
+	}
+	if p.Desktop.KwinVT < 0 || p.Desktop.KwinVT > 63 {
+		return fmt.Errorf("config: profile %q: desktop.kwin_vt must be 0-63, got %d", p.Profile, p.Desktop.KwinVT)
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":

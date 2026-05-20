@@ -202,6 +202,46 @@ func TestEffectiveDesktop_RespectsProfileOverrides(t *testing.T) {
 	}
 }
 
+func TestEffectiveDesktop_EnableLingerDefaultsTrue(t *testing.T) {
+	p := &Profile{} // empty -> no enable_linger key at all
+	got := p.EffectiveDesktop()
+	if !got.LingerEnabled() {
+		t.Errorf("missing enable_linger: LingerEnabled should be true")
+	}
+	if p.DesktopLingerExplicit() {
+		t.Errorf("missing enable_linger: DesktopLingerExplicit should be false")
+	}
+}
+
+func TestEffectiveDesktop_EnableLingerExplicitFalseIsRespected(t *testing.T) {
+	f := false
+	p := &Profile{Desktop: DesktopConfig{EnableLinger: &f}}
+	got := p.EffectiveDesktop()
+	if got.LingerEnabled() {
+		t.Errorf("explicit enable_linger: false should NOT be flipped to true")
+	}
+	if !p.DesktopLingerExplicit() {
+		t.Errorf("explicit enable_linger: false should mark DesktopLingerExplicit true")
+	}
+}
+
+func TestEffectiveDesktop_SessionBackendDefaultsRealvt(t *testing.T) {
+	p := &Profile{}
+	got := p.EffectiveDesktop()
+	if got.SessionBackend != DefaultSessionBackend {
+		t.Errorf("session_backend default: got %q want %q", got.SessionBackend, DefaultSessionBackend)
+	}
+	if got.CompositorMode != DefaultCompositorMode {
+		t.Errorf("compositor_mode default: got %q want %q", got.CompositorMode, DefaultCompositorMode)
+	}
+	if got.KwinVT != DefaultKwinVT {
+		t.Errorf("kwin_vt default: got %d want %d", got.KwinVT, DefaultKwinVT)
+	}
+	if got.KwinDRMDevice != DefaultKwinDRMDevice {
+		t.Errorf("kwin_drm_device default: got %q want %q", got.KwinDRMDevice, DefaultKwinDRMDevice)
+	}
+}
+
 // TestHDRAutoProfileSpec exercises the OS-resolver-driven HDR profile.
 // ubuntu_version is intentionally empty; the resolver picks the OS.
 func TestHDRAutoProfileSpec(t *testing.T) {
@@ -506,6 +546,15 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Desktop.User = "cloudgamer"
 			p.Desktop.Groups = []string{"video", "evil; rm -rf /"}
 		}, "desktop.groups"},
+		{"bad desktop.session_backend", func(p *Profile) {
+			p.Desktop.SessionBackend = "kvm"
+		}, "session_backend"},
+		{"bad desktop.compositor_mode", func(p *Profile) {
+			p.Desktop.CompositorMode = "gnome"
+		}, "compositor_mode"},
+		{"out-of-range desktop.kwin_vt", func(p *Profile) {
+			p.Desktop.KwinVT = 99
+		}, "kwin_vt"},
 	}
 	base := func() *Profile {
 		return &Profile{

@@ -161,13 +161,36 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 	// Acquire the process lock if this is a mutating command. Doctor
 	// / state-show callers can skip it; we surface a lock holder in
 	// the error returned from this helper.
+	//
+	// AcquireWithRecovery also tells us whether a previous run left a
+	// dead-PID lock that we just stole; we surface that to the
+	// operator and record it under state.Details["startup_recovery"].
 	var lock *state.Lock
 	if profileRequired {
-		l, err := state.Acquire("")
+		l, rec, err := state.AcquireWithRecovery("")
 		if err != nil {
 			return nil, nil, fmt.Errorf("acquire process lock: %w", err)
 		}
 		lock = l
+		if rec.Recovered() {
+			fmt.Println()
+			if rec.StalePID > 0 {
+				fmt.Printf("Stale CloudDeploy lock recovered: previous holder PID %d is dead. Lock=%s\n",
+					rec.StalePID, rec.LockPath)
+			} else if rec.StaleLockUnreadable {
+				fmt.Printf("Stale CloudDeploy lock recovered: lock file at %s was unreadable.\n", rec.LockPath)
+			}
+			fmt.Println()
+			if st != nil {
+				if st.StartupRecovery == nil {
+					st.StartupRecovery = &state.StartupRecovery{}
+				}
+				st.StartupRecovery.StaleLockRecovered = true
+				st.StartupRecovery.StalePID = rec.StalePID
+				st.StartupRecovery.LockPath = rec.LockPath
+				st.StartupRecovery.At = nowPtr()
+			}
+		}
 	}
 
 	r := runner.New()
@@ -192,6 +215,13 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 	return deps, lock, nil
 }
 
+// nowPtr returns a non-nil *time.Time of "now in UTC" for the state
+// startup-recovery / phase-completion timestamps.
+func nowPtr() *time.Time {
+	t := time.Now().UTC()
+	return &t
+}
+
 func recoverInterruptedPhasesOnStartup(deps *phase.Deps, profileName string) error {
 	if deps == nil || deps.State == nil {
 		return nil
@@ -203,6 +233,21 @@ func recoverInterruptedPhasesOnStartup(deps *phase.Deps, profileName string) err
 	sort.Slice(recovered, func(i, j int) bool {
 		return recovered[i].Name < recovered[j].Name
 	})
+
+	// Fold the recovered phase names into the startup_recovery
+	// summary so `state show` exposes the full picture without the
+	// operator having to scroll back through stdout.
+	if deps.State.StartupRecovery == nil {
+		deps.State.StartupRecovery = &state.StartupRecovery{}
+	}
+	names := make([]string, 0, len(recovered))
+	for _, r := range recovered {
+		names = append(names, r.Name)
+	}
+	deps.State.StartupRecovery.RecoveredPhases = names
+	if deps.State.StartupRecovery.At == nil {
+		deps.State.StartupRecovery.At = nowPtr()
+	}
 
 	fmt.Println()
 	fmt.Println("Detected interrupted CloudDeploy phase(s) from a previous run:")
@@ -393,14 +438,16 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 		phase.DRMDisplayValidate{},
 	}
 
-	if isResume {
-		svc := &reboot.Service{Runner: deps.Runner, DryRun: deps.DryRun}
-		if svc.IsInstalled() {
-			fmt.Println("resume: Disabling continuation service...")
-			_ = svc.Disable(ctx)
-		}
-	}
-
+	// Live-VM regression fix: previously we disabled the continuation
+	// systemd unit at the START of resume. That unit was the very
+	// thing that had just invoked us, so systemd treated the
+	// disable+daemon-reload as the unit removing itself mid-execution
+	// and killed the resume run before any phase started -
+	// /var/log/clouddeploy/continue.log would contain only:
+	//   "resume: Disabling continuation service..."
+	// followed by silence. We now leave the unit in place while we
+	// run; it gets cleaned up ONLY when every phase reached a
+	// terminal-done state AND no further reboot is queued.
 	for _, p := range phases {
 		fmt.Printf("\n=== phase %s ===\n", p.Name())
 		if err := p.Run(ctx, deps); err != nil {
@@ -411,8 +458,32 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 			return err
 		}
 	}
+	// Clean final completion. NOW we can safely disable the
+	// continuation unit (only on resume; apply never installed it on
+	// its own without a phase needing reboot, but Disable is
+	// idempotent so the apply path can also call it safely).
+	if isResume {
+		if err := disableContinuationIfPresent(ctx, deps); err != nil {
+			// Non-fatal: the deploy reached terminal-done. We log
+			// rather than fail the whole apply.
+			fmt.Printf("resume: warning: failed to clean up continuation unit: %v\n", err)
+		}
+	}
 	fmt.Print(partialApplyBanner)
 	return nil
+}
+
+// disableContinuationIfPresent removes /etc/systemd/system/clouddeploy-
+// v3-continue.service + the env-file iff the unit exists. Idempotent.
+// Called ONLY after every phase reached terminal-done AND no reboot is
+// queued.
+func disableContinuationIfPresent(ctx context.Context, deps *phase.Deps) error {
+	svc := &reboot.Service{Runner: deps.Runner, DryRun: deps.DryRun}
+	if !svc.IsInstalled() {
+		return nil
+	}
+	fmt.Println("resume: deploy fully complete; disabling continuation service")
+	return svc.Disable(ctx)
 }
 
 // -----------------------------------------------------------------------------
@@ -829,13 +900,28 @@ func newDoctorKwinCmd() *cobra.Command {
 				return err
 			}
 			fmt.Println("doctor kwin:")
-			fmt.Printf("  Unit name              : %s\n", phase.KWinUnitName)
-			fmt.Printf("  Unit path              : %s\n", phase.KWinUnitDefaultPath)
 			user := ""
 			uid := ""
+			backend := config.DefaultSessionBackend
+			mode := config.DefaultCompositorMode
+			vt := config.DefaultKwinVT
+			drm := config.DefaultKwinDRMDevice
 			if deps.Profile != nil {
-				user = deps.Profile.EffectiveDesktop().User
+				desk := deps.Profile.EffectiveDesktop()
+				user = desk.User
+				backend = desk.SessionBackend
+				mode = desk.CompositorMode
+				vt = desk.KwinVT
+				drm = desk.KwinDRMDevice
 			}
+			unitName := phase.UnitNameForSession(backend, mode)
+			unitPath := "/etc/systemd/system/" + unitName
+			fmt.Printf("  Backend                : %s\n", backend)
+			fmt.Printf("  Compositor mode        : %s\n", mode)
+			fmt.Printf("  VT                     : %d\n", vt)
+			fmt.Printf("  KWIN_DRM_DEVICES       : %s\n", drm)
+			fmt.Printf("  Unit name              : %s\n", unitName)
+			fmt.Printf("  Unit path              : %s\n", unitPath)
 			if hu := deps.State.Get(phase.HeadlessUserName); hu != nil {
 				if v, ok := hu.Details["uid"].(string); ok {
 					uid = v
@@ -843,14 +929,14 @@ func newDoctorKwinCmd() *cobra.Command {
 			}
 			fmt.Printf("  Headless user          : %s\n", evOrUnknown(user))
 			fmt.Printf("  Recorded UID           : %s\n", evOrUnknown(uid))
-			if _, err := os.Stat(phase.KWinUnitDefaultPath); err == nil {
+			if _, err := os.Stat(unitPath); err == nil {
 				fmt.Printf("  Unit installed         : yes\n")
 			} else {
 				fmt.Printf("  Unit installed         : no\n")
 			}
 			// Best-effort systemctl is-active probe.
 			res := deps.Runner.Exec(ctx, runner.CommandSpec{
-				Argv:    []string{"systemctl", "is-active", phase.KWinUnitName},
+				Argv:    []string{"systemctl", "is-active", unitName},
 				LogFile: "-",
 				Timeout: 5 * time.Second,
 			})
@@ -868,13 +954,14 @@ func newDoctorKwinCmd() *cobra.Command {
 				} else {
 					fmt.Printf("  Wayland socket         : %s (missing: %v)\n", socket, err)
 				}
+				fmt.Printf("  Manual kscreen command : sudo -u %s env XDG_RUNTIME_DIR=/run/user/%s WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus QT_QPA_PLATFORM=wayland XDG_CURRENT_DESKTOP=KDE XDG_SESSION_TYPE=wayland kscreen-doctor -o\n", evOrUnknown(user), uid, uid)
 			}
 
 			// Quick journal tail for the unit.
 			fmt.Println()
-			fmt.Println("Recent journal lines (last 20):")
+			fmt.Println("Recent journal lines (last 200):")
 			jres := deps.Runner.Exec(ctx, runner.CommandSpec{
-				Argv:    []string{"journalctl", "-u", phase.KWinUnitName, "-n", "20", "--no-pager"},
+				Argv:    []string{"journalctl", "-u", unitName, "-n", "200", "--no-pager"},
 				LogFile: "-",
 				Timeout: 10 * time.Second,
 			})
@@ -885,9 +972,11 @@ func newDoctorKwinCmd() *cobra.Command {
 			}
 			fmt.Println()
 			fmt.Println("Recovery hints:")
+			fmt.Printf("  sudo systemctl stop %s\n", unitName)
+			fmt.Println("  sudo clouddeployctl state reset --phase kwin_session")
 			fmt.Println("  sudo clouddeployctl phase kwin-session     # re-render + restart")
-			fmt.Println("  sudo journalctl -u clouddeploy-kwin-wayland.service -e")
-			fmt.Println("  sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> kscreen-doctor -o")
+			fmt.Printf("  sudo journalctl -u %s -e\n", unitName)
+			fmt.Println("  switch diagnostic fallback: set desktop.session_backend=weston and run phase kwin-session")
 			return nil
 		},
 	}

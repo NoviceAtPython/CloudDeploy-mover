@@ -137,11 +137,30 @@ func (p HeadlessUser) Run(ctx context.Context, deps *Deps) error {
 	details["groups"] = info.Groups
 
 	// 4. Linger.
-	if desk.EnableLinger {
+	//
+	// Live VM regression history:
+	//   * `enable_linger` was a plain bool so a missing YAML key
+	//     defaulted to false. Headless KWin then died at boot because
+	//     /run/user/<uid> never came up.
+	//   * Fix is in EffectiveDesktop: missing key -> true. We surface
+	//     `linger_requested` (the operator's intent), `linger_enabled`
+	//     (what we actually applied via loginctl), and
+	//     `linger_defaulted` (whether the YAML had an explicit key).
+	lingerRequested := desk.LingerEnabled()
+	details["linger_requested"] = lingerRequested
+	details["linger_defaulted"] = deps.Profile.DesktopLingerExplicit() == false
+	if lingerRequested {
 		if err := p.enableLinger(ctx, deps, desk.User, true); err != nil {
 			return p.failPhase(deps, "loginctl enable-linger", err, details)
 		}
-		details["linger_enabled"] = true
+		// Verify via loginctl show-user <user> -p Linger. Best-effort:
+		// a missing loginctl on a developer host is just informational.
+		if verified, raw := p.verifyLinger(ctx, deps, desk.User); raw != "" {
+			details["linger_verified_raw"] = raw
+			details["linger_enabled"] = verified
+		} else {
+			details["linger_enabled"] = true
+		}
 	} else {
 		details["linger_enabled"] = false
 	}
@@ -298,6 +317,33 @@ func (p HeadlessUser) enableLinger(ctx context.Context, deps *Deps, name string,
 		return fmt.Errorf("loginctl %s %s: %w (stderr=%q)", verb, name, res.Err, lastLines(res.Stderr, 3))
 	}
 	return nil
+}
+
+// verifyLinger reads `loginctl show-user <name> -p Linger`. Returns
+// (verified, rawOutput). Best-effort: a missing loginctl / unparseable
+// output returns (false, "") and the phase falls back to trusting
+// the enableLinger return value.
+func (p HeadlessUser) verifyLinger(ctx context.Context, deps *Deps, name string) (bool, string) {
+	if deps == nil || deps.Runner == nil {
+		return false, ""
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"loginctl", "show-user", name, "-p", "Linger"},
+		LogFile: "-",
+		Timeout: 10 * time.Second,
+	})
+	if res.Err != nil {
+		return false, ""
+	}
+	out := strings.TrimSpace(res.Stdout)
+	// loginctl emits "Linger=yes" / "Linger=no".
+	switch out {
+	case "Linger=yes":
+		return true, out
+	case "Linger=no":
+		return false, out
+	}
+	return false, out
 }
 
 func (p HeadlessUser) chownHome(ctx context.Context, deps *Deps, name, gid, home string) error {

@@ -81,6 +81,30 @@ type State struct {
 	Phases       map[string]*Phase `json:"phases"`
 	RebootNeeded bool              `json:"reboot_needed,omitempty"`
 	ResumeTarget string            `json:"resume_target,omitempty"`
+	// StartupRecovery is set when loadDeps observed it had to clean
+	// up stale on-disk state (a dead-PID lock file, an
+	// interrupted-running phase). Diagnostic only; never gates
+	// behavior.
+	StartupRecovery *StartupRecovery `json:"startup_recovery,omitempty"`
+}
+
+// StartupRecovery records the most recent automatic cleanup the
+// clouddeployctl CLI performed at startup.
+type StartupRecovery struct {
+	// StaleLockRecovered is true when AcquireWithRecovery stole a
+	// lock file whose PID was dead at startup.
+	StaleLockRecovered bool `json:"stale_lock_recovered,omitempty"`
+	// StalePID is the dead PID we removed from the lock file. 0
+	// when the lock was unreadable rather than dead-but-readable.
+	StalePID int `json:"stale_pid,omitempty"`
+	// LockPath is the path that was recovered.
+	LockPath string `json:"lock_path,omitempty"`
+	// RecoveredPhases is the names of phases that were forced from
+	// "running" back to "pending" because the prior clouddeployctl
+	// process died holding them.
+	RecoveredPhases []string `json:"recovered_phases,omitempty"`
+	// At is the UTC timestamp of the recovery sweep.
+	At *time.Time `json:"at,omitempty"`
 }
 
 // InterruptedPhaseRecovery describes a phase that was still marked

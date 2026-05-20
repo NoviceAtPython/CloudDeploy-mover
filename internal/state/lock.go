@@ -42,11 +42,27 @@ func (l *Lock) PID() int { return l.pid }
 // Lock. If create fails because the file exists, read the existing
 // pid; if that process is dead, steal the lock (overwrite the file).
 func Acquire(path string) (*Lock, error) {
+	l, _, err := AcquireWithRecovery(path)
+	return l, err
+}
+
+// AcquireWithRecovery is Acquire + a Recovery payload describing what
+// stale state we cleaned up. Callers that want to surface
+// `stale_lock_recovered=true` / `stale_pid=...` in state.Details use
+// this entry point; Acquire is kept for callers that only want the
+// lock.
+//
+// Recovery.StaleLockRecovered=true iff a previous lock file pointed
+// at a dead PID and we removed it. StalePID is that PID when
+// recovered; 0 otherwise.
+func AcquireWithRecovery(path string) (*Lock, AcquireRecovery, error) {
+	rec := AcquireRecovery{LockPath: path}
 	if path == "" {
 		path = DefaultLockPath
+		rec.LockPath = path
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("state: mkdir for lock: %w", err)
+		return nil, rec, fmt.Errorf("state: mkdir for lock: %w", err)
 	}
 	myPID := os.Getpid()
 
@@ -55,30 +71,46 @@ func Acquire(path string) (*Lock, error) {
 		if err == nil {
 			_, _ = fmt.Fprintf(f, "%d\n", myPID)
 			_ = f.Close()
-			return &Lock{path: path, pid: myPID}, nil
+			return &Lock{path: path, pid: myPID}, rec, nil
 		}
 		if !errors.Is(err, os.ErrExist) {
-			return nil, fmt.Errorf("state: create lock %s: %w", path, err)
+			return nil, rec, fmt.Errorf("state: create lock %s: %w", path, err)
 		}
 		// Lock exists. Read pid; if the holder is dead, steal it.
 		holder, readErr := readPID(path)
 		if readErr != nil || holder == 0 {
 			// Stale or unreadable. Force-remove and retry once.
+			rec.StaleLockRecovered = true
+			rec.StaleLockUnreadable = true
 			_ = os.Remove(path)
 			continue
 		}
 		if !processAlive(holder) {
 			// Holder is dead. Force-remove and retry.
+			rec.StaleLockRecovered = true
+			rec.StalePID = holder
 			_ = os.Remove(path)
 			continue
 		}
-		return nil, fmt.Errorf("%w (held by pid %d, lock=%s). "+
+		return nil, rec, fmt.Errorf("%w (held by pid %d, lock=%s). "+
 			"Inspect the holder with: ps -fp %d  |  journalctl -u clouddeploy-v3-continue.service -n 200 --no-pager. "+
 			"If the holder is gone, remove %s and retry.",
 			ErrLocked, holder, path, holder, path)
 	}
-	return nil, fmt.Errorf("state: could not acquire lock %s after stealing a stale entry", path)
+	return nil, rec, fmt.Errorf("state: could not acquire lock %s after stealing a stale entry", path)
 }
+
+// AcquireRecovery describes what stale state the lock-acquisition
+// step cleaned up. Empty struct = "nothing to recover".
+type AcquireRecovery struct {
+	LockPath            string
+	StaleLockRecovered  bool
+	StaleLockUnreadable bool
+	StalePID            int
+}
+
+// Recovered reports whether any cleanup happened.
+func (r AcquireRecovery) Recovered() bool { return r.StaleLockRecovered }
 
 // Release removes the lock file. Safe to call multiple times; only
 // errors when the file exists AND we cannot remove it.

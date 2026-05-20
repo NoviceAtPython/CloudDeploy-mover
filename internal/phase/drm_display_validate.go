@@ -302,6 +302,11 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 		}
 		return fmt.Sprintf("Output: 1 %s\n        enabled\n        Modes: 1!  %s\n", conn, mode), nil
 	}
+	// Live VM regression: kscreen-doctor defaulted to Qt xcb without
+	// an explicit QT_QPA_PLATFORM=wayland, which then crashed because
+	// the headless host has no X server. Set the full env the KDE
+	// shell expects so kscreen-doctor is forced through the Wayland
+	// platform plugin.
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
 			"sudo", "-u", user,
@@ -309,6 +314,11 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 			"XDG_RUNTIME_DIR=/run/user/" + uid,
 			"WAYLAND_DISPLAY=wayland-0",
 			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
+			"QT_QPA_PLATFORM=wayland",
+			"XDG_CURRENT_DESKTOP=KDE",
+			"XDG_SESSION_TYPE=wayland",
+			"XDG_SESSION_DESKTOP=KDE",
+			"KDE_FULL_SESSION=true",
 			"kscreen-doctor", "-o",
 		},
 		Sudo:    true,
