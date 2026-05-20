@@ -102,6 +102,137 @@ func TestKWinPatch_DryRunDoesNotRequireAptSource(t *testing.T) {
 	}
 }
 
+func TestEnsureDebSrcEnabled_Deb822AddsDebSrc(t *testing.T) {
+	dir := t.TempDir()
+	sources := filepath.Join(dir, "ubuntu.sources")
+	legacy := filepath.Join(dir, "missing-sources.list")
+	backupDir := filepath.Join(dir, "backups")
+	body := strings.Join([]string{
+		"# kept comment",
+		"Types: deb",
+		"URIs: http://archive.ubuntu.com/ubuntu",
+		"Suites: questing questing-updates",
+		"Components: main restricted universe multiverse",
+		"",
+	}, "\n")
+	if err := os.WriteFile(sources, []byte(body), 0o644); err != nil {
+		t.Fatalf("write sources: %v", err)
+	}
+	deps := newDeps(t, kwinPatchProfile(t, writeTestPatch(t)), nil)
+	deps.DryRun = true
+
+	res, err := ensureDebSrcEnabled(context.Background(), deps, debSrcOptions{
+		Deb822SourcesPath:     sources,
+		LegacySourcesListPath: legacy,
+		BackupDir:             backupDir,
+		Now:                   func() time.Time { return time.Date(2026, 5, 20, 12, 0, 0, 0, time.UTC) },
+	})
+	if err != nil {
+		t.Fatalf("ensureDebSrcEnabled: %v", err)
+	}
+	if res.EnabledBefore {
+		t.Fatalf("EnabledBefore got true want false")
+	}
+	if !res.Modified || !res.AptUpdateAfterDebSrc {
+		t.Fatalf("modified/update flags: %#v", res)
+	}
+	if res.BackupPath == "" {
+		t.Fatalf("backup path missing: %#v", res)
+	}
+	got, err := os.ReadFile(sources)
+	if err != nil {
+		t.Fatalf("read sources: %v", err)
+	}
+	if !strings.Contains(string(got), "Types: deb deb-src") {
+		t.Fatalf("deb-src not added:\n%s", string(got))
+	}
+	if !strings.Contains(string(got), "# kept comment") {
+		t.Fatalf("comment not preserved:\n%s", string(got))
+	}
+	if _, err := os.Stat(res.BackupPath); err != nil {
+		t.Fatalf("backup was not written at %s: %v", res.BackupPath, err)
+	}
+}
+
+func TestEnsureDebSrcEnabled_Deb822AlreadyEnabledUnchanged(t *testing.T) {
+	dir := t.TempDir()
+	sources := filepath.Join(dir, "ubuntu.sources")
+	legacy := filepath.Join(dir, "missing-sources.list")
+	backupDir := filepath.Join(dir, "backups")
+	body := "Types: deb deb-src\nURIs: http://archive.ubuntu.com/ubuntu\n"
+	if err := os.WriteFile(sources, []byte(body), 0o644); err != nil {
+		t.Fatalf("write sources: %v", err)
+	}
+	deps := newDeps(t, kwinPatchProfile(t, writeTestPatch(t)), nil)
+	deps.DryRun = true
+
+	res, err := ensureDebSrcEnabled(context.Background(), deps, debSrcOptions{
+		Deb822SourcesPath:     sources,
+		LegacySourcesListPath: legacy,
+		BackupDir:             backupDir,
+	})
+	if err != nil {
+		t.Fatalf("ensureDebSrcEnabled: %v", err)
+	}
+	if !res.EnabledBefore {
+		t.Fatalf("EnabledBefore got false want true")
+	}
+	if res.Modified || res.AptUpdateAfterDebSrc || res.BackupPath != "" {
+		t.Fatalf("already-enabled source should be unchanged: %#v", res)
+	}
+	got, err := os.ReadFile(sources)
+	if err != nil {
+		t.Fatalf("read sources: %v", err)
+	}
+	if string(got) != body {
+		t.Fatalf("sources changed unexpectedly:\n%s", string(got))
+	}
+}
+
+func TestEnsureDebSrcEnabled_LegacySourcesAddsMissingDebSrc(t *testing.T) {
+	dir := t.TempDir()
+	deb822 := filepath.Join(dir, "missing-ubuntu.sources")
+	legacy := filepath.Join(dir, "sources.list")
+	body := strings.Join([]string{
+		"# local mirror",
+		"deb http://archive.ubuntu.com/ubuntu questing main restricted",
+		"deb http://security.ubuntu.com/ubuntu questing-security main",
+		"",
+	}, "\n")
+	if err := os.WriteFile(legacy, []byte(body), 0o644); err != nil {
+		t.Fatalf("write sources.list: %v", err)
+	}
+	deps := newDeps(t, kwinPatchProfile(t, writeTestPatch(t)), nil)
+	deps.DryRun = true
+
+	res, err := ensureDebSrcEnabled(context.Background(), deps, debSrcOptions{
+		Deb822SourcesPath:     deb822,
+		LegacySourcesListPath: legacy,
+		BackupDir:             filepath.Join(dir, "backups"),
+	})
+	if err != nil {
+		t.Fatalf("ensureDebSrcEnabled: %v", err)
+	}
+	if res.EnabledBefore {
+		t.Fatalf("EnabledBefore got true want false")
+	}
+	if !res.Modified || !res.AptUpdateAfterDebSrc {
+		t.Fatalf("modified/update flags: %#v", res)
+	}
+	got, err := os.ReadFile(legacy)
+	if err != nil {
+		t.Fatalf("read sources.list: %v", err)
+	}
+	for _, want := range []string{
+		"deb-src http://archive.ubuntu.com/ubuntu questing main restricted",
+		"deb-src http://security.ubuntu.com/ubuntu questing-security main",
+	} {
+		if !strings.Contains(string(got), want) {
+			t.Fatalf("missing %q in:\n%s", want, string(got))
+		}
+	}
+}
+
 func TestKWinPatch_ValidationFailureFatalWhenRequired(t *testing.T) {
 	patchPath := writeTestPatch(t)
 	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
@@ -249,6 +380,48 @@ func TestKWinPatch_MarkerMismatchRebuilds(t *testing.T) {
 	}
 	if got.Profile != "test" {
 		t.Fatalf("marker profile: got %q want test", got.Profile)
+	}
+}
+
+func TestKWinPatch_EnsuresDebSrcBeforeSourceValidateBuild(t *testing.T) {
+	patchPath := writeTestPatch(t)
+	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
+	deps.DryRun = false
+	var events []string
+
+	err := (KWinPatch{
+		MarkerPath: filepath.Join(t.TempDir(), "kwin-patch.json"),
+		EnsureDebSrcFn: func(context.Context, *Deps) (DebSrcResult, error) {
+			events = append(events, "ensure-deb-src")
+			return DebSrcResult{EnabledBefore: false, Modified: true, BackupPath: "/tmp/ubuntu.sources.bak", AptUpdateAfterDebSrc: true}, nil
+		},
+		SourceVersionFn: func(context.Context, *Deps, config.KWinConfig) (string, error) {
+			events = append(events, "source-version")
+			return "6.4.5-0ubuntu3", nil
+		},
+		ValidateFn: func(context.Context, *Deps, config.KWinConfig, string) error {
+			events = append(events, "validate")
+			return nil
+		},
+		BuildInstallFn: func(context.Context, *Deps, config.KWinConfig, string, string) ([]string, error) {
+			events = append(events, "build-install")
+			return []string{"kwin-wayland"}, nil
+		},
+	}).Run(context.Background(), deps)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	got := strings.Join(events, ",")
+	want := "ensure-deb-src,source-version,validate,build-install"
+	if got != want {
+		t.Fatalf("event order got %q want %q", got, want)
+	}
+	details := deps.State.Get(KWinPatchName).Details
+	if details["deb_src_enabled_before"] != false ||
+		details["deb_src_modified"] != true ||
+		details["deb_src_backup_path"] != "/tmp/ubuntu.sources.bak" ||
+		details["apt_update_after_deb_src"] != true {
+		t.Fatalf("deb-src details not recorded correctly: %#v", details)
 	}
 }
 

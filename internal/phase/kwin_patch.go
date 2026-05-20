@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -17,10 +18,35 @@ import (
 
 const KWinPatchName = "kwin_patch"
 
+const (
+	defaultDeb822SourcesPath     = "/etc/apt/sources.list.d/ubuntu.sources"
+	defaultLegacySourcesListPath = "/etc/apt/sources.list"
+	defaultDebSrcBackupDir       = "/var/lib/clouddeploy/backups"
+)
+
+type DebSrcResult struct {
+	EnabledBefore        bool
+	Modified             bool
+	BackupPath           string
+	AptUpdateAfterDebSrc bool
+}
+
+type debSrcOptions struct {
+	Deb822SourcesPath     string
+	LegacySourcesListPath string
+	BackupDir             string
+	Now                   func() time.Time
+}
+
 type KWinPatch struct {
 	MarkerPath string
 	NowFn      func() time.Time
 
+	Deb822SourcesPath     string
+	LegacySourcesListPath string
+	DebSrcBackupDir       string
+
+	EnsureDebSrcFn  func(context.Context, *Deps) (DebSrcResult, error)
 	SourceVersionFn func(context.Context, *Deps, config.KWinConfig) (string, error)
 	ValidateFn      func(context.Context, *Deps, config.KWinConfig, string) error
 	BuildInstallFn  func(context.Context, *Deps, config.KWinConfig, string, string) ([]string, error)
@@ -72,6 +98,15 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 		_ = deps.PersistState()
 		return nil
 	}
+
+	debSrc, err := p.ensureDebSrcEnabled(ctx, deps)
+	if err != nil {
+		return p.fail(deps, details, "enable deb-src repositories", err)
+	}
+	details["deb_src_enabled_before"] = debSrc.EnabledBefore
+	details["deb_src_modified"] = debSrc.Modified
+	details["deb_src_backup_path"] = debSrc.BackupPath
+	details["apt_update_after_deb_src"] = debSrc.AptUpdateAfterDebSrc
 
 	sourceVersion, err := p.sourceVersion(ctx, deps, cfg)
 	if err != nil {
@@ -161,6 +196,19 @@ func (p KWinPatch) now() time.Time {
 		return p.NowFn().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (p KWinPatch) ensureDebSrcEnabled(ctx context.Context, deps *Deps) (DebSrcResult, error) {
+	if p.EnsureDebSrcFn != nil {
+		return p.EnsureDebSrcFn(ctx, deps)
+	}
+	opts := debSrcOptions{
+		Deb822SourcesPath:     p.Deb822SourcesPath,
+		LegacySourcesListPath: p.LegacySourcesListPath,
+		BackupDir:             p.DebSrcBackupDir,
+		Now:                   p.now,
+	}
+	return ensureDebSrcEnabled(ctx, deps, opts)
 }
 
 func (p KWinPatch) sourceVersion(ctx context.Context, deps *Deps, cfg config.KWinConfig) (string, error) {
@@ -278,6 +326,7 @@ func run(ctx context.Context, deps *Deps, cwd string, argv []string, timeout tim
 		Cwd:     cwd,
 		Sudo:    sudo,
 		Timeout: timeout,
+		DryRun:  deps.DryRun,
 		Env: []string{
 			"DEBIAN_FRONTEND=noninteractive",
 			"APT_LISTCHANGES_FRONTEND=none",
@@ -287,6 +336,210 @@ func run(ctx context.Context, deps *Deps, cwd string, argv []string, timeout tim
 		return fmt.Errorf("%s failed: %w stderr=%q", strings.Join(argv, " "), res.Err, tailLines(res.Stderr, 10))
 	}
 	return nil
+}
+
+func ensureDebSrcEnabled(ctx context.Context, deps *Deps, opts debSrcOptions) (DebSrcResult, error) {
+	deb822Path := opts.Deb822SourcesPath
+	if strings.TrimSpace(deb822Path) == "" {
+		deb822Path = defaultDeb822SourcesPath
+	}
+	legacyPath := opts.LegacySourcesListPath
+	if strings.TrimSpace(legacyPath) == "" {
+		legacyPath = defaultLegacySourcesListPath
+	}
+	backupDir := opts.BackupDir
+	if strings.TrimSpace(backupDir) == "" {
+		backupDir = defaultDebSrcBackupDir
+	}
+	nowFn := opts.Now
+	if nowFn == nil {
+		nowFn = time.Now
+	}
+
+	result := DebSrcResult{}
+	var backups []string
+
+	if text, ok, err := readOptionalTextFile(deb822Path); err != nil {
+		return result, err
+	} else if ok {
+		rewritten, modified, enabled := rewriteDeb822DebSrc(text)
+		result.EnabledBefore = result.EnabledBefore || enabled
+		if modified {
+			backup, err := backupFile(deb822Path, backupDir, nowFn)
+			if err != nil {
+				return result, err
+			}
+			backups = append(backups, backup)
+			if err := os.WriteFile(deb822Path, []byte(rewritten), 0o644); err != nil {
+				return result, fmt.Errorf("write %s: %w", deb822Path, err)
+			}
+			result.Modified = true
+		}
+	}
+
+	if text, ok, err := readOptionalTextFile(legacyPath); err != nil {
+		return result, err
+	} else if ok {
+		rewritten, modified, enabled := rewriteLegacySourcesDebSrc(text)
+		result.EnabledBefore = result.EnabledBefore || enabled
+		if modified {
+			backup, err := backupFile(legacyPath, backupDir, nowFn)
+			if err != nil {
+				return result, err
+			}
+			backups = append(backups, backup)
+			if err := os.WriteFile(legacyPath, []byte(rewritten), 0o644); err != nil {
+				return result, fmt.Errorf("write %s: %w", legacyPath, err)
+			}
+			result.Modified = true
+		}
+	}
+
+	result.BackupPath = strings.Join(backups, ";")
+	if result.Modified {
+		if err := run(ctx, deps, "", []string{"apt-get", "update"}, 20*time.Minute, true); err != nil {
+			return result, err
+		}
+		result.AptUpdateAfterDebSrc = true
+	}
+	return result, nil
+}
+
+func readOptionalTextFile(path string) (string, bool, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read %s: %w", path, err)
+	}
+	return string(b), true, nil
+}
+
+func rewriteDeb822DebSrc(text string) (string, bool, bool) {
+	lines := splitPreserveTrailingNewline(text)
+	modified := false
+	enabledBefore := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		key, rest, ok := strings.Cut(line, ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Types") {
+			continue
+		}
+		fields := strings.Fields(rest)
+		hasDeb := false
+		hasDebSrc := false
+		for _, f := range fields {
+			switch f {
+			case "deb":
+				hasDeb = true
+			case "deb-src":
+				hasDebSrc = true
+			}
+		}
+		if hasDebSrc {
+			enabledBefore = true
+		}
+		if hasDeb && !hasDebSrc {
+			fields = append(fields, "deb-src")
+			lines[i] = key + ": " + strings.Join(fields, " ")
+			modified = true
+		}
+	}
+	return strings.Join(lines, "\n"), modified, enabledBefore
+}
+
+func rewriteLegacySourcesDebSrc(text string) (string, bool, bool) {
+	lines := splitPreserveTrailingNewline(text)
+	existing := map[string]bool{}
+	var toAdd []string
+	enabledBefore := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 {
+			continue
+		}
+		if fields[0] == "deb-src" {
+			enabledBefore = true
+			existing[strings.TrimSpace(strings.TrimPrefix(trimmed, "deb-src"))] = true
+		}
+	}
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		fields := strings.Fields(trimmed)
+		if len(fields) < 2 || fields[0] != "deb" || !looksLikeUbuntuArchiveLine(trimmed) {
+			continue
+		}
+		rest := strings.TrimSpace(strings.TrimPrefix(trimmed, "deb"))
+		if existing[rest] {
+			continue
+		}
+		toAdd = append(toAdd, "deb-src "+rest)
+		existing[rest] = true
+	}
+	if len(toAdd) == 0 {
+		return strings.Join(lines, "\n"), false, enabledBefore
+	}
+	out := strings.Join(lines, "\n")
+	if !strings.HasSuffix(out, "\n") && out != "" {
+		out += "\n"
+	}
+	out += strings.Join(toAdd, "\n") + "\n"
+	return out, true, enabledBefore
+}
+
+func looksLikeUbuntuArchiveLine(line string) bool {
+	lower := strings.ToLower(line)
+	return strings.Contains(lower, "ubuntu")
+}
+
+func splitPreserveTrailingNewline(text string) []string {
+	lines := strings.Split(text, "\n")
+	if len(lines) > 0 && lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
+}
+
+func backupFile(path, backupDir string, nowFn func() time.Time) (string, error) {
+	if err := os.MkdirAll(backupDir, 0o755); err != nil {
+		return "", fmt.Errorf("mkdir %s: %w", backupDir, err)
+	}
+	stamp := nowFn().UTC().Format("20060102T150405Z")
+	dst := filepath.Join(backupDir, filepath.Base(path)+"."+stamp)
+	for i := 1; ; i++ {
+		if _, err := os.Stat(dst); os.IsNotExist(err) {
+			break
+		}
+		dst = filepath.Join(backupDir, fmt.Sprintf("%s.%s.%d", filepath.Base(path), stamp, i))
+	}
+	src, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("open backup source %s: %w", path, err)
+	}
+	defer src.Close()
+	out, err := os.OpenFile(dst, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	if err != nil {
+		return "", fmt.Errorf("create backup %s: %w", dst, err)
+	}
+	if _, err := io.Copy(out, src); err != nil {
+		_ = out.Close()
+		return "", fmt.Errorf("copy backup %s: %w", dst, err)
+	}
+	if err := out.Close(); err != nil {
+		return "", fmt.Errorf("close backup %s: %w", dst, err)
+	}
+	return dst, nil
 }
 
 func resolveKWinPatchPath(path string) string {
