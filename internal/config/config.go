@@ -35,6 +35,7 @@ type Profile struct {
 	CUDA          CUDAConfig     `yaml:"cuda"`
 	Sunshine      SunshineConfig `yaml:"sunshine"`
 	KWin          KWinConfig     `yaml:"kwin"`
+	Desktop       DesktopConfig  `yaml:"desktop"`
 	Deploy        DeployConfig   `yaml:"deploy"`
 }
 
@@ -117,6 +118,13 @@ type DisplayConfig struct {
 	Refresh         int    `yaml:"refresh"`
 	HDR             bool   `yaml:"hdr"`
 	ForcedConnector string `yaml:"forced_connector"`
+	// Edid is the filename (under /lib/firmware/edid/) that the edid
+	// phase writes and that drm.edid_firmware= on the kernel cmdline
+	// references. drm_display_validate uses it to confirm the
+	// installed edid blob matches the operator's intent. Empty
+	// means "no specific edid expected" - the validator only checks
+	// connector / mode.
+	Edid string `yaml:"edid"`
 }
 
 // NVIDIAConfig governs driver selection.
@@ -271,6 +279,75 @@ type KWinConfig struct {
 	Patch      string `yaml:"patch"`
 }
 
+// DesktopConfig governs the headless KDE/KWin Wayland substrate
+// (Milestone 4A). All three phases that consume it - headless_user,
+// desktop_runtime, kwin_session - read these fields. Defaults are
+// applied lazily (the phases substitute their own defaults when the
+// profile leaves a field empty).
+//
+//	user           account that owns the desktop session. Default
+//	               "cloudgamer". A non-empty value MUST be a safe
+//	               POSIX login name (see ValidateProfile rules).
+//	enable_linger  loginctl enable-linger <user> so the systemd user
+//	               bus + /run/user/<uid> stays alive when no one is
+//	               logged in. Default true; required for the
+//	               clouddeploy-kwin-wayland.service path.
+//	groups         supplementary groups the user MUST be in to
+//	               access DRM nodes, audio, input, etc. Default
+//	               ["video", "render", "input", "audio",
+//	               "systemd-journal"]. Empty list means "use the
+//	               defaults". A profile can extend the list, e.g.
+//	               add "kvm" for nested-virt workloads.
+//	shell          login shell. Default /bin/bash. Honored only when
+//	               headless_user actually creates the user.
+type DesktopConfig struct {
+	User         string   `yaml:"user"`
+	EnableLinger bool     `yaml:"enable_linger"`
+	Groups       []string `yaml:"groups"`
+	Shell        string   `yaml:"shell"`
+}
+
+// DefaultDesktopUser is the account headless_user creates when the
+// profile leaves desktop.user empty.
+const DefaultDesktopUser = "cloudgamer"
+
+// DefaultDesktopShell is the login shell when the profile leaves
+// desktop.shell empty.
+const DefaultDesktopShell = "/bin/bash"
+
+// DefaultDesktopGroups is the supplementary-group list headless_user
+// uses when the profile leaves desktop.groups empty. These groups
+// MUST exist on every Ubuntu the deploy supports today.
+//
+//	video, render    DRM device access (/dev/dri/*).
+//	input            evdev / libinput access (mostly for completeness;
+//	                 a headless deploy doesn't need a keyboard).
+//	audio            PipeWire / Pulse access.
+//	systemd-journal  read journalctl without sudo - useful for
+//	                 collect-logs and operator debugging.
+var DefaultDesktopGroups = []string{"video", "render", "input", "audio", "systemd-journal"}
+
+// EffectiveDesktop returns the DesktopConfig with profile-empty fields
+// filled by the documented defaults. Phases call this instead of
+// reading Profile.Desktop directly so default behavior is consistent
+// across phases.
+func (p *Profile) EffectiveDesktop() DesktopConfig {
+	out := DesktopConfig{}
+	if p != nil {
+		out = p.Desktop
+	}
+	if strings.TrimSpace(out.User) == "" {
+		out.User = DefaultDesktopUser
+	}
+	if strings.TrimSpace(out.Shell) == "" {
+		out.Shell = DefaultDesktopShell
+	}
+	if len(out.Groups) == 0 {
+		out.Groups = append([]string{}, DefaultDesktopGroups...)
+	}
+	return out
+}
+
 // LoadProfile reads a single profile YAML by name from
 // <dir>/profiles/<name>.yaml.
 func LoadProfile(dir, name string) (*Profile, error) {
@@ -392,6 +469,14 @@ func ValidateProfile(p *Profile) error {
 	}
 	if strings.TrimSpace(p.Deploy.UbuntuMinVersion) != "" && !looksLikeUbuntuVersion(p.Deploy.UbuntuMinVersion) {
 		return fmt.Errorf("config: profile %q: deploy.ubuntu_min_version %q is not an Ubuntu VERSION_ID", p.Profile, p.Deploy.UbuntuMinVersion)
+	}
+	if strings.TrimSpace(p.Desktop.User) != "" && !looksLikePOSIXLogin(p.Desktop.User) {
+		return fmt.Errorf("config: profile %q: desktop.user %q is not a safe POSIX login name", p.Profile, p.Desktop.User)
+	}
+	for _, g := range p.Desktop.Groups {
+		if !looksLikePOSIXLogin(g) {
+			return fmt.Errorf("config: profile %q: desktop.groups entry %q is not a safe POSIX group name", p.Profile, g)
+		}
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":
@@ -525,6 +610,38 @@ func ValidateGPU(g *GPUProfile) error {
 		return fmt.Errorf("config: gpu profile %q: streaming.hdr must be yes/no/limited, got %q", g.Filename, g.Streaming.HDR)
 	}
 	return nil
+}
+
+// looksLikePOSIXLogin accepts a conservative subset of POSIX login
+// / group names: starts with [a-z_], then [a-z0-9_-] up to 32 chars,
+// with an optional trailing '$' (useful for machine accounts).
+// Stricter than the kernel's rules so anything shell-meaningful
+// (spaces, $, ;, |, backticks, redirects) is rejected before it
+// reaches useradd / usermod / loginctl.
+func looksLikePOSIXLogin(s string) bool {
+	v := strings.TrimSpace(s)
+	if v == "" {
+		return false
+	}
+	if len(v) > 32 {
+		return false
+	}
+	if v[len(v)-1] == '$' {
+		v = v[:len(v)-1]
+		if v == "" {
+			return false
+		}
+	}
+	if !((v[0] >= 'a' && v[0] <= 'z') || v[0] == '_') {
+		return false
+	}
+	for i := 1; i < len(v); i++ {
+		c := v[i]
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
 }
 
 // looksLikeUbuntuVersion accepts a "YY.MM" Ubuntu VERSION_ID (e.g.

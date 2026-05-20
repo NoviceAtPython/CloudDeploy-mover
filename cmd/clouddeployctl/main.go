@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -235,11 +236,12 @@ const partialApplyBanner = `
 ================================================================================
   Milestone 4 partial apply complete (v3 is NOT yet v2-equivalent).
 
-  Implemented:   apt-health, ubuntu-upgrade, base-packages, nvidia-driver, cuda, edid
-  NOT yet:       headless user, cloud-init wait,
-                 KDE/KWin install, patched-KWin HDR build, Sunshine fork
-                 build, Tailscale install, PipeWire virtual sink,
-                 KWin/Plasma/Sunshine systemd units,
+  Implemented:   apt-health, ubuntu-upgrade, base-packages, nvidia-driver,
+                 cuda, edid, headless-user, desktop-packages, desktop-runtime,
+                 kwin-session, drm-display-validate
+  NOT yet:       cloud-init wait, patched-KWin NVIDIA private HDR build,
+                 Sunshine fork build, Tailscale install, PipeWire
+                 virtual sink, full Sunshine/Plasma systemd unit chain,
                  HDR DRM validation, HDR stream validation
 
   Note: ubuntu-upgrade or the EDID/GRUB phase may write changes that
@@ -380,6 +382,15 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 		phase.NvidiaDriver{},
 		phase.Cuda{},
 		phase.Edid{},
+		// Milestone 4A: headless KDE/KWin Wayland substrate. These
+		// five phases run after the kernel-cmdline reboot from edid
+		// so /proc/cmdline already has nvidia-drm.modeset=1 +
+		// drm.edid_firmware=DP-1:edid/<file>.
+		phase.HeadlessUser{},
+		phase.DesktopPackages{},
+		phase.DesktopRuntime{},
+		phase.KWinSession{},
+		phase.DRMDisplayValidate{},
 	}
 
 	if isResume {
@@ -810,17 +821,73 @@ func newDoctorSystemCmd() *cobra.Command {
 func newDoctorKwinCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "kwin",
-		Short: "Report patched-KWin / NVIDIA private HDR state (read-only)",
+		Short: "Report KWin Wayland session state (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("doctor kwin: NOT IMPLEMENTED in Milestone 3 partial.")
-			fmt.Println("Will check (Milestone 4):")
-			fmt.Println("  - /var/lib/clouddeploy/patched-kwin-installed marker")
-			fmt.Println("  - apt-mark hold status for kwin packages")
-			fmt.Println("  - kscreen-doctor -o HDR + Wide Color Gamut state")
-			fmt.Println("  - NV_CRTC_REGAMMA_TF / NV_INPUT_COLORSPACE / NV_PLANE_DEGAMMA_TF via drm_info")
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			fmt.Println("doctor kwin:")
+			fmt.Printf("  Unit name              : %s\n", phase.KWinUnitName)
+			fmt.Printf("  Unit path              : %s\n", phase.KWinUnitDefaultPath)
+			user := ""
+			uid := ""
+			if deps.Profile != nil {
+				user = deps.Profile.EffectiveDesktop().User
+			}
+			if hu := deps.State.Get(phase.HeadlessUserName); hu != nil {
+				if v, ok := hu.Details["uid"].(string); ok {
+					uid = v
+				}
+			}
+			fmt.Printf("  Headless user          : %s\n", evOrUnknown(user))
+			fmt.Printf("  Recorded UID           : %s\n", evOrUnknown(uid))
+			if _, err := os.Stat(phase.KWinUnitDefaultPath); err == nil {
+				fmt.Printf("  Unit installed         : yes\n")
+			} else {
+				fmt.Printf("  Unit installed         : no\n")
+			}
+			// Best-effort systemctl is-active probe.
+			res := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"systemctl", "is-active", phase.KWinUnitName},
+				LogFile: "-",
+				Timeout: 5 * time.Second,
+			})
+			active := strings.TrimSpace(res.Stdout)
+			if active == "" {
+				active = "(systemctl unavailable)"
+			}
+			fmt.Printf("  Service is-active      : %s\n", active)
+
+			// Wayland socket check.
+			if uid != "" {
+				socket := "/run/user/" + uid + "/wayland-0"
+				if _, err := os.Stat(socket); err == nil {
+					fmt.Printf("  Wayland socket         : %s (present)\n", socket)
+				} else {
+					fmt.Printf("  Wayland socket         : %s (missing: %v)\n", socket, err)
+				}
+			}
+
+			// Quick journal tail for the unit.
 			fmt.Println()
-			fmt.Println("For HDR-side validation today, run scripts/validate-hdr-drm-state.py")
-			fmt.Println("(invoked by v2's validate_hdr_final_state).")
+			fmt.Println("Recent journal lines (last 20):")
+			jres := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"journalctl", "-u", phase.KWinUnitName, "-n", "20", "--no-pager"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			if jres.Err != nil {
+				fmt.Printf("  (journalctl unavailable: %v)\n", jres.Err)
+			} else {
+				fmt.Println(indent(jres.Stdout, "  "))
+			}
+			fmt.Println()
+			fmt.Println("Recovery hints:")
+			fmt.Println("  sudo clouddeployctl phase kwin-session     # re-render + restart")
+			fmt.Println("  sudo journalctl -u clouddeploy-kwin-wayland.service -e")
+			fmt.Println("  sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid> kscreen-doctor -o")
 			return nil
 		},
 	}
@@ -873,13 +940,21 @@ func newPhaseCmd() *cobra.Command {
 	p.AddCommand(newPhaseImplCmd("nvidia-driver", phase.NvidiaDriver{}))
 	p.AddCommand(newPhaseImplCmd("cuda", phase.Cuda{}))
 	p.AddCommand(newPhaseImplCmd("edid", phase.Edid{}))
+	// Milestone 4A: headless KDE/KWin Wayland substrate.
+	p.AddCommand(newPhaseImplCmd("headless-user", phase.HeadlessUser{}))
+	p.AddCommand(newPhaseImplCmd("desktop-packages", phase.DesktopPackages{}))
+	p.AddCommand(newPhaseImplCmd("desktop-runtime", phase.DesktopRuntime{}))
+	p.AddCommand(newPhaseImplCmd("kwin-session", phase.KWinSession{}))
+	p.AddCommand(newPhaseImplCmd("drm-display-validate", phase.DRMDisplayValidate{}))
+	// Still not implemented: the patched-KWin HDR build, Sunshine
+	// fork build, and Sunshine/Plasma systemd unit chain.
 	for _, name := range []string{"kwin-patch", "sunshine-build", "services"} {
 		n := name
 		p.AddCommand(&cobra.Command{
 			Use:   n,
 			Short: fmt.Sprintf("Run the %s phase (NOT IMPLEMENTED)", n),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fmt.Errorf("phase %s: NOT IMPLEMENTED in Milestone 3 partial. Use v2 CloudDeploy-wayland.sh for now", n)
+				return fmt.Errorf("phase %s: NOT IMPLEMENTED yet (Milestone 4B/5). The Milestone 4A desktop substrate (apt-health -> drm-display-validate) is real; KWin patch / Sunshine build / runtime services come next", n)
 			},
 		})
 	}

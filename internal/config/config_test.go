@@ -167,6 +167,41 @@ func TestHDRCudaCompatibleProfileSpec(t *testing.T) {
 	}
 }
 
+// TestEffectiveDesktop_AppliesDefaults documents the default
+// substitution: empty user -> "cloudgamer", empty groups -> the
+// canonical list, empty shell -> /bin/bash.
+func TestEffectiveDesktop_AppliesDefaults(t *testing.T) {
+	p := &Profile{}
+	got := p.EffectiveDesktop()
+	if got.User != DefaultDesktopUser {
+		t.Errorf("user: got %q want %q", got.User, DefaultDesktopUser)
+	}
+	if got.Shell != DefaultDesktopShell {
+		t.Errorf("shell: got %q want %q", got.Shell, DefaultDesktopShell)
+	}
+	if len(got.Groups) != len(DefaultDesktopGroups) {
+		t.Errorf("groups: got %v want %v", got.Groups, DefaultDesktopGroups)
+	}
+}
+
+func TestEffectiveDesktop_RespectsProfileOverrides(t *testing.T) {
+	p := &Profile{Desktop: DesktopConfig{
+		User:   "operator",
+		Shell:  "/usr/bin/fish",
+		Groups: []string{"video", "render"},
+	}}
+	got := p.EffectiveDesktop()
+	if got.User != "operator" {
+		t.Errorf("user: got %q want operator", got.User)
+	}
+	if got.Shell != "/usr/bin/fish" {
+		t.Errorf("shell: got %q want /usr/bin/fish", got.Shell)
+	}
+	if len(got.Groups) != 2 || got.Groups[0] != "video" || got.Groups[1] != "render" {
+		t.Errorf("groups: got %v want [video render]", got.Groups)
+	}
+}
+
 // TestHDRAutoProfileSpec exercises the OS-resolver-driven HDR profile.
 // ubuntu_version is intentionally empty; the resolver picks the OS.
 func TestHDRAutoProfileSpec(t *testing.T) {
@@ -464,6 +499,13 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 		{"bad ubuntu_min_version", func(p *Profile) {
 			p.Deploy.UbuntuMinVersion = "questing"
 		}, "ubuntu_min_version"},
+		{"unsafe desktop.user", func(p *Profile) {
+			p.Desktop.User = "../etc/passwd"
+		}, "desktop.user"},
+		{"unsafe desktop.groups entry", func(p *Profile) {
+			p.Desktop.User = "cloudgamer"
+			p.Desktop.Groups = []string{"video", "evil; rm -rf /"}
+		}, "desktop.groups"},
 	}
 	base := func() *Profile {
 		return &Profile{
