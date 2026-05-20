@@ -15,6 +15,11 @@ import (
 func kwinDeps(t *testing.T) *Deps {
 	t.Helper()
 	deps := newDeps(t, desktopProfile(), nil)
+	// kwin-session honors DryRun: it skips unit writes + synthesizes
+	// wayland_socket_ok=true. Tests want the real code paths, so
+	// flip DryRun off; SystemctlFn / WaylandSocketFn are stubbed
+	// so we still don't touch real systemctl.
+	deps.DryRun = false
 	// Seed headless_user state so kwin-session can read the UID.
 	deps.State.MarkDone(HeadlessUserName, map[string]any{
 		"user": "cloudgamer",
