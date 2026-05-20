@@ -242,6 +242,41 @@ func TestEffectiveDesktop_SessionBackendDefaultsRealvt(t *testing.T) {
 	}
 }
 
+func TestEffectiveKWin_DefaultsPatchedHDR(t *testing.T) {
+	t.Run("stock profile skips patch by default", func(t *testing.T) {
+		p := &Profile{}
+		got := p.EffectiveKWin()
+		if got.PatchedHDR {
+			t.Errorf("PatchedHDR default should be false")
+		}
+		if got.Patch != DefaultKWinPatchPath {
+			t.Errorf("Patch default: got %q want %q", got.Patch, DefaultKWinPatchPath)
+		}
+		if got.SourceMode != DefaultKWinSourceMode {
+			t.Errorf("SourceMode default: got %q want %q", got.SourceMode, DefaultKWinSourceMode)
+		}
+		if got.BuildDir != DefaultKWinBuildDir {
+			t.Errorf("BuildDir default: got %q want %q", got.BuildDir, DefaultKWinBuildDir)
+		}
+		if got.RequirePatchEnabled() {
+			t.Errorf("RequirePatch should follow PatchedHDR=false")
+		}
+	})
+	t.Run("hdr defaults fail closed", func(t *testing.T) {
+		p := &Profile{KWin: KWinConfig{PatchedHDR: true}}
+		got := p.EffectiveKWin()
+		if !got.RequirePatchEnabled() {
+			t.Errorf("RequirePatch should follow PatchedHDR=true")
+		}
+		if !got.ValidatePatch {
+			t.Errorf("ValidatePatch should default true for patched HDR")
+		}
+		if !got.HoldPackages {
+			t.Errorf("HoldPackages should default true for patched HDR")
+		}
+	})
+}
+
 // TestHDRAutoProfileSpec exercises the OS-resolver-driven HDR profile.
 // ubuntu_version is intentionally empty; the resolver picks the OS.
 func TestHDRAutoProfileSpec(t *testing.T) {
@@ -555,6 +590,12 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 		{"out-of-range desktop.kwin_vt", func(p *Profile) {
 			p.Desktop.KwinVT = 99
 		}, "kwin_vt"},
+		{"bad kwin.source_mode", func(p *Profile) {
+			p.KWin.SourceMode = "neon"
+		}, "kwin.source_mode"},
+		{"bad kwin.install_mode", func(p *Profile) {
+			p.KWin.InstallMode = "overwrite-system"
+		}, "kwin.install_mode"},
 	}
 	base := func() *Profile {
 		return &Profile{

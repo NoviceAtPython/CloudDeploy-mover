@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
@@ -173,11 +174,19 @@ func TestExecStartFor_PicksRightBinary(t *testing.T) {
 	}
 	for _, c := range cases {
 		_, choice := chooseUnit(c.backend, c.mode)
-		got := execStartFor(choice)
+		got := execStartFor(choice, "")
 		if !strings.Contains(got, c.mustHave) {
 			t.Errorf("execStartFor(%s/%s): got %q want substring %q",
 				c.backend, c.mode, got, c.mustHave)
 		}
+	}
+}
+
+func TestExecStartFor_KwinRuntimeOverride(t *testing.T) {
+	_, choice := chooseUnit("realvt", "kwin")
+	got := execStartFor(choice, "/opt/clouddeploy-kwin/bin/kwin_wayland")
+	if !strings.Contains(got, "/opt/clouddeploy-kwin/bin/kwin_wayland --drm --no-lockscreen") {
+		t.Fatalf("runtime override missing from ExecStart: %q", got)
 	}
 }
 
@@ -256,6 +265,47 @@ func TestKWinSession_HappyPath_RealVTPlasma(t *testing.T) {
 	}
 	if d["kwin_pid"] != 42 {
 		t.Errorf("kwin_pid: got %v want 42", d["kwin_pid"])
+	}
+}
+
+func TestKWinSession_InjectsPrivateHDREnvOnlyAfterKWinPatchDone(t *testing.T) {
+	deps := kwinDeps(t)
+	deps.Profile.KWin = config.KWinConfig{PatchedHDR: true}
+	unitPath := filepath.Join(t.TempDir(), "plasma-realvt.service")
+	ph := happyKwin(unitPath)
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run without kwin_patch done: %v", err)
+	}
+	body, err := os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	if strings.Contains(string(body), "KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1") {
+		t.Fatalf("private HDR env should not be injected until kwin_patch is done:\n%s", string(body))
+	}
+
+	deps = kwinDeps(t)
+	deps.Profile.KWin = config.KWinConfig{PatchedHDR: true}
+	deps.State.MarkDone(KWinPatchName, map[string]any{"patch_sha256": "abc"})
+	unitPath = filepath.Join(t.TempDir(), "plasma-realvt.service")
+	ph = happyKwin(unitPath)
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run with kwin_patch done: %v", err)
+	}
+	body, err = os.ReadFile(unitPath)
+	if err != nil {
+		t.Fatalf("read unit: %v", err)
+	}
+	for _, want := range []string{
+		"Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1",
+		"Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1",
+	} {
+		if !strings.Contains(string(body), want) {
+			t.Fatalf("private HDR env missing %q in:\n%s", want, string(body))
+		}
+	}
+	if deps.State.Get(KWinSessionName).Details["patched_hdr_env"] != true {
+		t.Fatalf("patched_hdr_env detail should be true: %#v", deps.State.Get(KWinSessionName).Details)
 	}
 }
 

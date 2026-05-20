@@ -59,7 +59,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `validate hdr-stream` | Stub. Milestone 4. |
 | `state show` | **Real**. |
 | `state reset --phase X` | **Real**. |
-| `apply` | **Partial (Milestone 4A landed).** Runs `apt-health → ubuntu-upgrade → base-packages → nvidia-driver → cuda → edid (opt-in) → headless-user → desktop-packages → desktop-runtime → kwin-session → drm-display-validate`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`, but if the host is on a v3-supported release AND `profile.deploy.auto_upgrade_ubuntu=true` AND the profile targets a different supported version, defers the exact-match gate to the ubuntu-upgrade phase. |
+| `apply` | **Partial (Milestone 4A/4B landed).** Runs `apt-health → ubuntu-upgrade → base-packages → nvidia-driver → cuda → edid (opt-in) → headless-user → desktop-packages → desktop-runtime → kwin-patch → kwin-session → drm-display-validate`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`, but if the host is on a v3-supported release AND `profile.deploy.auto_upgrade_ubuntu=true` AND the profile targets a different supported version, defers the exact-match gate to the ubuntu-upgrade phase. |
 | `phase ubuntu-upgrade` | **Real (this commit).** v3 port of v2's `maybe_upgrade_ubuntu` + `direct_apt_codename_upgrade`. 24.04 → 25.10 path works; anti-reboot-loop guard via `state.Details["pre_version"]`. do-release-upgrade path is stubbed with a clear error (set `deploy.direct_apt_codename_upgrade=force` to skip it). |
 | `resume` | **Real**. Reads state, clears RebootNeeded, rewrites stale `running` phases to `pending` after acquiring the process lock, replays implemented phases, and disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
@@ -68,14 +68,16 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `phase headless-user` | **Real (Milestone 4A).** Creates / verifies the deploy account (default `cloudgamer`), ensures supplementary groups (`video`, `render`, `input`, `audio`, `systemd-journal` by default), runs `loginctl enable-linger` so `/run/user/<uid>` persists, and best-effort chowns the home dir. State.Details: `user`, `uid`, `gid`, `home`, `shell`, `groups`, `linger_enabled`, `created_or_existing`. |
 | `phase desktop-packages` | **Real (Milestone 4A).** apt-installs the minimum Wayland/KDE/PipeWire stack via apt.Transaction: `kwin-wayland`, `plasma-workspace`, `plasma-desktop`, `kscreen`, `dbus-user-session`, `xdg-desktop-portal[-kde]`, `pipewire[-pulse]`, `wireplumber`, `qt6-wayland`, `wayland-utils`, `vulkan-tools`, `mesa-utils`, `drm-info`. |
 | `phase desktop-runtime` | **Real (Milestone 4A).** Verifies preconditions: `/dev/dri/card*` + `/dev/dri/renderD*` exist; `/sys/module/nvidia_drm/parameters/modeset == "Y"`; `/proc/cmdline` contains `nvidia-drm.modeset=1`, `nvidia-drm.fbdev=1`, `video=<connector>:e`, and `drm.edid_firmware=<connector>:edid/<file>`; the headless user is in BOTH `video` and `render`. Any failure -> fatal before kwin-session. State.Details: `dri_cards`, `render_nodes`, `nvidia_drm_modeset`, `cmdline`, `cmdline_missing`, `cmdline_ok`, `user_groups_now`, `user_device_access_ok`. |
-| `phase kwin-session` | **Real (Milestone 4A).** Renders + installs `/etc/systemd/system/clouddeploy-kwin-wayland.service` (template under `phase.RenderUnitText`), `systemctl daemon-reload + enable + start`, then polls `/run/user/<uid>/wayland-0` for up to 30s. The unit runs `dbus-run-session -- kwin_wayland --drm --no-lockscreen` as the headless user with `XDG_RUNTIME_DIR=/run/user/<uid>` + `WAYLAND_DISPLAY=wayland-0` + `GBM_BACKEND=nvidia-drm` + `KWIN_DRM_USE_EGL_STREAMS=0`. State.Details: `user`, `uid`, `unit_path`, `systemctl_enabled`, `systemctl_started`, `wayland_socket_path`, `wayland_socket_ok`. |
+| `phase kwin-patch` | **Real (Milestone 4B).** If `kwin.patched_hdr=false`, marks skipped. If enabled, validates `patches/kwin-clouddeploy-nvidia-private-hdr.patch` against the active Ubuntu `kwin` source, builds patched KWin binary packages with `dpkg-buildpackage`, installs/holds them, and writes `/var/lib/clouddeploy/kwin-patch.json` with patch/source/install metadata. Fails closed for HDR profiles unless `allow_packaged_fallback=true` and `require_patch=false`. |
+| `phase kwin-session` | **Real (Milestone 4A/4B).** Renders + installs the selected real-VT KWin/Plasma service, `systemctl daemon-reload + enable + start`, waits for `/run/user/<uid>/wayland-0` to appear and remain stable, requires `systemctl is-active` + MainPID, and scans recent journal lines for KWin DRM/logind fatal signatures. When `kwin.patched_hdr=true` and `kwin_patch` is done, injects `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1` and `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1` into the service environment. |
 | `phase drm-display-validate` | **Real (Milestone 4A).** Runs `kscreen-doctor -o` as the headless user with the right Wayland/XDG/D-Bus env. Parses the output, asserts the profile's forced connector exists + is enabled + advertises the configured mode (`<W>x<H>@<refresh>`). Fails fatal otherwise. HDR-side validation is recorded if visible but does NOT hard-fail (Milestone 4B). State.Details: `connector`, `enabled`, `selected_mode`, `expected_mode`, `modes`, `wayland_socket_ok`, `kscreen_doctor_ok`. |
-| `doctor kwin` | **Real (Milestone 4A).** Reports unit path + install state, `systemctl is-active`, `/run/user/<uid>/wayland-0` presence, and a 20-line `journalctl -u clouddeploy-kwin-wayland.service` tail. |
+| `doctor kwin` | **Real (Milestone 4A).** Reports selected compositor backend, service name/path, systemd state, `/run/user/<uid>` and socket state, loginctl/user groups, DRI nodes, journal tail, and recovery commands. |
+| `doctor kwin-patch` | **Real (Milestone 4B).** Reports patched-HDR profile settings, patch path/hash, marker metadata, installed packages, held packages, fallback reason, and the next command to rerun validation/build. |
 | `phase apt-health` | **Real.** Runs FIRST in the apply chain. (1) preserves emergency sudo by writing `/etc/sudoers.d/90-clouddeploy-<SUDO_USER>` (validated with `visudo -cf`, installed via temp+atomic rename, mode 0440) so a clobbered `/etc/sudoers` mid-upgrade does not lock the operator out; (2) runs `dpkg --audit`, and on the `/var/lib/dpkg/updates/<N>` parse-error signature quarantines the journal files into `/var/lib/clouddeploy/backups/dpkg-updates-<ts>/` before running `dpkg --configure -a` + `apt-get -f install`; (3) detects mid-upgrade state (host VERSION_ID disagrees with the codename in `ubuntu.sources`) and records `mid_upgrade: true` + a `mid_upgrade_reason` in state.Details. Any unrecoverable repair failure fails the phase **before** ubuntu-upgrade touches sources. |
 | `phase ubuntu-upgrade` | **Real, resume-friendly, target-resolver-aware.** Records a `stage` marker (`started → third-party-sources-disabled → sources-rewritten → dist-upgrade-started → dist-upgrade-complete → reboot-required`). Anti-loop guard fires only when stage indicates the previous run completed dist-upgrade AND `current==pre_version`. `rewriteAptCodename` is idempotent. Before mutating sources the phase stops `apt-daily.timer`, `apt-daily-upgrade.timer`, `unattended-upgrades.service` and waits up to 3 minutes for dpkg/apt locks. **New (this commit):** OS target resolver. When `deploy.ubuntu_candidates` is non-empty, the phase walks the candidate list newest-first via `ubuntu.ResolveOSTarget(...)` and records `ubuntu_selection_policy`, `ubuntu_candidates_configured`, `ubuntu_candidates_tried`, `selected_ubuntu_version`, `selected_ubuntu_codename`, `rejected_ubuntu_candidates`, `prefer_lts` in state.Details. The resolver gates on known-codename + v3-supported list + non-LTS knob + an optional `OSPackageProbeFn`. Policies: `latest-compatible` (default), `exact`, `min-version`, `any`. |
 | `doctor lock` | **Real (this commit).** Read-only probe of `/var/lib/clouddeploy/state.lock`: reports the holder PID, whether it's still alive, and recovery instructions for stale locks. Use after a "lock is held by another clouddeployctl process" error. |
 | `phase edid` | **Real (opt-in).** Invokes `helpers/write-edids.py`, writes `/lib/firmware/edid/<name>.bin`, drops a `/etc/default/grub.d/99-clouddeploy.cfg`, runs `update-initramfs -u` + `update-grub`, sets `RebootNeeded`. Only runs when `display.forced_connector` is set in the profile. |
-| `phase kwin-patch` | Stub. Milestone 4. |
+| `phase kwin-patch` | **Real.** Patch validation + source package build/install + marker/idempotency. |
 | `phase sunshine-build` | Stub. Milestone 4. |
 | `phase services` | Stub. Milestone 4. |
 | `collect-logs` | **Real**. Bundles `/var/log/clouddeploy/`, `state.json`, `systemctl status` of relevant units, `journalctl` snippets, `dmesg` NVIDIA lines, `dpkg.log` / `apt/history.log` tails into `/tmp/clouddeploy-logs-<ts>.tar.gz`. Secret redaction applies to env. |
@@ -90,12 +92,12 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `internal/nvidia` | **Real**. Selector + classification + dirty-state cleanup planner + post-install validators. |
 | `internal/cuda` | **Real**. Policy + RetryDecider + package-candidate discovery. |
 | `internal/config` | **Real**. Profile + GPU + validation. |
-| `internal/phase` | **Real for base-packages / nvidia-driver / cuda / edid.** |
+| `internal/phase` | **Real for base-packages / nvidia-driver / cuda / edid / headless-user / desktop-packages / desktop-runtime / kwin-patch / kwin-session / drm-display-validate.** |
 | `internal/reboot` | **Real (minimal).** Continuation systemd unit + Install/Schedule/Disable. |
 | `internal/ubuntu` | **Real.** `/etc/os-release` reader + supported-version gate. |
 | `internal/edid` | **Real (helper-script wrapper).** Calls `helpers/write-edids.py` + drops EDID + edits grub. |
 | `internal/gpu` | Stub. Milestone 4. |
-| `internal/kwin` | Stub. Milestone 4. |
+| `internal/kwin` | **Real marker/hash helper.** The build/install orchestration lives in `internal/phase/kwin_patch.go`. |
 | `internal/sunshine` | Stub. Milestone 4. |
 | `internal/systemd` | Stub. Milestone 4 (runtime services beyond the continuation unit). |
 | `internal/validate` | Stub. Milestone 4. |
@@ -109,7 +111,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `nvidia_driver` | **v3 real** | Reboot-aware. |
 | `cuda` | **v3 real** | mode=none default. |
 | `edid` | **v3 real (opt-in)** | Reboot-aware. |
-| `kwin_patch` | Milestone 4 | Apt-pin patched KWin + build + install + marker file. |
+| `kwin_patch` | **v3 real** | Validates patch, builds/install patched KWin source packages, holds installed packages, writes marker. |
 | `sunshine_build` | Milestone 4 | Pin commit `464bccf1`, dual-install, setcap, config. |
 | `sunshine_config` | Milestone 4 | sunshine.conf without invalid keys + CSRF allowlist. |
 | `systemd_units` | Milestone 4 | kwin-realvt + plasma-shell-realvt + sunshine-headless (with `SUNSHINE_FORCE_AV1_HDR10=1` + `SUNSHINE_SYNTHESIZE_HDR10_METADATA=1`). |
@@ -127,9 +129,9 @@ In rough order of how the deploy hits them:
    now generates the binary and updates GRUB; combined with the
    continuation service the operator no longer has to babysit the
    reboot. Validated for the `hdr-4k120` profile only.
-2. **KWin patched build is missing.** Without it, KScreen does not
-   report `HDR: enabled` + `Wide Color Gamut: enabled`, and the
-   NVIDIA private DRM properties are never set. **Highest-impact
+2. **Sunshine build/service chain is missing.** The patched-KWin phase can
+   now install the private HDR path, but v3 still does not build/run the
+   pinned Sunshine fork or wire the final runtime services. **Highest-impact
    missing piece**.
 3. **Sunshine fork build is missing.** Without the pinned
    `464bccf1` build, the HDR control packet synthesis fix is not in
@@ -154,7 +156,7 @@ In rough order of how the deploy hits them:
 | `0` | All implemented phases done; no reboot pending. (Not "full deploy" — see the partial-apply banner.) |
 | `1` | Real failure. Apply aborted; state records `failed_fatal` / `LastError` for the failing phase. |
 | `2` | Reboot scheduled or required. State has `RebootNeeded=true` and `ResumeTarget=<phase>`. Continuation service is enabled. With `--auto-reboot` / `profile.deploy.auto_reboot: true`, `systemctl reboot` has been invoked. |
-| `10` | Partial-apply banner printed: implemented phases completed cleanly, but KWin/Sunshine/services/HDR-validation phases are not yet implemented. The deploy is intentionally incomplete. |
+| `10` | Partial-apply banner printed: implemented phases completed cleanly, but Sunshine/services/HDR-validation phases are not yet implemented. The deploy is intentionally incomplete. |
 | `64` | Refused to run: unsupported Ubuntu version (use `--allow-unsupported` to override). |
 
 `bootstrap.sh` reads the exit code and prints a one-line summary so

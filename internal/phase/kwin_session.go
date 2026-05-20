@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	kwinpkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/kwin"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
+	statepkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
 // KWinSessionName is the canonical state-key.
@@ -154,6 +156,7 @@ Environment=KWIN_USE_OVERLAYS=0
 Environment=GBM_BACKEND=nvidia-drm
 Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+{{ .PrivateHDREnv }}
 
 # Make sure /run/user/<uid> + linger are ready before we launch.
 # The leading dash swallows non-fatal failures (the unit doesn't own
@@ -202,6 +205,7 @@ Environment=KWIN_DRM_USE_EGL_STREAMS=0
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 Environment=GBM_BACKEND=nvidia-drm
 Environment=MOZ_ENABLE_WAYLAND=1
+{{ .PrivateHDREnv }}
 
 ExecStartPre=/bin/mkdir -p /run/user/{{ .UID }}
 ExecStartPre=/bin/chown {{ .User }}:{{ .User }} /run/user/{{ .UID }}
@@ -377,6 +381,7 @@ type templateInputs struct {
 	CompositorMode string
 	KwinDRMDevice  string
 	ExecStart      string
+	PrivateHDREnv  string
 	Connector      string
 	Resolution     string
 	Refresh        int
@@ -392,6 +397,7 @@ func (in templateInputs) apply(tpl string) string {
 	out = strings.ReplaceAll(out, "{{ .CompositorMode }}", in.CompositorMode)
 	out = strings.ReplaceAll(out, "{{ .KwinDRMDevice }}", in.KwinDRMDevice)
 	out = strings.ReplaceAll(out, "{{ .ExecStart }}", in.ExecStart)
+	out = strings.ReplaceAll(out, "{{ .PrivateHDREnv }}", in.PrivateHDREnv)
 	out = strings.ReplaceAll(out, "{{ .Connector }}", in.Connector)
 	out = strings.ReplaceAll(out, "{{ .Resolution }}", in.Resolution)
 	out = strings.ReplaceAll(out, "{{ .Refresh }}", fmt.Sprintf("%d", in.Refresh))
@@ -431,7 +437,10 @@ func UnitNameForSession(backend, compositorMode string) string {
 }
 
 // execStartFor returns the ExecStart command for a given choice.
-func execStartFor(choice kwinUnitChoice) string {
+func execStartFor(choice kwinUnitChoice, runtimeBin string) string {
+	if strings.TrimSpace(runtimeBin) == "" {
+		runtimeBin = "/usr/bin/kwin_wayland"
+	}
 	switch {
 	case choice.IsWeston:
 		return "/usr/bin/weston --backend=drm-backend.so"
@@ -445,9 +454,9 @@ func execStartFor(choice kwinUnitChoice) string {
 	}
 	// kwin-only paths.
 	if choice.IsRealVT {
-		return "/usr/bin/kwin_wayland --drm --no-lockscreen"
+		return runtimeBin + " --drm --no-lockscreen"
 	}
-	return "/usr/bin/dbus-run-session -- /usr/bin/kwin_wayland --drm --no-lockscreen"
+	return "/usr/bin/dbus-run-session -- " + runtimeBin + " --drm --no-lockscreen"
 }
 
 // RenderUnitText is exported so tests + doctor kwin can show the
@@ -512,6 +521,30 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	tplBody, choice := chooseUnit(desk.SessionBackend, desk.CompositorMode)
 	details["service_name"] = choice.UnitName
 	details["binary"] = choice.BinaryDesc
+	kwinCfg := deps.Profile.EffectiveKWin()
+	runtimeBin := strings.TrimSpace(kwinCfg.RuntimeBin)
+	kwinPatchDone := false
+	if ph := deps.State.Phases[KWinPatchName]; ph != nil && ph.Status == statepkg.StatusDone {
+		kwinPatchDone = true
+		if runtimeBin == "" {
+			if marker, err := kwinpkg.ReadMarker(kwinpkg.DefaultMarkerPath); err == nil {
+				runtimeBin = strings.TrimSpace(marker.RuntimeBin)
+			}
+		}
+	}
+	privateHDREnv := ""
+	if kwinCfg.PatchedHDR && kwinPatchDone {
+		privateHDREnv = strings.Join([]string{
+			"Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1",
+			"Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1",
+		}, "\n")
+	}
+	details["patched_hdr_requested"] = kwinCfg.PatchedHDR
+	details["kwin_patch_done"] = kwinPatchDone
+	details["patched_hdr_env"] = privateHDREnv != ""
+	if runtimeBin != "" {
+		details["runtime_bin"] = runtimeBin
+	}
 
 	in := templateInputs{
 		User:           desk.User,
@@ -521,7 +554,8 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		Description:    choice.BannerName,
 		CompositorMode: desk.CompositorMode,
 		KwinDRMDevice:  desk.KwinDRMDevice,
-		ExecStart:      execStartFor(choice),
+		ExecStart:      execStartFor(choice, runtimeBin),
+		PrivateHDREnv:  privateHDREnv,
 		Connector:      connector,
 		Resolution:     resolution,
 		Refresh:        refresh,

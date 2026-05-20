@@ -136,7 +136,7 @@ phase nvidia-driver    # implemented
 phase cuda             # implemented
 phase edid             # implemented
                        # ↓ remaining P1 phases not yet ported
-phase kwin-patch       # NOT IMPLEMENTED
+phase kwin-patch       # implemented
 phase sunshine-build   # NOT IMPLEMENTED
 phase services         # NOT IMPLEMENTED
 phase validate         # NOT IMPLEMENTED
@@ -154,7 +154,8 @@ v3 cannot claim parity until:
 4. v2 stays untouched and remains a 1-line fallback for the cases
    v3 hasn't covered yet.
 
-This commit closes the **ubuntu-upgrade** row. The remaining P0
-gaps (headless user, cloud-init wait, snapd / libblockdev / corrupt-
-updates dpkg branches) and every P1 row remain open. See
+This commit closes the **kwin-patch** row: v3 can now validate,
+build/install, hold, and marker the CloudDeploy private-HDR KWin patch
+before launching the real-VT session. Sunshine build, runtime services,
+PipeWire/Tailscale, and HDR/stream validation remain open. See
 [V3-ROADMAP.md](V3-ROADMAP.md) for the milestone-by-milestone plan.

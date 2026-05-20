@@ -3,10 +3,10 @@
 // State at Milestone 4 (in progress): doctor (apt/nvidia/cuda/system) is
 // real and read-only; apply / resume / phase ubuntu-upgrade /
 // base-packages / nvidia-driver / cuda / edid are real and implemented.
-// The reboot continuation service is implemented. (KWin / Sunshine /
-// KWin/Plasma/Sunshine systemd units / Tailscale / PipeWire / HDR
-// validators are NOT yet implemented; apply exits after the implemented
-// phases with a clear partial-apply banner.)
+// The reboot continuation service is implemented. KWin real-VT and the
+// patched-KWin build/install phase are implemented; Sunshine / Tailscale /
+// PipeWire / HDR stream validators are NOT yet implemented, so apply exits
+// after the implemented phases with a clear partial-apply banner.
 //
 // See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability audit,
 // docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -28,6 +29,7 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
+	kwinpkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/kwin"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/nvidia"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/phase"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/reboot"
@@ -88,7 +90,8 @@ docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 Milestone 4 (in progress):
   doctor apt | nvidia | cuda | system                  read-only checks
   phase ubuntu-upgrade | base-packages |
-        nvidia-driver | cuda | edid                    implemented
+        nvidia-driver | cuda | edid |
+        kwin-patch                                      implemented
   apply                                                runs the implemented
                                                        phases above (in
                                                        that order) then
@@ -97,7 +100,7 @@ Milestone 4 (in progress):
                                                        banner
   resume                                               continues after
                                                        a reboot
-  phase kwin-patch | sunshine-build | services         NOT implemented;
+  phase sunshine-build | services                       NOT implemented;
                                                        use the v2
                                                        CloudDeploy-
                                                        wayland.sh entry
@@ -283,11 +286,10 @@ const partialApplyBanner = `
 
   Implemented:   apt-health, ubuntu-upgrade, base-packages, nvidia-driver,
                  cuda, edid, headless-user, desktop-packages, desktop-runtime,
-                 kwin-session, drm-display-validate
-  NOT yet:       cloud-init wait, patched-KWin NVIDIA private HDR build,
-                 Sunshine fork build, Tailscale install, PipeWire
-                 virtual sink, full Sunshine/Plasma systemd unit chain,
-                 HDR DRM validation, HDR stream validation
+                 kwin-patch, kwin-session, drm-display-validate
+  NOT yet:       Sunshine fork build, Tailscale install, PipeWire virtual sink,
+                 full Sunshine/Plasma systemd unit chain, HDR DRM validation,
+                 HDR stream validation
 
   Note: ubuntu-upgrade or the EDID/GRUB phase may write changes that
         request a reboot. apply will install the continuation service
@@ -420,23 +422,7 @@ in the active profile. When false, the operator must manually run
 //  5. cuda: only if profile.cuda.mode != none.
 //  6. edid: stamps a kernel cmdline edid override if the profile asks.
 func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) error {
-	phases := []phase.Phase{
-		phase.AptHealth{},
-		phase.UbuntuUpgrade{},
-		phase.BasePackages{},
-		phase.NvidiaDriver{},
-		phase.Cuda{},
-		phase.Edid{},
-		// Milestone 4A: headless KDE/KWin Wayland substrate. These
-		// five phases run after the kernel-cmdline reboot from edid
-		// so /proc/cmdline already has nvidia-drm.modeset=1 +
-		// drm.edid_firmware=DP-1:edid/<file>.
-		phase.HeadlessUser{},
-		phase.DesktopPackages{},
-		phase.DesktopRuntime{},
-		phase.KWinSession{},
-		phase.DRMDisplayValidate{},
-	}
+	phases := applyPhases()
 
 	// Live-VM regression fix: previously we disabled the continuation
 	// systemd unit at the START of resume. That unit was the very
@@ -471,6 +457,27 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 	}
 	fmt.Print(partialApplyBanner)
 	return nil
+}
+
+func applyPhases() []phase.Phase {
+	return []phase.Phase{
+		phase.AptHealth{},
+		phase.UbuntuUpgrade{},
+		phase.BasePackages{},
+		phase.NvidiaDriver{},
+		phase.Cuda{},
+		phase.Edid{},
+		// Milestone 4A/4B: headless KDE/KWin Wayland substrate. These
+		// phases run after the kernel-cmdline reboot from edid so
+		// /proc/cmdline already has nvidia-drm.modeset=1 +
+		// drm.edid_firmware=DP-1:edid/<file>.
+		phase.HeadlessUser{},
+		phase.DesktopPackages{},
+		phase.DesktopRuntime{},
+		phase.KWinPatch{},
+		phase.KWinSession{},
+		phase.DRMDisplayValidate{},
+	}
 }
 
 // disableContinuationIfPresent removes /etc/systemd/system/clouddeploy-
@@ -543,6 +550,7 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorCudaCmd())
 	doctor.AddCommand(newDoctorSystemCmd())
 	doctor.AddCommand(newDoctorKwinCmd())
+	doctor.AddCommand(newDoctorKwinPatchCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
 	doctor.AddCommand(newDoctorLockCmd())
 	return doctor
@@ -982,6 +990,105 @@ func newDoctorKwinCmd() *cobra.Command {
 	}
 }
 
+func newDoctorKwinPatchCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "kwin-patch",
+		Short: "Report patched KWin private-HDR build/install state",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			cfg := (&config.Profile{}).EffectiveKWin()
+			profile := ""
+			if deps.Profile != nil {
+				cfg = deps.Profile.EffectiveKWin()
+				profile = deps.Profile.Profile
+			}
+			patchPath := cfg.Patch
+			if !filepath.IsAbs(patchPath) {
+				if _, err := os.Stat(patchPath); err != nil {
+					patchPath = filepath.Join("/opt/clouddeploy-mover", cfg.Patch)
+				}
+			}
+			fmt.Println("doctor kwin-patch:")
+			fmt.Printf("  Profile                : %s\n", evOrUnknown(profile))
+			fmt.Printf("  patched_hdr            : %v\n", cfg.PatchedHDR)
+			fmt.Printf("  source_mode            : %s\n", cfg.SourceMode)
+			fmt.Printf("  install_mode           : %s\n", cfg.InstallMode)
+			fmt.Printf("  require_patch          : %v\n", cfg.RequirePatchEnabled())
+			fmt.Printf("  allow_packaged_fallback: %v\n", cfg.AllowPackagedFallback)
+			fmt.Printf("  patch path             : %s\n", patchPath)
+			if _, err := os.Stat(patchPath); err == nil {
+				fmt.Println("  patch exists           : yes")
+				if sum, herr := kwinpkg.HashFile(patchPath); herr == nil {
+					fmt.Printf("  patch sha256           : %s\n", sum)
+				}
+			} else {
+				fmt.Printf("  patch exists           : no (%v)\n", err)
+			}
+
+			marker, merr := kwinpkg.ReadMarker(kwinpkg.DefaultMarkerPath)
+			if merr != nil {
+				fmt.Printf("  marker                 : missing (%v)\n", merr)
+			} else {
+				fmt.Printf("  marker                 : %s\n", kwinpkg.DefaultMarkerPath)
+				fmt.Printf("  marker patch sha256    : %s\n", marker.PatchSHA256)
+				fmt.Printf("  marker source version  : %s\n", evOrUnknown(marker.KWinSourceVersion))
+				fmt.Printf("  marker install mode    : %s\n", marker.InstallMode)
+				fmt.Printf("  marker runtime bin     : %s\n", evOrUnknown(marker.RuntimeBin))
+				fmt.Printf("  installed packages     : %v\n", marker.InstalledPackages)
+				if marker.FallbackReason != "" {
+					fmt.Printf("  fallback reason        : %s\n", marker.FallbackReason)
+				}
+				holds := deps.Runner.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"apt-mark", "showhold"},
+					LogFile: "-",
+					Timeout: 10 * time.Second,
+				})
+				if holds.Err == nil {
+					fmt.Printf("  apt holds              : %v\n", heldPackages(marker.InstalledPackages, holds.Stdout))
+				}
+			}
+			if ph := deps.State.Get(phase.KWinPatchName); ph != nil {
+				fmt.Printf("  state status           : %s\n", ph.Status)
+				if ph.Reason != "" {
+					fmt.Printf("  state reason           : %s\n", ph.Reason)
+				}
+				if ph.Details != nil {
+					if fallback, ok := ph.Details["fallback_reason"].(string); ok && fallback != "" {
+						fmt.Printf("  state fallback reason  : %s\n", fallback)
+					}
+				}
+			}
+			fmt.Println()
+			fmt.Println("Recommended next command:")
+			fmt.Println("  sudo clouddeployctl phase kwin-patch")
+			return nil
+		},
+	}
+}
+
+func heldPackages(installed []string, holdOutput string) []string {
+	want := map[string]bool{}
+	for _, pkg := range installed {
+		pkg = strings.TrimSpace(pkg)
+		if pkg != "" {
+			want[pkg] = true
+		}
+	}
+	var out []string
+	for _, line := range strings.Split(holdOutput, "\n") {
+		pkg := strings.TrimSpace(line)
+		if want[pkg] {
+			out = append(out, pkg)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
 func newDoctorSunshineCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "sunshine",
@@ -1033,17 +1140,18 @@ func newPhaseCmd() *cobra.Command {
 	p.AddCommand(newPhaseImplCmd("headless-user", phase.HeadlessUser{}))
 	p.AddCommand(newPhaseImplCmd("desktop-packages", phase.DesktopPackages{}))
 	p.AddCommand(newPhaseImplCmd("desktop-runtime", phase.DesktopRuntime{}))
+	p.AddCommand(newPhaseImplCmd("kwin-patch", phase.KWinPatch{}))
 	p.AddCommand(newPhaseImplCmd("kwin-session", phase.KWinSession{}))
 	p.AddCommand(newPhaseImplCmd("drm-display-validate", phase.DRMDisplayValidate{}))
-	// Still not implemented: the patched-KWin HDR build, Sunshine
-	// fork build, and Sunshine/Plasma systemd unit chain.
-	for _, name := range []string{"kwin-patch", "sunshine-build", "services"} {
+	// Still not implemented: Sunshine fork build and the
+	// Sunshine/Plasma systemd unit chain.
+	for _, name := range []string{"sunshine-build", "services"} {
 		n := name
 		p.AddCommand(&cobra.Command{
 			Use:   n,
 			Short: fmt.Sprintf("Run the %s phase (NOT IMPLEMENTED)", n),
 			RunE: func(cmd *cobra.Command, args []string) error {
-				return fmt.Errorf("phase %s: NOT IMPLEMENTED yet (Milestone 4B/5). The Milestone 4A desktop substrate (apt-health -> drm-display-validate) is real; KWin patch / Sunshine build / runtime services come next", n)
+				return fmt.Errorf("phase %s: NOT IMPLEMENTED yet (Milestone 4B/5). The desktop substrate and KWin patch phase (apt-health -> drm-display-validate) are real; Sunshine build / runtime services come next", n)
 			},
 		})
 	}

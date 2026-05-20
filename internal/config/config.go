@@ -275,8 +275,63 @@ type SunshineConfig struct {
 
 // KWinConfig governs patched-KWin install + private HDR.
 type KWinConfig struct {
-	PatchedHDR bool   `yaml:"patched_hdr"`
-	Patch      string `yaml:"patch"`
+	PatchedHDR            bool   `yaml:"patched_hdr"`
+	Patch                 string `yaml:"patch"`
+	SourceMode            string `yaml:"source_mode"`
+	BuildDir              string `yaml:"build_dir"`
+	InstallMode           string `yaml:"install_mode"`
+	RuntimeBin            string `yaml:"runtime_bin"`
+	RequirePatch          *bool  `yaml:"require_patch"`
+	AllowPackagedFallback bool   `yaml:"allow_packaged_fallback"`
+	ValidatePatch         bool   `yaml:"validate_patch"`
+	HoldPackages          bool   `yaml:"hold_packages"`
+}
+
+const DefaultKWinPatchPath = "patches/kwin-clouddeploy-nvidia-private-hdr.patch"
+const DefaultKWinSourceMode = "auto"
+const DefaultKWinBuildDir = "/opt/clouddeploy-kwin-src"
+const DefaultKWinInstallMode = "packages"
+
+// EffectiveKWin applies the documented KWin defaults. Missing
+// require_patch follows patched_hdr; HDR profiles therefore fail
+// closed unless they explicitly opt into packaged fallback.
+func (p *Profile) EffectiveKWin() KWinConfig {
+	out := KWinConfig{}
+	if p != nil {
+		out = p.KWin
+	}
+	if strings.TrimSpace(out.Patch) == "" {
+		out.Patch = DefaultKWinPatchPath
+	}
+	if strings.TrimSpace(out.SourceMode) == "" {
+		out.SourceMode = DefaultKWinSourceMode
+	}
+	if strings.TrimSpace(out.BuildDir) == "" {
+		out.BuildDir = DefaultKWinBuildDir
+	}
+	if strings.TrimSpace(out.InstallMode) == "" {
+		out.InstallMode = DefaultKWinInstallMode
+	}
+	if out.RequirePatch == nil {
+		v := out.PatchedHDR
+		out.RequirePatch = &v
+	}
+	// Validate by default when patched HDR is requested. Stock SDR
+	// profiles skip the phase before this matters.
+	if out.PatchedHDR && !out.ValidatePatch {
+		out.ValidatePatch = true
+	}
+	if out.PatchedHDR && !out.HoldPackages {
+		out.HoldPackages = true
+	}
+	return out
+}
+
+func (k KWinConfig) RequirePatchEnabled() bool {
+	if k.RequirePatch == nil {
+		return k.PatchedHDR
+	}
+	return *k.RequirePatch
 }
 
 // DesktopConfig governs the headless KDE/KWin Wayland substrate
@@ -300,6 +355,7 @@ type KWinConfig struct {
 //	               add "kvm" for nested-virt workloads.
 //	shell          login shell. Default /bin/bash. Honored only when
 //	               headless_user actually creates the user.
+//
 // DesktopConfig is the operator-facing knob set. EnableLinger is a
 // pointer so the YAML parser can distinguish "not set" (nil ->
 // default-true) from "explicitly false". Live VM regressions
@@ -593,6 +649,18 @@ func ValidateProfile(p *Profile) error {
 	}
 	if p.Desktop.KwinVT < 0 || p.Desktop.KwinVT > 63 {
 		return fmt.Errorf("config: profile %q: desktop.kwin_vt must be 0-63, got %d", p.Profile, p.Desktop.KwinVT)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.KWin.SourceMode)) {
+	case "", "auto", "packaged", "source-patch":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: kwin.source_mode must be one of auto/packaged/source-patch, got %q", p.Profile, p.KWin.SourceMode)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.KWin.InstallMode)) {
+	case "", "packages", "prefix":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: kwin.install_mode must be one of packages/prefix, got %q", p.Profile, p.KWin.InstallMode)
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
 	case "fork", "deb":

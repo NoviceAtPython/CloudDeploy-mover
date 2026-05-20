@@ -101,8 +101,8 @@ the harder ones.
 - [ ] `clouddeployctl apply` runs v3-implemented phases (base
       packages with policy-rc.d guard, NVIDIA family selection +
       install, CUDA mode policy).
-- [ ] For phases v3 has not yet ported (KWin patch, Sunshine build,
-      EDID, services, validation), `apply` shells out to
+- [ ] For phases v3 has not yet ported (Sunshine build,
+      services, validation), `apply` shells out to
       `CloudDeploy-wayland.sh` via the existing env-file flow,
       recording per-phase status in `state.json`.
 - [ ] `internal/reboot` owns the continuation systemd unit + the
@@ -124,8 +124,9 @@ flag.
       `cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep`, generate
       `sunshine.conf` with the right CSRF allowlist, generate
       `sunshine-headless.service` with the HDR env vars.
-- [ ] `internal/kwin` — apt-pin patched KWin, apply the patch, build,
-      install, marker file.
+- [x] `internal/kwin` / `phase kwin-patch` — validate the configured
+      patch, build/install patched KWin source packages, hold the
+      installed packages, and write the marker file.
 - [ ] `internal/edid` — generate forced-mode EDID, write under
       `/lib/firmware/edid/`, wire into kernel cmdline.
 - [ ] `internal/systemd` — render templates under
