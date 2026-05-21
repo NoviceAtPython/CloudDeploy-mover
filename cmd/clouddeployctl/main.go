@@ -29,6 +29,7 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/discovery"
 	kwinpkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/kwin"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/nvidia"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/phase"
@@ -91,7 +92,8 @@ docs/V3-ROADMAP.md for milestone status, and
 docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
 Milestone 5 (in progress):
-  doctor apt | nvidia | cuda | system | kwin | lock     read-only checks
+  doctor apt | nvidia | cuda | system | kwin |
+         kwin-patch | sunshine | tools | network | lock read-only checks
   phase apt-health | ubuntu-upgrade | base-packages |
         nvidia-driver | cuda | edid |
         headless-user | desktop-packages |
@@ -605,6 +607,8 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorKwinCmd())
 	doctor.AddCommand(newDoctorKwinPatchCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
+	doctor.AddCommand(newDoctorToolsCmd())
+	doctor.AddCommand(newDoctorNetworkCmd())
 	doctor.AddCommand(newDoctorLockCmd())
 	return doctor
 }
@@ -1170,11 +1174,21 @@ func newDoctorSunshineCmd() *cobra.Command {
 			fmt.Printf("  fork commit            : %s\n", evOrUnknown(cfg.ForkCommit))
 			fmt.Printf("  build dir              : %s\n", cfg.BuildDir)
 			fmt.Printf("  install bin            : %s\n", cfg.InstallBin)
-			fmt.Printf("  config path            : %s\n", evOrUnknown(cfg.ConfigPath))
+			confPath := cfg.ConfigPath
+			if confPath == "" && deps.Profile != nil {
+				desk := deps.Profile.EffectiveDesktop()
+				confPath = "/home/" + desk.User + "/.config/sunshine/sunshine.conf"
+			}
+			fmt.Printf("  config path            : %s\n", evOrUnknown(confPath))
 			fmt.Printf("  install bin exists     : %v\n", fileExists(cfg.InstallBin))
 			fmt.Printf("  /usr/local/bin/sunshine: %v\n", fileExists("/usr/local/bin/sunshine"))
 			fmt.Printf("  assets apps.json       : %v\n", fileExists("/usr/local/assets/apps.json"))
 			fmt.Printf("  assets web/index.html  : %v\n", fileExists("/usr/local/assets/web/index.html"))
+			fmt.Printf("  config exists          : %v\n", fileExists(confPath))
+			if confPath != "" {
+				credsDir := filepath.Join(filepath.Dir(confPath), "credentials")
+				fmt.Printf("  credentials dir exists : %v\n", fileExists(credsDir))
+			}
 			if fileExists(cfg.InstallBin) {
 				res := deps.Runner.Exec(ctx, runner.CommandSpec{
 					Argv:    []string{"getcap", cfg.InstallBin},
@@ -1199,12 +1213,146 @@ func newDoctorSunshineCmd() *cobra.Command {
 			if unit.Err == nil {
 				fmt.Printf("  service has force HDR  : %v\n", strings.Contains(unit.Stdout, "SUNSHINE_FORCE_AV1_HDR10=1"))
 				fmt.Printf("  service uses kwin-realvt: %v\n", strings.Contains(unit.Stdout, "kwin-realvt.service"))
+				fmt.Printf("  service has CAP_SYS_ADMIN: %v\n", strings.Contains(unit.Stdout, "AmbientCapabilities=CAP_SYS_ADMIN"))
 			} else {
 				fmt.Println("  service                : sunshine-headless.service not installed")
+			}
+			journal := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"journalctl", "-u", "sunshine-headless.service", "-n", "300", "--no-pager"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			if journal.Err == nil {
+				for _, marker := range []string{
+					"STREAM_DIAG kms capture selected",
+					"Found monitor for DRM screencasting",
+					"hevc_nvenc",
+					"Color coding: HDR",
+					"selected_pix_fmt=p010",
+				} {
+					fmt.Printf("  log marker %-36s: %v\n", marker, strings.Contains(journal.Stdout, marker))
+				}
 			}
 			return nil
 		},
 	}
+}
+
+func newDoctorToolsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "tools",
+		Short: "Report runtime command discovery choices (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			fmt.Println("doctor tools:")
+			resolver := discovery.Resolver{}
+			report := func(label string, names []string) {
+				c, err := resolver.ResolveCommand(names)
+				if err != nil {
+					fmt.Printf("  %-16s: missing (%v)\n", label, err)
+					return
+				}
+				version := strings.TrimSpace(c.Version)
+				if version == "" {
+					version = "(version unavailable)"
+				}
+				fmt.Printf("  %-16s: %s [%s]\n", label, c.Path, version)
+			}
+			report("qdbus", []string{"qdbus6", "qdbus", "qdbus-qt5", "/usr/lib/qt6/bin/qdbus", "/usr/lib/qt5/bin/qdbus"})
+			report("kscreen-doctor", []string{"kscreen-doctor"})
+			report("doxygen", []string{"/usr/local/bin/doxygen", "doxygen"})
+			report("nvcc", []string{"/usr/local/cuda/bin/nvcc", "nvcc"})
+			report("cmake", []string{"cmake"})
+			report("ninja", []string{"ninja", "ninja-build"})
+			report("sunshine", []string{"/usr/local/bin/sunshine-clouddeploy", "/usr/local/bin/sunshine", "sunshine"})
+			report("tailscale", []string{"tailscale"})
+			return nil
+		},
+	}
+}
+
+func newDoctorNetworkCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "network",
+		Short: "Report Sunshine/Tailscale network reachability (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			tailscaleIP := ""
+			if ph := deps.State.Get(phase.TailscaleName); ph != nil && ph.Details != nil {
+				if v, ok := ph.Details["tailscale_ip"].(string); ok {
+					tailscaleIP = strings.TrimSpace(v)
+				}
+			}
+			cfg := (&config.Profile{}).EffectiveSunshine()
+			desk := (&config.Profile{}).EffectiveDesktop()
+			if deps.Profile != nil {
+				cfg = deps.Profile.EffectiveSunshine()
+				desk = deps.Profile.EffectiveDesktop()
+			}
+			confPath := cfg.ConfigPath
+			if confPath == "" {
+				confPath = "/home/" + desk.User + "/.config/sunshine/sunshine.conf"
+			}
+			fmt.Println("doctor network:")
+			fmt.Printf("  tailscale ip           : %s\n", evOrUnknown(tailscaleIP))
+			fmt.Printf("  config path            : %s\n", confPath)
+			if b, err := os.ReadFile(confPath); err == nil {
+				fmt.Printf("  csrf_allowed_origins   : %s\n", firstLineContainingLocal(string(b), "csrf_allowed_origins"))
+			} else {
+				fmt.Printf("  csrf_allowed_origins   : (config unreadable: %v)\n", err)
+			}
+			for _, url := range []string{"http://127.0.0.1:47989/serverinfo", "https://127.0.0.1:47990"} {
+				fmt.Printf("  %-32s: %s\n", url, curlHTTPStatus(ctx, deps, url))
+			}
+			if tailscaleIP != "" {
+				for _, url := range []string{"http://" + tailscaleIP + ":47989/serverinfo", "https://" + tailscaleIP + ":47990"} {
+					fmt.Printf("  %-32s: %s\n", url, curlHTTPStatus(ctx, deps, url))
+				}
+				fmt.Println()
+				fmt.Println("Client checks:")
+				fmt.Printf("  curl.exe http://%s:47989/serverinfo\n", tailscaleIP)
+				fmt.Printf("  curl.exe -k https://%s:47990\n", tailscaleIP)
+			} else {
+				fmt.Println()
+				fmt.Println("No Tailscale IP recorded. If using public networking, verify provider firewall allows Sunshine ports:")
+				fmt.Println("  TCP 47984, TCP 47989, TCP 47990, and Sunshine/Moonlight UDP streaming ports.")
+			}
+			publicIP := strings.TrimSpace(os.Getenv("CLOUDDEPLOY_PUBLIC_IP"))
+			if publicIP != "" {
+				fmt.Println()
+				fmt.Printf("SSH tunnel helper: ssh -L 47990:127.0.0.1:47990 -L 47989:127.0.0.1:47989 %s@%s\n", desk.User, publicIP)
+			}
+			return nil
+		},
+	}
+}
+
+func curlHTTPStatus(ctx context.Context, deps *phase.Deps, url string) string {
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"curl", "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", url},
+		LogFile: "-",
+		Timeout: 10 * time.Second,
+	})
+	if res.Err != nil {
+		return "error: " + res.Err.Error()
+	}
+	status := strings.TrimSpace(res.Stdout)
+	if status == "" {
+		status = "000"
+	}
+	return "HTTP " + status
+}
+
+func firstLineContainingLocal(s, needle string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, needle) {
+			return strings.TrimSpace(line)
+		}
+	}
+	return "(missing)"
 }
 
 // -----------------------------------------------------------------------------

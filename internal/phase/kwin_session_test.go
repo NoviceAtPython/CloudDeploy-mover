@@ -711,6 +711,25 @@ func TestKWinSession_Run_ExplicitProfileOverrideBypassesResolver(t *testing.T) {
 	}
 }
 
+func TestParseKWinOutputBackendAcceptsPlasma64SectionStyleDRM(t *testing.T) {
+	support := `KWin Support Information
+
+Output backend
+Name: DRM
+Atomic Mode Setting on GPU 0: true
+`
+	if got := parseKWinOutputBackend(support); got != "DRM" {
+		t.Fatalf("backend: got %q want DRM", got)
+	}
+}
+
+func TestParseKWinOutputBackendDetectsNestedWayland(t *testing.T) {
+	support := "Output backend: Wayland\n"
+	if got := parseKWinOutputBackend(support); !isNestedKWinBackend(got) {
+		t.Fatalf("backend %q should be treated as nested/invalid for private HDR", got)
+	}
+}
+
 func equalStrings(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

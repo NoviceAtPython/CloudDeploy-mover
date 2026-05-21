@@ -277,25 +277,38 @@ type CUDAConfig struct {
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
 type SunshineConfig struct {
-	Source                  string `yaml:"source"`
-	ForkRepo                string `yaml:"fork_repo"`
-	ForkBranch              string `yaml:"fork_branch"`
-	ForkCommit              string `yaml:"fork_commit"`
-	Encoder                 string `yaml:"encoder"`
-	Capture                 string `yaml:"capture"`
-	ForceAV1HDR10           bool   `yaml:"force_av1_hdr10"`
-	SynthesizeHDR10Metadata bool   `yaml:"synthesize_hdr10_metadata"`
-	BuildDir                string `yaml:"build_dir"`
-	InstallBin              string `yaml:"install_bin"`
-	ConfigPath              string `yaml:"config_path"`
-	BuildJobs               int    `yaml:"build_jobs"`
-	RequireCUDA             bool   `yaml:"require_cuda"`
+	Source                  string   `yaml:"source"`
+	ForkRepo                string   `yaml:"fork_repo"`
+	ForkBranch              string   `yaml:"fork_branch"`
+	ForkCommit              string   `yaml:"fork_commit"`
+	Encoder                 string   `yaml:"encoder"`
+	Capture                 string   `yaml:"capture"`
+	ForceAV1HDR10           bool     `yaml:"force_av1_hdr10"`
+	SynthesizeHDR10Metadata bool     `yaml:"synthesize_hdr10_metadata"`
+	BuildDir                string   `yaml:"build_dir"`
+	InstallBin              string   `yaml:"install_bin"`
+	ConfigPath              string   `yaml:"config_path"`
+	BuildJobs               int      `yaml:"build_jobs"`
+	RequireCUDA             bool     `yaml:"require_cuda"`
+	EnableCUDA              string   `yaml:"enable_cuda"`
+	CUDAFailOnMissing       bool     `yaml:"cuda_fail_on_missing"`
+	CUDARoot                string   `yaml:"cuda_root"`
+	ExtraCSRFAllowedOrigins []string `yaml:"extra_csrf_allowed_origins"`
+	DoxygenVersion          string   `yaml:"doxygen_version"`
+	DoxygenURL              string   `yaml:"doxygen_url"`
+	DoxygenSHA256           string   `yaml:"doxygen_sha256"`
+	DoxygenInstallDir       string   `yaml:"doxygen_install_dir"`
 }
 
 const DefaultSunshineBuildDir = "/opt/sunshine-src"
 const DefaultSunshineInstallBin = "/usr/local/bin/sunshine-clouddeploy"
 const DefaultSunshineConfigName = "sunshine.conf"
 const DefaultSunshineBuildJobs = 2
+const DefaultSunshineEnableCUDA = "auto"
+const DefaultDoxygenVersion = "1.17.0"
+const DefaultDoxygenURL = "https://www.doxygen.nl/files/doxygen-1.17.0.linux.bin.tar.gz"
+const DefaultDoxygenSHA256 = "75419ef4f446fc1c24ef12514b574e66e898ee6f527c6ae2ad84f91a905823c2"
+const DefaultDoxygenInstallDir = "/opt/doxygen-1.17.0"
 
 func (p *Profile) EffectiveSunshine() SunshineConfig {
 	out := SunshineConfig{}
@@ -319,6 +332,21 @@ func (p *Profile) EffectiveSunshine() SunshineConfig {
 	}
 	if out.BuildJobs <= 0 {
 		out.BuildJobs = DefaultSunshineBuildJobs
+	}
+	if strings.TrimSpace(out.EnableCUDA) == "" {
+		out.EnableCUDA = DefaultSunshineEnableCUDA
+	}
+	if strings.TrimSpace(out.DoxygenVersion) == "" {
+		out.DoxygenVersion = DefaultDoxygenVersion
+	}
+	if strings.TrimSpace(out.DoxygenURL) == "" {
+		out.DoxygenURL = DefaultDoxygenURL
+	}
+	if strings.TrimSpace(out.DoxygenSHA256) == "" {
+		out.DoxygenSHA256 = DefaultDoxygenSHA256
+	}
+	if strings.TrimSpace(out.DoxygenInstallDir) == "" {
+		out.DoxygenInstallDir = DefaultDoxygenInstallDir
 	}
 	return out
 }
@@ -794,6 +822,12 @@ func ValidateProfile(p *Profile) error {
 	}
 	if p.Sunshine.BuildJobs < 0 {
 		return fmt.Errorf("config: profile %q: sunshine.build_jobs must be >= 0", p.Profile)
+	}
+	switch strings.ToLower(strings.TrimSpace(p.Sunshine.EnableCUDA)) {
+	case "", "auto", "true", "false":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: sunshine.enable_cuda must be auto/true/false, got %q", p.Profile, p.Sunshine.EnableCUDA)
 	}
 	if p.Deploy.MaxAutoReboots < 0 {
 		return fmt.Errorf("config: profile %q: deploy.max_auto_reboots must be >= 0", p.Profile)

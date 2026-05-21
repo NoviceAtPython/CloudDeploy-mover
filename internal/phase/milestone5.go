@@ -2,10 +2,14 @@ package phase
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -40,7 +44,9 @@ var sunshineBuildDeps = []string{
 }
 
 type SunshineBuild struct {
-	BuildDeps []string
+	BuildDeps     []string
+	DoxygenFn     func(context.Context, *Deps, config.SunshineConfig) (doxygenInfo, error)
+	CUDAToolkitFn func(context.Context, *Deps, config.SunshineConfig) cudaToolchain
 }
 
 func (SunshineBuild) Name() string { return SunshineBuildName }
@@ -114,17 +120,54 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	head, _ := output(ctx, deps, cfg.BuildDir, []string{"git", "rev-parse", "HEAD"}, 30*time.Second, false)
 	details["commit"] = strings.TrimSpace(head)
 
-	if err := run(ctx, deps, cfg.BuildDir, []string{"cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"}, 30*time.Minute, true); err != nil {
-		return failPhase(deps, SunshineBuildName, details, "configure Sunshine", err, true)
+	doxFn := p.DoxygenFn
+	if doxFn == nil {
+		doxFn = ensureSunshineDoxygen
 	}
+	dox, err := doxFn(ctx, deps, cfg)
+	if err != nil {
+		return failPhase(deps, SunshineBuildName, details, "resolve Doxygen", err, true)
+	}
+	details["doxygen_path"] = dox.Path
+	details["doxygen_version"] = dox.Version
+	details["doxygen_source"] = dox.Source
+	if dox.SHA256 != "" {
+		details["doxygen_sha256"] = dox.SHA256
+	}
+	cudaFn := p.CUDAToolkitFn
+	if cudaFn == nil {
+		cudaFn = discoverSunshineCUDA
+	}
+	cuda := cudaFn(ctx, deps, cfg)
+	details["sunshine_cuda_mode"] = cfg.EnableCUDA
+	details["cuda_detected"] = cuda.Found
+	details["cuda_nvcc"] = cuda.NVCC
+	details["cuda_root"] = cuda.Root
+	cmakeArgs := sunshineCMakeArgs(cfg, dox.Path, cuda, false)
+	if err := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); err != nil {
+		if shouldRetrySunshineWithoutCUDA(cfg, cuda) {
+			details["fallback_to_no_cuda"] = true
+			cmakeArgs = sunshineCMakeArgs(cfg, dox.Path, cudaToolchain{}, true)
+			if retryErr := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); retryErr != nil {
+				return failPhase(deps, SunshineBuildName, details, "configure Sunshine without CUDA fallback", retryErr, true)
+			}
+		} else {
+			return failPhase(deps, SunshineBuildName, details, "configure Sunshine", err, true)
+		}
+	}
+	details["cmake_args"] = strings.Join(cmakeArgs, " ")
 	if err := run(ctx, deps, cfg.BuildDir, []string{"cmake", "--build", "build", "--target", "sunshine", "-j", strconv.Itoa(cfg.BuildJobs)}, 90*time.Minute, true); err != nil {
 		return failPhase(deps, SunshineBuildName, details, "build Sunshine", err, true)
 	}
 	built := filepath.Join(cfg.BuildDir, "build", "sunshine")
+	details["built_binary"] = built
 	if err := run(ctx, deps, "", []string{"install", "-m", "0755", built, cfg.InstallBin}, time.Minute, true); err != nil {
 		return failPhase(deps, SunshineBuildName, details, "install Sunshine binary", err, true)
 	}
 	_ = run(ctx, deps, "", []string{"ln", "-sf", cfg.InstallBin, "/usr/local/bin/sunshine"}, time.Minute, true)
+	if err := validateExecutable(cfg.InstallBin); err != nil {
+		return failPhase(deps, SunshineBuildName, details, "validate installed Sunshine binary", err, true)
+	}
 	for _, bin := range []string{cfg.InstallBin, "/usr/local/bin/sunshine"} {
 		if err := run(ctx, deps, "", []string{"setcap", "cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep", bin}, time.Minute, true); err != nil {
 			return failPhase(deps, SunshineBuildName, details, "set Sunshine capabilities", err, true)
@@ -137,6 +180,8 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	details["version"] = strings.TrimSpace(ver)
 	details["install_method"] = "fork"
 	details["binary"] = cfg.InstallBin
+	details["installed_binary"] = cfg.InstallBin
+	details["symlinked_binary"] = "/usr/local/bin/sunshine"
 	deps.State.MarkDone(SunshineBuildName, details)
 	_ = deps.PersistState()
 	log.Info("phase sunshine-build: done", "binary", cfg.InstallBin)
@@ -157,6 +202,194 @@ func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) err
 	}
 	if _, err := os.Stat("/usr/local/assets/web/index.html"); err != nil {
 		return fmt.Errorf("/usr/local/assets/web/index.html missing after asset install")
+	}
+	return nil
+}
+
+type doxygenInfo struct {
+	Path    string
+	Version string
+	Source  string
+	SHA256  string
+}
+
+type cudaToolchain struct {
+	Found bool
+	NVCC  string
+	Root  string
+}
+
+func ensureSunshineDoxygen(ctx context.Context, deps *Deps, cfg config.SunshineConfig) (doxygenInfo, error) {
+	if deps.DryRun {
+		return doxygenInfo{Path: "/usr/local/bin/doxygen", Version: cfg.DoxygenVersion, Source: "dry-run"}, nil
+	}
+	if cmd, err := resolveDoxygen(); err == nil {
+		ver, _ := output(ctx, deps, "", []string{cmd.Path, "--version"}, 15*time.Second, false)
+		version := strings.TrimSpace(strings.Split(strings.TrimSpace(ver), "\n")[0])
+		if versionAtLeast(version, "1.10.0") {
+			return doxygenInfo{Path: cmd.Path, Version: version, Source: "system"}, nil
+		}
+	}
+	if strings.TrimSpace(cfg.DoxygenURL) == "" || strings.TrimSpace(cfg.DoxygenSHA256) == "" {
+		return doxygenInfo{}, fmt.Errorf("system doxygen is missing/too old and no upstream doxygen URL/SHA configured")
+	}
+	tmp := "/tmp/doxygen-" + cfg.DoxygenVersion + ".linux.bin.tar.gz"
+	if err := run(ctx, deps, "", []string{"curl", "-fL", "--retry", "3", "-o", tmp, cfg.DoxygenURL}, 10*time.Minute, true); err != nil {
+		return doxygenInfo{}, err
+	}
+	got, err := sha256File(tmp)
+	if err != nil {
+		return doxygenInfo{}, err
+	}
+	if !strings.EqualFold(got, cfg.DoxygenSHA256) {
+		return doxygenInfo{}, fmt.Errorf("doxygen tarball sha256 mismatch: got %s want %s", got, cfg.DoxygenSHA256)
+	}
+	parent := filepath.Dir(cfg.DoxygenInstallDir)
+	if err := run(ctx, deps, "", []string{"install", "-d", "-m", "0755", parent}, time.Minute, true); err != nil {
+		return doxygenInfo{}, err
+	}
+	if err := run(ctx, deps, "", []string{"bash", "-lc", "rm -rf " + shellQuote(cfg.DoxygenInstallDir) + " && tar -C " + shellQuote(parent) + " -xzf " + shellQuote(tmp)}, 5*time.Minute, true); err != nil {
+		return doxygenInfo{}, err
+	}
+	candidates := []string{
+		filepath.Join(cfg.DoxygenInstallDir, "bin", "doxygen"),
+		filepath.Join(parent, "doxygen-"+cfg.DoxygenVersion, "bin", "doxygen"),
+	}
+	doxygenPath := ""
+	for _, c := range candidates {
+		if st, err := os.Stat(c); err == nil && !st.IsDir() && st.Mode()&0o111 != 0 {
+			doxygenPath = c
+			break
+		}
+	}
+	if doxygenPath == "" {
+		return doxygenInfo{}, fmt.Errorf("upstream Doxygen extracted but no doxygen binary found under %s", parent)
+	}
+	if err := run(ctx, deps, "", []string{"ln", "-sf", doxygenPath, "/usr/local/bin/doxygen"}, time.Minute, true); err != nil {
+		return doxygenInfo{}, err
+	}
+	ver, _ := output(ctx, deps, "", []string{doxygenPath, "--version"}, 15*time.Second, false)
+	return doxygenInfo{Path: doxygenPath, Version: strings.TrimSpace(ver), Source: "upstream", SHA256: got}, nil
+}
+
+func discoverSunshineCUDA(ctx context.Context, deps *Deps, cfg config.SunshineConfig) cudaToolchain {
+	if strings.EqualFold(strings.TrimSpace(cfg.EnableCUDA), "false") {
+		return cudaToolchain{}
+	}
+	nvcc := ""
+	root := strings.TrimSpace(cfg.CUDARoot)
+	if root != "" {
+		c := filepath.Join(root, "bin", "nvcc")
+		if st, err := os.Stat(c); err == nil && !st.IsDir() {
+			nvcc = c
+		}
+	}
+	if nvcc == "" {
+		if cmd, err := resolveNVCC(); err == nil {
+			nvcc = cmd.Path
+		}
+	}
+	if nvcc == "" {
+		return cudaToolchain{}
+	}
+	if root == "" {
+		root = filepath.Dir(filepath.Dir(nvcc))
+	}
+	return cudaToolchain{Found: true, NVCC: nvcc, Root: root}
+}
+
+func sunshineCMakeArgs(cfg config.SunshineConfig, doxygenPath string, cuda cudaToolchain, forceNoCUDA bool) []string {
+	args := []string{"cmake", "-S", ".", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"}
+	if strings.TrimSpace(doxygenPath) != "" {
+		args = append(args, "-DDOXYGEN_EXECUTABLE="+doxygenPath)
+	}
+	mode := strings.ToLower(strings.TrimSpace(cfg.EnableCUDA))
+	if mode == "" {
+		mode = "auto"
+	}
+	enableCUDA := !forceNoCUDA && mode != "false" && cuda.Found
+	if mode == "true" && !forceNoCUDA {
+		enableCUDA = true
+	}
+	if enableCUDA {
+		args = append(args, "-DSUNSHINE_ENABLE_CUDA=ON")
+		if cuda.Root != "" {
+			args = append(args, "-DCUDAToolkit_ROOT="+cuda.Root)
+		}
+		if cuda.NVCC != "" {
+			args = append(args, "-DCMAKE_CUDA_COMPILER="+cuda.NVCC)
+		}
+		if !cfg.CUDAFailOnMissing {
+			args = append(args, "-DCUDA_FAIL_ON_MISSING=OFF")
+		}
+	} else {
+		args = append(args, "-DSUNSHINE_ENABLE_CUDA=OFF", "-DCUDA_FAIL_ON_MISSING=OFF")
+	}
+	return args
+}
+
+func shouldRetrySunshineWithoutCUDA(cfg config.SunshineConfig, cuda cudaToolchain) bool {
+	mode := strings.ToLower(strings.TrimSpace(cfg.EnableCUDA))
+	if mode == "true" || cfg.CUDAFailOnMissing {
+		return false
+	}
+	return cuda.Found
+}
+
+func versionAtLeast(got, want string) bool {
+	g := versionParts(got)
+	w := versionParts(want)
+	for len(g) < 3 {
+		g = append(g, 0)
+	}
+	for len(w) < 3 {
+		w = append(w, 0)
+	}
+	for i := 0; i < 3; i++ {
+		if g[i] > w[i] {
+			return true
+		}
+		if g[i] < w[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func versionParts(s string) []int {
+	re := regexp.MustCompile(`[0-9]+`)
+	raw := re.FindAllString(s, 3)
+	out := make([]int, 0, len(raw))
+	for _, r := range raw {
+		n, _ := strconv.Atoi(r)
+		out = append(out, n)
+	}
+	return out
+}
+
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func validateExecutable(path string) error {
+	st, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if st.IsDir() {
+		return fmt.Errorf("%s is a directory", path)
+	}
+	if st.Mode()&0o111 == 0 {
+		return fmt.Errorf("%s exists but is not executable", path)
 	}
 	return nil
 }
@@ -190,20 +423,31 @@ func (p SunshineConfigPhase) Run(ctx context.Context, deps *Deps) error {
 	if path == "" {
 		path = home + "/" + defaultSunshineConfRel
 	}
-	origins := []string{"https://localhost:47990", "https://127.0.0.1:47990"}
-	if ip := tailscaleIPFromState(deps); ip != "" {
-		origins = append(origins, "https://"+ip+":47990")
-	}
+	origins := sunshineCSRFOrigins(deps, tailscaleIPFromState(deps))
 	body := renderSunshineConfig(cfg, drm, origins)
 	details := map[string]any{"path": path, "adapter_name": drm, "csrf_allowed_origins": origins, "uid": uid}
 	if !deps.DryRun {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		configDir := filepath.Dir(path)
+		credsDir := filepath.Join(configDir, "credentials")
+		if err := os.MkdirAll(credsDir, 0o700); err != nil {
 			return failPhase(deps, SunshineConfigName, details, "create Sunshine config dir", err, true)
 		}
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			return failPhase(deps, SunshineConfigName, details, "write Sunshine config", err, true)
 		}
-		_ = run(ctx, deps, "", []string{"chown", desk.User + ":" + desk.User, path}, time.Minute, true)
+		for _, cmd := range [][]string{
+			{"chown", "-R", desk.User + ":" + desk.User, configDir},
+			{"chmod", "0700", configDir},
+			{"chmod", "0700", credsDir},
+			{"chmod", "0600", path},
+			{"runuser", "-u", desk.User, "--", "test", "-w", configDir},
+			{"runuser", "-u", desk.User, "--", "mkdir", "-p", credsDir},
+		} {
+			if err := run(ctx, deps, "", cmd, time.Minute, true); err != nil {
+				return failPhase(deps, SunshineConfigName, details, "fix/validate Sunshine config ownership", err, true)
+			}
+		}
+		details["credentials_dir"] = credsDir
 	}
 	if strings.Contains(body, "\nhdr =") || strings.Contains(body, "\nfps =") || strings.Contains(body, "\nresolutions =") {
 		return failPhase(deps, SunshineConfigName, details, "invalid Sunshine config keys", fmt.Errorf("generated sunshine.conf contains invalid hdr/fps/resolutions keys"), true)
@@ -234,12 +478,6 @@ func renderSunshineConfig(cfg config.SunshineConfig, drm string, origins []strin
 	b.WriteString("ping_timeout = 60000\n")
 	b.WriteString("hevc_mode = " + hevcMode + "\n")
 	b.WriteString("av1_mode = " + av1Mode + "\n")
-	if cfg.ForceAV1HDR10 {
-		b.WriteString("force_av1_hdr10 = enabled\n")
-	}
-	if cfg.SynthesizeHDR10Metadata {
-		b.WriteString("synthesize_hdr10_metadata = enabled\n")
-	}
 	if len(origins) > 0 {
 		b.WriteString("csrf_allowed_origins = " + strings.Join(origins, ",") + "\n")
 	}
@@ -277,25 +515,51 @@ func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 	if strings.ContainsAny(key, " \t\r\n") {
 		return failPhase(deps, TailscaleName, details, "invalid Tailscale authkey", fmt.Errorf("%s must be a single-line key without whitespace", cfg.AuthKeyEnv), true)
 	}
+	details["authkey_present"] = true
+	installMethod := "apt"
 	if err := deps.APT.Run(ctx, func(tc *apt.TxContext) error { return tc.Install(ctx, []string{"tailscale"}) }); err != nil {
-		return failPhase(deps, TailscaleName, details, "install tailscale", err, true)
+		details["apt_install_error"] = err.Error()
+		installMethod = "tailscale-install-sh"
+		if ierr := run(ctx, deps, "", []string{"bash", "-lc", "curl -fsSL https://tailscale.com/install.sh | sh"}, 5*time.Minute, true); ierr != nil {
+			return failPhase(deps, TailscaleName, details, "install tailscale", fmt.Errorf("apt failed: %v; install.sh failed: %w", err, ierr), true)
+		}
 	}
+	details["install_method"] = installMethod
 	_ = run(ctx, deps, "", []string{"systemctl", "enable", "--now", "tailscaled"}, time.Minute, true)
+	details["tailscaled_active"] = run(ctx, deps, "", []string{"systemctl", "is-active", "--quiet", "tailscaled"}, 15*time.Second, false) == nil
 	args := []string{"tailscale", "up", "--authkey", key}
 	if cfg.SSH {
 		args = append(args, "--ssh")
 	}
-	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv: args, Sudo: true, Timeout: 2 * time.Minute, DryRun: deps.DryRun,
-		RedactArgs: []int{3}, LogFile: "-",
-	})
+	var res runner.Result
+	for attempt := 1; attempt <= 3; attempt++ {
+		res = deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv: args, Sudo: true, Timeout: 2 * time.Minute, DryRun: deps.DryRun,
+			RedactArgs: []int{3}, LogFile: "-",
+		})
+		if res.Err == nil {
+			break
+		}
+		time.Sleep(time.Duration(attempt) * 2 * time.Second)
+	}
+	details["tailscale_up_exit"] = res.ExitCode
+	if res.Stderr != "" {
+		details["tailscale_up_stderr_tail"] = lastLines(res.Stderr, 6)
+	}
 	if res.Err != nil {
 		return failPhase(deps, TailscaleName, details, "tailscale up", res.Err, true)
 	}
+	status, _ := output(ctx, deps, "", []string{"tailscale", "status"}, 15*time.Second, false)
+	details["tailscale_status_excerpt"] = lastLines(status, 8)
 	ip, _ := output(ctx, deps, "", []string{"tailscale", "ip", "-4"}, 15*time.Second, false)
 	ip = strings.TrimSpace(strings.Split(strings.TrimSpace(ip), "\n")[0])
-	details["authkey_present"] = true
+	if deps.DryRun && ip == "" {
+		ip = "100.64.0.1"
+	}
 	details["tailscale_ip"] = ip
+	if ip == "" {
+		return failPhase(deps, TailscaleName, details, "tailscale ip missing", fmt.Errorf("tailscale up returned success but `tailscale ip -4` returned no address"), true)
+	}
 	if ip != "" {
 		updateSunshineCSRF(ctx, deps, ip)
 	}
@@ -380,6 +644,14 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 			return failPhase(deps, StreamingServicesName, details, "KWin not ready", err, true)
 		}
 		_ = run(ctx, deps, "", []string{forceKwinModeScriptPath}, 90*time.Second, true)
+		credsSet, credsUser, credsErr := setSunshineCredentials(ctx, deps, desk.User, cfg.InstallBin)
+		details["sunshine_credentials_set"] = credsSet
+		if credsUser != "" {
+			details["sunshine_username"] = credsUser
+		}
+		if credsErr != nil {
+			details["sunshine_credentials_warning"] = credsErr.Error()
+		}
 		if err := run(ctx, deps, "", []string{"systemctl", "restart", "sunshine-headless.service"}, time.Minute, true); err != nil {
 			return failPhase(deps, StreamingServicesName, details, "start Sunshine", err, true)
 		}
@@ -452,18 +724,48 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		details["tailscale_serverinfo_bytes"] = len(ts)
 	}
 	logs, _ := journalFn(ctx, deps)
-	details["kms_marker"] = containsAny(logs, "Found monitor for DRM screencasting", "Screencasting with KMS")
-	details["nvenc_marker"] = containsAny(logs, "NVENC", "h264_nvenc", "hevc_nvenc", "av1_nvenc")
-	details["av1_marker"] = strings.Contains(logs, "av1_nvenc")
-	details["resolution_marker"] = strings.Contains(logs, "3840x2160")
-	if strings.Contains(logs, "Fatal: Unable to find display or encoder") || strings.Contains(logs, "Couldn't find any working encoder") {
+	ev := parseSunshineStreamEvidence(logs)
+	details["kms_marker"] = ev.KMS
+	details["nvenc_marker"] = ev.NVENC
+	details["av1_marker"] = ev.AV1
+	details["hevc_marker"] = ev.HEVC
+	details["resolution_marker"] = ev.Resolution4K
+	details["selected_capture_line"] = ev.SelectedCaptureLine
+	details["selected_encoder_line"] = ev.SelectedEncoderLine
+	details["hdr_line"] = ev.HDRLine
+	details["cuda_interop_warning"] = ev.CUDAInteropWarning
+	if ev.Fatal {
 		return failPhase(deps, StreamValidateName, details, "fatal Sunshine encoder/display log marker", fmt.Errorf("Sunshine fatal marker in journal"), true)
 	}
-	if details["kms_marker"] != true || details["nvenc_marker"] != true {
+	if ev.SelectedCaptureLine == "" {
 		deps.State.MarkPendingMoonlightConnect(StreamValidateName, "Sunshine serverinfo is reachable; waiting for Moonlight stream attempt to produce KMS/NVENC markers")
 		deps.State.Get(StreamValidateName).Details = details
 		_ = deps.PersistState()
 		return nil
+	}
+	drm := selectedDRMDevice(deps)
+	if drm == "" {
+		drm = "/dev/dri/card1"
+	}
+	connector := "DP-1"
+	width, height := "3840", "2160"
+	if deps.Profile != nil {
+		connector = deps.Profile.Display.ForcedConnector
+		w, h := ParseResolution(deps.Profile.Display.Resolution)
+		if w > 0 && h > 0 {
+			width, height = strconv.Itoa(w), strconv.Itoa(h)
+		}
+	}
+	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, drm, connector, width, height); err != nil {
+		return failPhase(deps, StreamValidateName, details, "wrong Sunshine KMS capture target", err, true)
+	}
+	if !ev.KMS || !ev.Resolution4K || !ev.NVENC || !ev.HEVC {
+		return failPhase(deps, StreamValidateName, details, "missing required Sunshine KMS/NVENC markers", fmt.Errorf("kms=%v resolution4k=%v nvenc=%v hevc=%v", ev.KMS, ev.Resolution4K, ev.NVENC, ev.HEVC), true)
+	}
+	if deps.Profile != nil && deps.Profile.Display.HDR {
+		if !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
+			return failPhase(deps, StreamValidateName, details, "missing required Sunshine HDR Main10 markers", fmt.Errorf("hdr=%v color_depth_10=%v p010=%v", ev.HDR, ev.ColorDepth10, ev.P010), true)
+		}
 	}
 	deps.State.MarkDone(StreamValidateName, details)
 	_ = deps.PersistState()
@@ -518,6 +820,9 @@ After=network-online.target kwin-realvt.service
 User=%s
 Group=%s
 SupplementaryGroups=video render input audio
+AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE
+NoNewPrivileges=false
 WorkingDirectory=/home/%s
 Environment=HOME=/home/%s
 Environment=USER=%s
@@ -584,12 +889,143 @@ WantedBy=timers.target
 	return os.WriteFile("/etc/systemd/system/clouddeploy-watch-streaming.timer", []byte(timer), 0o644)
 }
 
+type sunshineStreamEvidence struct {
+	KMS                 bool
+	NVENC               bool
+	HEVC                bool
+	AV1                 bool
+	Resolution4K        bool
+	HDR                 bool
+	ColorDepth10        bool
+	P010                bool
+	Fatal               bool
+	CUDAInteropWarning  bool
+	SelectedCaptureLine string
+	SelectedEncoderLine string
+	HDRLine             string
+}
+
+func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
+	var ev sunshineStreamEvidence
+	for _, raw := range strings.Split(logs, "\n") {
+		line := strings.TrimSpace(raw)
+		lower := strings.ToLower(line)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "STREAM_DIAG kms capture selected") || strings.Contains(line, "kms capture selected") {
+			ev.SelectedCaptureLine = line
+		}
+		if strings.Contains(line, "Found monitor for DRM screencasting") || strings.Contains(line, "Screencasting with KMS") {
+			ev.KMS = true
+		}
+		if strings.Contains(line, "Resolution: 3840x2160") || strings.Contains(line, "Desktop resolution: 3840x2160") || strings.Contains(line, "3840x2160") {
+			ev.Resolution4K = true
+		}
+		if strings.Contains(lower, "hevc_nvenc") || strings.Contains(line, "HEVC NVENC initialized") {
+			ev.HEVC = true
+			ev.NVENC = true
+			ev.SelectedEncoderLine = line
+		}
+		if strings.Contains(lower, "av1_nvenc") {
+			ev.AV1 = true
+			ev.NVENC = true
+			ev.SelectedEncoderLine = line
+		}
+		if strings.Contains(lower, "h264_nvenc") || strings.Contains(line, "Nvenc initialized") || strings.Contains(line, "NVENC initialized") {
+			ev.NVENC = true
+			if ev.SelectedEncoderLine == "" {
+				ev.SelectedEncoderLine = line
+			}
+		}
+		if strings.Contains(line, "Color coding: HDR (Rec. 2020 + SMPTE 2084 PQ)") ||
+			strings.Contains(line, "selected_colorspace=HDR (Rec. 2020 + SMPTE 2084 PQ)") ||
+			strings.Contains(line, "NV_INPUT_COLORSPACE=BT.2100 PQ") ||
+			strings.Contains(line, "is_hdr: NVIDIA private HDR") {
+			ev.HDR = true
+			ev.HDRLine = line
+		}
+		if strings.Contains(line, "Color depth: 10-bit") || strings.Contains(line, "color_depth=10") {
+			ev.ColorDepth10 = true
+		}
+		if strings.Contains(lower, "selected_pix_fmt=p010") || strings.Contains(lower, "pix_fmt=p010") {
+			ev.P010 = true
+		}
+		if strings.Contains(line, "Attempting to use NVENC without CUDA support") {
+			ev.CUDAInteropWarning = true
+		}
+		if strings.Contains(line, "Fatal: Unable to find display or encoder") ||
+			strings.Contains(line, "Couldn't find any working encoder") ||
+			strings.Contains(line, "Encoder [nvenc] failed") {
+			ev.Fatal = true
+		}
+	}
+	return ev
+}
+
+func validateSunshineSelectedCapture(line, drm, connector, width, height string) error {
+	if strings.Contains(line, "/dev/dri/card0") && drm != "/dev/dri/card0" {
+		return fmt.Errorf("Sunshine selected wrong DRM card: %s", line)
+	}
+	for _, want := range []string{drm, "connector=" + connector, "width=" + width, "height=" + height} {
+		if strings.TrimSpace(want) == "" {
+			continue
+		}
+		if !strings.Contains(line, want) {
+			return fmt.Errorf("Sunshine selected capture line missing %q: %s", want, line)
+		}
+	}
+	if strings.Contains(line, "Virtual-1") || strings.Contains(line, "1024x768") || strings.Contains(line, "width=1024") || strings.Contains(line, "height=768") {
+		return fmt.Errorf("Sunshine selected virtual/low-res capture target: %s", line)
+	}
+	return nil
+}
+
+func setSunshineCredentials(ctx context.Context, deps *Deps, user, bin string) (bool, string, error) {
+	sunUser := strings.TrimSpace(os.Getenv("SUNSHINE_USER"))
+	pass := os.Getenv("SUNSHINE_PASS")
+	if sunUser == "" {
+		sunUser = user
+	}
+	if strings.TrimSpace(pass) == "" {
+		return false, sunUser, fmt.Errorf("SUNSHINE_PASS not set; Web UI will prompt for initial credentials")
+	}
+	if strings.TrimSpace(bin) == "" {
+		bin = "/usr/local/bin/sunshine-clouddeploy"
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv: []string{
+			"runuser", "-u", user, "--", "env",
+			"HOME=/home/" + user,
+			bin, "--creds", sunUser, pass,
+		},
+		Sudo:       true,
+		Timeout:    time.Minute,
+		DryRun:     deps.DryRun,
+		LogFile:    "-",
+		RedactArgs: []int{-1},
+	})
+	if res.Err != nil {
+		return false, sunUser, fmt.Errorf("sunshine --creds failed: %w stderr=%q", res.Err, lastLines(res.Stderr, 4))
+	}
+	return true, sunUser, nil
+}
+
 func ensureKWinReady(ctx context.Context, deps *Deps, user, uid string) error {
 	if err := run(ctx, deps, "", []string{"systemctl", "is-active", "--quiet", "kwin-realvt.service"}, 15*time.Second, false); err != nil {
 		return err
 	}
-	if _, err := outputAsDesktop(ctx, deps, user, uid, []string{"qdbus", "--session", "org.kde.KWin", "/KWin", "org.kde.KWin.supportInformation"}, 10*time.Second); err != nil {
+	qdbus, qerr := resolveQDBus()
+	if qerr != nil {
+		return qerr
+	}
+	support, err := outputAsDesktop(ctx, deps, user, uid, []string{qdbus.Path, "--session", "org.kde.KWin", "/KWin", "org.kde.KWin.supportInformation"}, 10*time.Second)
+	if err != nil {
 		return err
+	}
+	backend := parseKWinOutputBackend(support)
+	if isNestedKWinBackend(backend) {
+		return fmt.Errorf("KWin is reachable through %s but backend is %s, not DRM", qdbus.Path, backend)
 	}
 	return nil
 }
@@ -660,7 +1096,7 @@ func updateSunshineCSRF(ctx context.Context, deps *Deps, ip string) {
 		return
 	}
 	lines := strings.Split(strings.TrimRight(string(b), "\n"), "\n")
-	want := "csrf_allowed_origins = https://localhost:47990,https://127.0.0.1:47990,https://" + ip + ":47990"
+	want := "csrf_allowed_origins = " + strings.Join(sunshineCSRFOrigins(deps, ip), ",")
 	found := false
 	for i, line := range lines {
 		if strings.HasPrefix(strings.TrimSpace(line), "csrf_allowed_origins") {
@@ -674,12 +1110,44 @@ func updateSunshineCSRF(ctx context.Context, deps *Deps, ip string) {
 	_ = os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
 }
 
+func sunshineCSRFOrigins(deps *Deps, ips ...string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, 4)
+	add := func(origin string) {
+		origin = strings.TrimSpace(origin)
+		if origin == "" || seen[origin] {
+			return
+		}
+		seen[origin] = true
+		out = append(out, origin)
+	}
+	add("https://localhost:47990")
+	add("https://127.0.0.1:47990")
+	for _, ip := range ips {
+		ip = strings.TrimSpace(ip)
+		if ip != "" {
+			add("https://" + ip + ":47990")
+		}
+	}
+	if publicIP := strings.TrimSpace(os.Getenv("CLOUDDEPLOY_PUBLIC_IP")); publicIP != "" {
+		add("https://" + publicIP + ":47990")
+	}
+	if deps != nil && deps.Profile != nil {
+		for _, origin := range deps.Profile.EffectiveSunshine().ExtraCSRFAllowedOrigins {
+			add(origin)
+		}
+	}
+	return out
+}
+
 func runAsDesktop(ctx context.Context, deps *Deps, user, uid string, argv []string, timeout time.Duration) error {
 	args := append([]string{"runuser", "-u", user, "--", "env",
 		"XDG_RUNTIME_DIR=/run/user/" + uid,
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
 		"WAYLAND_DISPLAY=wayland-0",
-		"QT_QPA_PLATFORM=wayland"}, argv...)
+		"QT_QPA_PLATFORM=wayland",
+		"XDG_CURRENT_DESKTOP=KDE",
+		"XDG_SESSION_TYPE=wayland"}, argv...)
 	return run(ctx, deps, "", args, timeout, true)
 }
 
@@ -688,7 +1156,9 @@ func outputAsDesktop(ctx context.Context, deps *Deps, user, uid string, argv []s
 		"XDG_RUNTIME_DIR=/run/user/" + uid,
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
 		"WAYLAND_DISPLAY=wayland-0",
-		"QT_QPA_PLATFORM=wayland"}, argv...)
+		"QT_QPA_PLATFORM=wayland",
+		"XDG_CURRENT_DESKTOP=KDE",
+		"XDG_SESSION_TYPE=wayland"}, argv...)
 	return output(ctx, deps, "", args, timeout, true)
 }
 

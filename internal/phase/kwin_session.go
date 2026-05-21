@@ -302,6 +302,8 @@ UID_NUM="${CLOUDDEPLOY_KWIN_UID:-{{ .UID }}}"
 CONNECTOR="${CLOUDDEPLOY_KWIN_CONNECTOR:-{{ .Connector }}}"
 MODE="${CLOUDDEPLOY_KWIN_MODE:-{{ .Resolution }}@{{ .Refresh }}}"
 HDR="${CLOUDDEPLOY_KWIN_HDR:-{{ .HDR }}}"
+KSCREEN="${CLOUDDEPLOY_KSCREEN_DOCTOR:-$(command -v kscreen-doctor || true)}"
+QDBUS="${CLOUDDEPLOY_QDBUS:-$(command -v qdbus6 || command -v qdbus || command -v qdbus-qt5 || true)}"
 
 as_user() {
     timeout 20s runuser -u "${USER_NAME}" -- env \
@@ -316,9 +318,14 @@ as_user() {
 
 log() { echo "clouddeploy-force-kwin-mode: $*"; }
 
+if [ -z "${KSCREEN}" ]; then
+    log "kscreen-doctor not found in PATH"
+    exit 1
+fi
+
 end=$(( $(date +%s) + 60 ))
 while [ "$(date +%s)" -lt "${end}" ]; do
-    out="$(as_user kscreen-doctor -o 2>&1 || true)"
+    out="$(as_user "${KSCREEN}" -o 2>&1 || true)"
     output_id=""
     mode_id=""
     target_res="${MODE%@*}"
@@ -337,16 +344,21 @@ while [ "$(date +%s)" -lt "${end}" ]; do
         [ "${in_output}" = "1" ] || continue
         echo "${line}" | grep -q 'Modes:' || continue
         modes_line="${line#*Modes:}"
-        IFS=',' read -ra entries <<< "${modes_line}"
-        for entry in "${entries[@]}"; do
+        # Plasma 6.4 shape: "1:3840x2160@60!  2:3840x2160@120*"
+        # Older shape: "1!  3840x2160@120, 2  1920x1080@60"
+        tokens="$(echo "${modes_line}" | grep -oE '[0-9]+[:!][[:space:]]*[0-9]+x[0-9]+@[0-9.]+' || true)"
+        if [ -z "${tokens}" ]; then
+            tokens="$(echo "${modes_line}" | tr ',' '\n' || true)"
+        fi
+        while IFS= read -r entry; do
             m="$(echo "${entry}" | grep -oE '[0-9]+x[0-9]+@[0-9.]+' | head -n1 || true)"
-            id="$(echo "${entry}" | sed -E 's/^[[:space:]]*([0-9]+)[!:]?[[:space:]].*/\1/; t; s/^[[:space:]]*([0-9]+)[!:]?.*/\1/' || true)"
+            id="$(echo "${entry}" | grep -oE '^[[:space:]]*[0-9]+' | tr -d '[:space:]' || true)"
             [ -n "${m}" ] && [ -n "${id}" ] || continue
             if [ "${m}" = "${MODE}" ] || { [ "${target_refresh}" = "120" ] && echo "${m}" | grep -Eq "^${target_res}@119(\.|$)|^${target_res}@120(\.|$)"; }; then
                 mode_id="${id}"
                 break
             fi
-        done
+        done <<< "${tokens}"
     done <<< "${out}"
 
     if [ -n "${output_id}" ] && [ -n "${mode_id}" ]; then
@@ -363,7 +375,7 @@ while [ "$(date +%s)" -lt "${end}" ]; do
             args+=( "output.${CONNECTOR}.hdr.enable" "output.${CONNECTOR}.wcg.enable" )
         fi
     fi
-    if as_user kscreen-doctor "${args[@]}" >/dev/null 2>&1; then
+    if as_user "${KSCREEN}" "${args[@]}" >/dev/null 2>&1; then
         log "${CONNECTOR} -> ${MODE} scale=1 hdr=${HDR} output_id=${output_id:-unknown} mode_id=${mode_id:-unknown}"
         exit 0
     fi
@@ -375,16 +387,23 @@ done
 log "gave up after 60s; collecting diagnostics"
 
 # 1. Is org.kde.KWin even there?
-if as_user qdbus --session org.kde.KWin /KWin org.freedesktop.DBus.Introspectable.Introspect >/dev/null 2>&1; then
+if [ -z "${QDBUS}" ]; then
+    log "diag: no qdbus/qdbus6 command available"
+elif as_user "${QDBUS}" --session org.kde.KWin /KWin org.freedesktop.DBus.Introspectable.Introspect >/dev/null 2>&1; then
     log "diag: org.kde.KWin DBus introspect OK"
 else
     log "diag: org.kde.KWin MISSING on session bus - kwin_session readiness was incomplete"
 fi
 
 # 2. supportInformation: backend kind?
-support="$(as_user qdbus --session org.kde.KWin /KWin supportInformation 2>&1 || true)"
+support=""
+if [ -n "${QDBUS}" ]; then
+    support="$(as_user "${QDBUS}" --session org.kde.KWin /KWin org.kde.KWin.supportInformation 2>&1 || true)"
+fi
 if echo "${support}" | grep -q 'Output backend: DRM'; then
     log "diag: KWin supportInformation reports Output backend: DRM"
+elif echo "${support}" | grep -A3 '^Output backend$' | grep -q 'Name: DRM'; then
+    log "diag: KWin supportInformation reports Output backend / Name: DRM"
 elif echo "${support}" | grep -q 'Output backend:'; then
     log "diag: KWin supportInformation reports NON-DRM backend: $(echo "${support}" | grep 'Output backend:' | head -n1)"
 else
@@ -392,7 +411,7 @@ else
 fi
 
 # 3. kscreen-doctor -o: does the connector exist? does the mode exist?
-out="$(as_user kscreen-doctor -o 2>&1 || true)"
+out="$(as_user "${KSCREEN}" -o 2>&1 || true)"
 if echo "${out}" | grep -q "Output:.*${CONNECTOR}"; then
     log "diag: kscreen-doctor sees ${CONNECTOR}"
     if echo "${out}" | grep -q "${MODE}"; then
@@ -967,21 +986,28 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		}
 		details["support_information_bytes"] = len(support)
 		details["support_information_ok"] = true
-		outputBackendLine := firstLineContaining(support, "Output backend:")
-		details["support_information_output_backend"] = outputBackendLine
-		drmBackendOK := strings.Contains(outputBackendLine, "DRM")
+		connectorOK := connector == "" || strings.Contains(support, connector)
+		details["support_information_connector_ok"] = connectorOK
+		backend := parseKWinOutputBackend(support)
+		details["support_information_output_backend"] = backend
+		nestedBackend := isNestedKWinBackend(backend) || strings.Contains(journalLog, "automatically choosing Wayland because WAYLAND_DISPLAY is set")
+		details["support_information_nested_backend"] = nestedBackend
+		drmBackendOK := strings.EqualFold(backend, "DRM")
+		inferredDRM := false
+		if !drmBackendOK && !nestedBackend && connectorOK && choice.IsRealVT && strings.Contains(in.ExecStart, "--drm") && resolvedDRM != "" {
+			inferredDRM = true
+		}
 		details["support_information_drm_backend"] = drmBackendOK
-		if !drmBackendOK {
-			err := fmt.Errorf("KWin supportInformation does NOT report Output backend: DRM (likely nested-Wayland fallback). Output backend line: %q; tail: %q",
-				outputBackendLine, lastLines(support, 4))
+		details["support_information_drm_backend_inferred"] = inferredDRM
+		if nestedBackend || (!drmBackendOK && !inferredDRM) {
+			err := fmt.Errorf("KWin supportInformation does not prove DRM backend. Parsed backend=%q inferred_drm=%v nested=%v tail=%q",
+				backend, inferredDRM, nestedBackend, lastLines(support, 6))
 			details["err"] = err.Error()
 			deps.State.MarkFailed(KWinSessionName, "compositor backend is not DRM", err, true)
 			deps.State.Get(KWinSessionName).Details = details
 			_ = deps.PersistState()
 			return fmt.Errorf("phase kwin-session: %w", err)
 		}
-		connectorOK := connector == "" || strings.Contains(support, connector)
-		details["support_information_connector_ok"] = connectorOK
 		if !connectorOK {
 			err := fmt.Errorf("KWin supportInformation does not mention forced connector %q; tail: %q",
 				connector, lastLines(support, 8))
@@ -1012,13 +1038,17 @@ func (p KWinSession) kwinDBus(ctx context.Context, deps *Deps, user, uid string)
 	if deps.DryRun {
 		return true, "dry-run synthesized", nil
 	}
+	qdbus, qerr := resolveQDBus()
+	if qerr != nil {
+		return false, "", qerr
+	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
 			"sudo", "-u", user,
 			"env",
 			"XDG_RUNTIME_DIR=/run/user/" + uid,
 			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
-			"qdbus", "--session", "org.kde.KWin", "/KWin",
+			qdbus.Path, "--session", "org.kde.KWin", "/KWin",
 			"org.freedesktop.DBus.Introspectable.Introspect",
 		},
 		Sudo:    true,
@@ -1028,7 +1058,7 @@ func (p KWinSession) kwinDBus(ctx context.Context, deps *Deps, user, uid string)
 	if res.Err != nil {
 		return false, lastLines(res.Stderr, 2), res.Err
 	}
-	return true, "introspect OK", nil
+	return true, "introspect OK via " + qdbus.Path, nil
 }
 
 // supportInformation runs `qdbus org.kde.KWin /KWin org.kde.KWin.supportInformation`.
@@ -1042,13 +1072,17 @@ func (p KWinSession) supportInformation(ctx context.Context, deps *Deps, user, u
 		// Synthesize a passing dump so apply --dry-run can demo end-to-end.
 		return "Output backend: DRM\nCompositing backend: OpenGL\nOutput: DP-1\n", nil
 	}
+	qdbus, qerr := resolveQDBus()
+	if qerr != nil {
+		return "", qerr
+	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
 			"sudo", "-u", user,
 			"env",
 			"XDG_RUNTIME_DIR=/run/user/" + uid,
 			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
-			"qdbus", "--session", "org.kde.KWin", "/KWin", "org.kde.KWin.supportInformation",
+			qdbus.Path, "--session", "org.kde.KWin", "/KWin", "org.kde.KWin.supportInformation",
 		},
 		Sudo:    true,
 		Timeout: 30 * time.Second,
@@ -1243,6 +1277,61 @@ func firstLineContaining(s, needle string) string {
 		}
 	}
 	return ""
+}
+
+func parseKWinOutputBackend(support string) string {
+	lines := strings.Split(support, "\n")
+	for i, raw := range lines {
+		line := strings.TrimSpace(strings.TrimRight(raw, "\r"))
+		if line == "" {
+			continue
+		}
+		lower := strings.ToLower(line)
+		for _, prefix := range []string{"output backend:", "backend:", "platform:"} {
+			if strings.HasPrefix(lower, prefix) {
+				v := strings.TrimSpace(line[len(prefix):])
+				if v != "" {
+					return normalizeKWinBackend(v)
+				}
+			}
+		}
+		if strings.EqualFold(line, "Output backend") || strings.EqualFold(line, "Backend") || strings.EqualFold(line, "Platform") {
+			for j := i + 1; j < len(lines) && j < i+8; j++ {
+				next := strings.TrimSpace(strings.TrimRight(lines[j], "\r"))
+				if next == "" {
+					break
+				}
+				if strings.HasPrefix(strings.ToLower(next), "name:") {
+					return normalizeKWinBackend(strings.TrimSpace(next[len("name:"):]))
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func normalizeKWinBackend(v string) string {
+	v = strings.Trim(strings.TrimSpace(v), `"'`)
+	fields := strings.Fields(v)
+	if len(fields) > 0 {
+		v = fields[0]
+	}
+	switch strings.ToLower(v) {
+	case "drm", "kms":
+		return "DRM"
+	case "wayland", "nestedwayland", "nested-wayland":
+		return "Wayland"
+	default:
+		return v
+	}
+}
+
+func isNestedKWinBackend(backend string) bool {
+	switch strings.ToLower(strings.TrimSpace(backend)) {
+	case "wayland", "nestedwayland", "nested-wayland", "x11":
+		return true
+	}
+	return false
 }
 
 // resolveDRMDevice picks the /dev/dri/card* node the compositor

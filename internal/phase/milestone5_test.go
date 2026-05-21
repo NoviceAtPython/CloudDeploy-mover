@@ -37,6 +37,11 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 			t.Fatalf("sunshine.conf contains invalid key marker %q:\n%s", bad, body)
 		}
 	}
+	for _, bad := range []string{"force_av1_hdr10", "synthesize_hdr10_metadata"} {
+		if strings.Contains(body, bad) {
+			t.Fatalf("sunshine.conf contains env-only key %q:\n%s", bad, body)
+		}
+	}
 	for _, want := range []string{
 		"capture = kms",
 		"encoder = nvenc",
@@ -74,6 +79,11 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 		"After=network-online.target kwin-realvt.service",
 		"ExecStart=/usr/local/bin/sunshine-clouddeploy /home/cloudgamer/.config/sunshine/sunshine.conf",
 		"Environment=WAYLAND_DISPLAY=wayland-0",
+		"AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE",
+		"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE",
+		"NoNewPrivileges=false",
+		"Environment=SUNSHINE_FORCE_AV1_HDR10=1",
+		"Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1",
 	} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("sunshine service missing %q:\n%s", want, unit)
@@ -123,6 +133,77 @@ func TestStreamValidatePendingUntilMoonlightProducesKMSMarkers(t *testing.T) {
 	}
 	if got := deps.State.Get(StreamValidateName).Status; got != state.StatusPendingMoonlightConnect {
 		t.Fatalf("status: got %q want pending_moonlight_connect", got)
+	}
+}
+
+func TestSunshineCMakeArgsEnableCUDAWhenDetected(t *testing.T) {
+	args := strings.Join(sunshineCMakeArgs(config.SunshineConfig{EnableCUDA: "auto"}, "/usr/local/bin/doxygen", cudaToolchain{
+		Found: true,
+		NVCC:  "/usr/local/cuda/bin/nvcc",
+		Root:  "/usr/local/cuda",
+	}, false), " ")
+	for _, want := range []string{
+		"-DDOXYGEN_EXECUTABLE=/usr/local/bin/doxygen",
+		"-DSUNSHINE_ENABLE_CUDA=ON",
+		"-DCUDAToolkit_ROOT=/usr/local/cuda",
+		"-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc",
+		"-DCUDA_FAIL_ON_MISSING=OFF",
+	} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("cmake args missing %q: %s", want, args)
+		}
+	}
+}
+
+func TestSunshineCMakeArgsDisableCUDAWhenMissingByDefault(t *testing.T) {
+	args := strings.Join(sunshineCMakeArgs(config.SunshineConfig{EnableCUDA: "auto"}, "/usr/local/bin/doxygen", cudaToolchain{}, false), " ")
+	for _, want := range []string{"-DSUNSHINE_ENABLE_CUDA=OFF", "-DCUDA_FAIL_ON_MISSING=OFF"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("cmake args missing %q: %s", want, args)
+		}
+	}
+	if shouldRetrySunshineWithoutCUDA(config.SunshineConfig{EnableCUDA: "true"}, cudaToolchain{Found: true}) {
+		t.Fatalf("strict enable_cuda=true should not silently retry without CUDA")
+	}
+}
+
+func TestVersionAtLeastDoxygenThreshold(t *testing.T) {
+	if versionAtLeast("1.9.8", "1.10.0") {
+		t.Fatalf("Doxygen 1.9.8 must be treated as too old for current Sunshine")
+	}
+	if !versionAtLeast("1.17.0", "1.10.0") {
+		t.Fatalf("Doxygen 1.17.0 should satisfy the Sunshine requirement")
+	}
+}
+
+func TestParseSunshineStreamEvidenceLiveGoodHDRHEVCSample(t *testing.T) {
+	logs := `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+Found monitor for DRM screencasting
+Desktop resolution: 3840x2160
+hevc_nvenc initialized successfully
+Color coding: HDR (Rec. 2020 + SMPTE 2084 PQ)
+Color depth: 10-bit
+selected_pix_fmt=p010
+is_hdr: NVIDIA private HDR via NV_INPUT_COLORSPACE=BT.2100 PQ
+Attempting to use NVENC without CUDA support. Reverting back to GPU -> RAM -> GPU
+`
+	ev := parseSunshineStreamEvidence(logs)
+	if !ev.KMS || !ev.NVENC || !ev.HEVC || !ev.Resolution4K || !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
+		t.Fatalf("evidence did not detect live good HDR HEVC sample: %+v", ev)
+	}
+	if !ev.CUDAInteropWarning {
+		t.Fatalf("CUDA interop warning should be recorded but nonfatal")
+	}
+	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, "/dev/dri/card1", "DP-1", "3840", "2160"); err != nil {
+		t.Fatalf("selected capture should validate: %v", err)
+	}
+}
+
+func TestValidateSunshineSelectedCaptureRejectsWrongVirtioPlane(t *testing.T) {
+	line := "STREAM_DIAG kms capture selected drm_device=/dev/dri/card0 connector=Virtual-1 width=1024 height=768 pixel_format=XR24"
+	if err := validateSunshineSelectedCapture(line, "/dev/dri/card1", "DP-1", "3840", "2160"); err == nil {
+		t.Fatalf("expected wrong KMS target to fail")
 	}
 }
 
@@ -231,5 +312,23 @@ func TestUpdateSunshineCSRFNoopWithoutFile(t *testing.T) {
 	updateSunshineCSRF(context.Background(), deps, "100.64.0.1")
 	if _, err := os.Stat(deps.Profile.Sunshine.ConfigPath); !os.IsNotExist(err) {
 		t.Fatalf("missing config should stay missing, stat err=%v", err)
+	}
+}
+
+func TestSunshineCSRFOriginsIncludeExtraAndPublicIP(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.Profile.Sunshine.ExtraCSRFAllowedOrigins = []string{"https://example.test:47990"}
+	t.Setenv("CLOUDDEPLOY_PUBLIC_IP", "203.0.113.10")
+	got := strings.Join(sunshineCSRFOrigins(deps, "100.64.0.1"), ",")
+	for _, want := range []string{
+		"https://localhost:47990",
+		"https://127.0.0.1:47990",
+		"https://100.64.0.1:47990",
+		"https://203.0.113.10:47990",
+		"https://example.test:47990",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("origins missing %q: %s", want, got)
+		}
 	}
 }

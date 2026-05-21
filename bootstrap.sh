@@ -362,16 +362,38 @@ prompt_secrets() {
         fi
     fi
 
+    local sunshine_user="${SUNSHINE_USER:-cloudgamer}"
+    local sunshine_pass="${SUNSHINE_PASS:-}"
+    if [[ -z "${sunshine_pass}" ]]; then
+        log "Sunshine Web UI credentials are needed once so resume can run 'sunshine --creds'."
+        if [[ -r /dev/tty ]]; then
+            read -rp "Sunshine username [${sunshine_user}]: " entered_user < /dev/tty
+            [[ -n "${entered_user:-}" ]] && sunshine_user="${entered_user}"
+            read -rsp "Sunshine password (blank to skip credential setup): " sunshine_pass < /dev/tty
+            echo >/dev/tty
+        else
+            read -rp "Sunshine username [${sunshine_user}]: " entered_user
+            [[ -n "${entered_user:-}" ]] && sunshine_user="${entered_user}"
+            read -rsp "Sunshine password (blank to skip credential setup): " sunshine_pass
+            echo
+        fi
+    fi
+
     if [[ "${wants_tailscale}" != "1" ]]; then
         log "Profile ${PROFILE} does not enable Tailscale; skipping authkey prompt."
+        write_secrets_file "${secrets_path}" "" "${sunshine_user}" "${sunshine_pass}"
+        export SUNSHINE_USER="${sunshine_user}"
+        export SUNSHINE_PASS="${sunshine_pass}"
         return 0
     fi
 
     # Operator already exported the key (e.g. from a CI runner)?
     # Persist it to secrets.env so the post-reboot resume sees it too.
     if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
-        log "TAILSCALE_AUTHKEY found in environment; persisting to ${secrets_path}."
-        write_secrets_file "${secrets_path}" "${TAILSCALE_AUTHKEY}"
+        log "TAILSCALE_AUTHKEY found in environment; persisting secrets to ${secrets_path}."
+        write_secrets_file "${secrets_path}" "${TAILSCALE_AUTHKEY}" "${sunshine_user}" "${sunshine_pass}"
+        export SUNSHINE_USER="${sunshine_user}"
+        export SUNSHINE_PASS="${sunshine_pass}"
         return 0
     fi
 
@@ -390,12 +412,17 @@ prompt_secrets() {
     fi
     if [[ -z "${key}" ]]; then
         log "No auth key entered; Tailscale phase will skip nonfatally."
+        write_secrets_file "${secrets_path}" "" "${sunshine_user}" "${sunshine_pass}"
+        export SUNSHINE_USER="${sunshine_user}"
+        export SUNSHINE_PASS="${sunshine_pass}"
         return 0
     fi
-    write_secrets_file "${secrets_path}" "${key}"
+    write_secrets_file "${secrets_path}" "${key}" "${sunshine_user}" "${sunshine_pass}"
     # Export to this process too so apply (before the first reboot)
     # can use it without re-reading the file.
     export TAILSCALE_AUTHKEY="${key}"
+    export SUNSHINE_USER="${sunshine_user}"
+    export SUNSHINE_PASS="${sunshine_pass}"
     # Local var goes out of scope at function return; clear belt+suspenders.
     key=""
 }
@@ -405,6 +432,8 @@ prompt_secrets() {
 write_secrets_file() {
     local path="$1"
     local key="$2"
+    local sunshine_user="${3:-cloudgamer}"
+    local sunshine_pass="${4:-}"
     local dir
     dir="$(dirname "${path}")"
     install -d -m 0755 -o root -g root "${dir}"
@@ -419,13 +448,21 @@ write_secrets_file() {
     # Write via printf rather than echo to avoid backslash mangling.
     printf '# managed by clouddeployctl bootstrap: operator secrets for the resume continuation service.\n' > "${tmp}"
     printf '# DO NOT EDIT BY HAND. mode 0600 root:root. systemd reads this via EnvironmentFile=.\n' >> "${tmp}"
-    printf "TAILSCALE_AUTHKEY='%s'\n" "${escaped}" >> "${tmp}"
+    if [[ -n "${key}" ]]; then
+        printf "TAILSCALE_AUTHKEY='%s'\n" "${escaped}" >> "${tmp}"
+    fi
+    local escaped_user="${sunshine_user//\'/\'\\\'\'}"
+    local escaped_pass="${sunshine_pass//\'/\'\\\'\'}"
+    printf "SUNSHINE_USER='%s'\n" "${escaped_user}" >> "${tmp}"
+    if [[ -n "${sunshine_pass}" ]]; then
+        printf "SUNSHINE_PASS='%s'\n" "${escaped_pass}" >> "${tmp}"
+    fi
     chown root:root "${tmp}"
     chmod 0600 "${tmp}"
     mv -f "${tmp}" "${path}"
     chmod 0600 "${path}"
     chown root:root "${path}"
-    log "Wrote ${path} (0600 root:root); key length=$(printf '%s' "${key}" | wc -c)"
+    log "Wrote ${path} (0600 root:root); tailscale_key_length=$(printf '%s' "${key}" | wc -c); sunshine_user=${sunshine_user}; sunshine_pass_set=$([[ -n "${sunshine_pass}" ]] && echo yes || echo no)"
 }
 
 main() {

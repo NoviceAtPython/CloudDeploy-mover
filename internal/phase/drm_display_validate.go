@@ -300,6 +300,7 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	rawOut, err := p.runKScreen(ctx, deps, desk.User, uid)
 	if err != nil {
 		details["kscreen_err"] = err.Error()
+		details["kscreen_raw_excerpt"] = lastLines(rawOut, 12)
 		deps.State.MarkFailed(DRMDisplayValidateName, "kscreen-doctor failed", err, true)
 		deps.State.Get(DRMDisplayValidateName).Details = details
 		_ = deps.PersistState()
@@ -313,6 +314,8 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	if conn == nil {
 		err := fmt.Errorf("kscreen-doctor reports no connector named %q (saw %v)", connector, connectorNames(parsed))
 		details["err"] = err.Error()
+		details["kscreen_connector_names"] = connectorNames(parsed)
+		details["kscreen_raw_excerpt"] = lastLines(rawOut, 20)
 		deps.State.MarkFailed(DRMDisplayValidateName, "connector missing in kscreen-doctor output", err, true)
 		deps.State.Get(DRMDisplayValidateName).Details = details
 		_ = deps.PersistState()
@@ -368,13 +371,17 @@ func (p DRMDisplayValidate) kwinDBusReady(ctx context.Context, deps *Deps, user,
 	if p.KWinDBusFn != nil {
 		return p.KWinDBusFn(ctx, deps, user, uid)
 	}
+	qdbus, qerr := resolveQDBus()
+	if qerr != nil {
+		return false, "", qerr
+	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
 			"sudo", "-u", user,
 			"env",
 			"XDG_RUNTIME_DIR=/run/user/" + uid,
 			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
-			"qdbus", "--session", "org.kde.KWin", "/KWin",
+			qdbus.Path, "--session", "org.kde.KWin", "/KWin",
 			"org.freedesktop.DBus.Introspectable.Introspect",
 		},
 		Sudo:    true,
@@ -384,7 +391,7 @@ func (p DRMDisplayValidate) kwinDBusReady(ctx context.Context, deps *Deps, user,
 	if res.Err != nil {
 		return false, lastLines(res.Stderr, 2), res.Err
 	}
-	return true, "introspect OK", nil
+	return true, "introspect OK via " + qdbus.Path, nil
 }
 
 func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, uid string) (string, error) {
@@ -414,6 +421,10 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 	// the headless host has no X server. Set the full env the KDE
 	// shell expects so kscreen-doctor is forced through the Wayland
 	// platform plugin.
+	kscreen, kerr := resolveKScreenDoctor()
+	if kerr != nil {
+		return "", fmt.Errorf("missing kscreen-doctor: %w", kerr)
+	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv: []string{
 			"sudo", "-u", user,
@@ -426,7 +437,7 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 			"XDG_SESSION_TYPE=wayland",
 			"XDG_SESSION_DESKTOP=KDE",
 			"KDE_FULL_SESSION=true",
-			"kscreen-doctor", "-o",
+			kscreen.Path, "-o",
 		},
 		Sudo:    true,
 		Timeout: 15 * time.Second,

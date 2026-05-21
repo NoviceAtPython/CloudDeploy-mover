@@ -351,10 +351,7 @@ func (p KWinPatch) buildInstall(ctx context.Context, deps *Deps, cfg config.KWin
 	//   - the only -y install in this codepath is THIS file's
 	//     locally-built KWin .debs (operator-explicit intent);
 	//   - we re-hold immediately after via the HoldPackages block.
-	args := append(
-		[]string{"apt-get", "-y", "--allow-downgrades", "--allow-change-held-packages", "install"},
-		debs...,
-	)
+	args := kwinLocalDebInstallArgs(debs)
 	if err := run(ctx, deps, "", args, 45*time.Minute, true); err != nil {
 		return nil, err
 	}
@@ -365,6 +362,10 @@ func (p KWinPatch) buildInstall(ctx context.Context, deps *Deps, cfg config.KWin
 		}
 	}
 	return pkgs, nil
+}
+
+func kwinLocalDebInstallArgs(debs []string) []string {
+	return append([]string{"apt-get", "-y", "--allow-downgrades", "--allow-change-held-packages", "install"}, debs...)
 }
 
 func run(ctx context.Context, deps *Deps, cwd string, argv []string, timeout time.Duration, sudo bool, extraEnv ...string) error {

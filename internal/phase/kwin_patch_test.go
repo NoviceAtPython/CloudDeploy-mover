@@ -456,6 +456,16 @@ func TestPackageNamesFromDebs(t *testing.T) {
 	}
 }
 
+func TestKWinLocalDebInstallArgsAllowDowngrades(t *testing.T) {
+	args := kwinLocalDebInstallArgs([]string{"./kwin-wayland_6.4.5-0ubuntu3_amd64.deb"})
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"--allow-downgrades", "--allow-change-held-packages", "install", "./kwin-wayland_6.4.5-0ubuntu3_amd64.deb"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("install args missing %q: %v", want, args)
+		}
+	}
+}
+
 func TestKWinPatch_SourceModePackaged_RequirePatchTrue(t *testing.T) {
 	patchPath := writeTestPatch(t)
 	deps := newDeps(t, kwinPatchProfile(t, patchPath), nil)
