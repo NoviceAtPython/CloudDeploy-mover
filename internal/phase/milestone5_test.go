@@ -221,10 +221,10 @@ func TestStreamValidateFailsHDRProfileWhenServerInfoLacksHEVCMain10(t *testing.T
 	deps := milestone5Deps(t)
 	deps.DryRun = false
 	// Bits: H264 + HEVC + AV1 Main8 + AV1 Main10 (= 1 + 0x100 +
-	// 0x10000 + 0x20000 = 197377). NO HEVC Main10 (0x200) - so the
+	// 0x10000 + 0x20000 = 196865). NO HEVC Main10 (0x200) - so the
 	// AV1 gate passes and we land on the HEVC Main10 gate, which is
 	// the regression this test pins.
-	const codecBits = 197377
+	const codecBits = 196865
 	ph := StreamValidate{
 		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
@@ -298,8 +298,8 @@ func TestStreamValidateHDRProfilePassesBothMain10Bits(t *testing.T) {
 	deps := milestone5Deps(t)
 	deps.DryRun = false
 	// Full HDR Main10 ad: H264 + HEVC + HEVC Main10 + AV1 Main8 +
-	// AV1 Main10 = 1 + 0x100 + 0x200 + 0x10000 + 0x20000 = 197889.
-	const codecBits = 197889
+	// AV1 Main10 = 1 + 0x100 + 0x200 + 0x10000 + 0x20000 = 197377.
+	const codecBits = 197377
 	ph := StreamValidate{
 		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
