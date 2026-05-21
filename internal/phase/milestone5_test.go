@@ -87,7 +87,6 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 		"AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE",
 		"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE",
 		"NoNewPrivileges=false",
-		"DeviceAllow=/dev/uinput rw",
 		"Environment=SUNSHINE_FORCE_AV1_HDR10=1",
 		"Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1",
 	} {
@@ -95,7 +94,7 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 			t.Errorf("sunshine service missing %q:\n%s", want, unit)
 		}
 	}
-	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service"} {
+	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service", "DeviceAllow=/dev/uinput", "DevicePolicy="} {
 		if strings.Contains(unit, bad) {
 			t.Errorf("sunshine service should not contain %q:\n%s", bad, unit)
 		}
@@ -254,6 +253,84 @@ Attempting to use NVENC without CUDA support. Reverting back to GPU -> RAM -> GP
 	}
 	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, "/dev/dri/card1", "DP-1", "3840", "2160"); err != nil {
 		t.Fatalf("selected capture should validate: %v", err)
+	}
+}
+
+func TestParseSunshineStreamEvidenceRejectsH264HDRP010Combination(t *testing.T) {
+	logs := `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+Encode selection: codec=H.264 (videoFormat=0) client_dynamicRange=1 is_hdr_display=yes selected_colorspace=HDR (Rec. 2020 + SMPTE 2084 PQ) selected_bit_depth=10-bit selected_pix_fmt=p010 chromaSamplingType=0
+Error: h264_nvenc: dynamic range not supported
+`
+	ev := parseSunshineStreamEvidence(logs)
+	if !ev.InvalidH264HDR {
+		t.Fatalf("expected invalid H.264 HDR selection to be detected: %+v", ev)
+	}
+	if !ev.H264DynamicRangeUnsupported {
+		t.Fatalf("expected h264 dynamic range error to be detected: %+v", ev)
+	}
+	if ev.SelectedCodec != "H.264" || ev.VideoFormat != "0" || ev.ClientDynamicRange != "1" {
+		t.Fatalf("unexpected encode-selection parse: %+v", ev)
+	}
+}
+
+func TestStreamValidateFailsInvalidH264HDRSession(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return "<root status_code=\"200\"></root>", nil },
+		JournalFn: func(context.Context, *Deps) (string, error) {
+			return `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+Found monitor for DRM screencasting
+Desktop resolution: 3840x2160
+Encode selection: codec=H.264 (videoFormat=0) client_dynamicRange=1 is_hdr_display=yes selected_colorspace=HDR (Rec. 2020 + SMPTE 2084 PQ) selected_bit_depth=10-bit selected_pix_fmt=p010 chromaSamplingType=0
+Error: h264_nvenc: dynamic range not supported
+`, nil
+		},
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected invalid H.264 HDR session to fail")
+	}
+	if !strings.Contains(err.Error(), "H.264 HDR") {
+		t.Fatalf("error should mention invalid H.264 HDR: %v", err)
+	}
+	if got := deps.State.Get(StreamValidateName).Details["selected_codec"]; got != "H.264" {
+		t.Fatalf("selected_codec detail: got %v want H.264", got)
+	}
+}
+
+func TestRenderNodeForCard(t *testing.T) {
+	tests := map[string]string{
+		"/dev/dri/card0":    "/dev/dri/renderD128",
+		"/dev/dri/card1":    "/dev/dri/renderD129",
+		"/dev/dri/renderD1": "",
+		"":                  "",
+	}
+	for in, want := range tests {
+		if got := renderNodeForCard(in); got != want {
+			t.Fatalf("renderNodeForCard(%q): got %q want %q", in, got, want)
+		}
+	}
+}
+
+func TestContainsRawWebMarkerDetectsUnbuiltVueAssets(t *testing.T) {
+	for _, raw := range []string{
+		"<%- header %>",
+		"import { createApp } from 'vue'",
+		"import Navbar from './Navbar.vue'",
+		"{{ $t('index.welcome') }}",
+	} {
+		if !containsRawWebMarker(raw) {
+			t.Fatalf("expected raw web marker in %q", raw)
+		}
+	}
+	if containsRawWebMarker("(()=>{console.log('bundled asset')})();") {
+		t.Fatalf("bundled JS should not look like raw Vue/template source")
 	}
 }
 

@@ -21,6 +21,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -609,6 +610,10 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorKwinPatchCmd())
 	doctor.AddCommand(newDoctorDRMDisplayCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
+	doctor.AddCommand(newDoctorSunshineWebCmd())
+	doctor.AddCommand(newDoctorStreamSessionCmd())
+	doctor.AddCommand(newDoctorCodecsCmd())
+	doctor.AddCommand(newDoctorMoonlightCmd())
 	doctor.AddCommand(newDoctorToolsCmd())
 	doctor.AddCommand(newDoctorNetworkCmd())
 	doctor.AddCommand(newDoctorLockCmd())
@@ -1245,6 +1250,41 @@ func newDoctorSunshineCmd() *cobra.Command {
 				Timeout: 5 * time.Second,
 			})
 			fmt.Printf("  /dev/uinput writable   : %v\n", uinput.Err == nil)
+			drmDevice := "/dev/dri/card1"
+			if ph := deps.State.Get(phase.KWinSessionName); ph != nil && ph.Details != nil {
+				if v, ok := ph.Details["selected_drm_device"].(string); ok && strings.TrimSpace(v) != "" {
+					drmDevice = strings.TrimSpace(v)
+				} else if v, ok := ph.Details["kwin_drm_device_resolved"].(string); ok && strings.TrimSpace(v) != "" {
+					drmDevice = strings.TrimSpace(v)
+				}
+			}
+			renderNode := doctorRenderNodeForCard(drmDevice)
+			fmt.Printf("  selected DRM device    : %s\n", drmDevice)
+			if renderNode != "" {
+				fmt.Printf("  expected render node   : %s\n", renderNode)
+			}
+			id := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: []string{"id", user}, LogFile: "-", Timeout: 5 * time.Second})
+			fmt.Printf("  user groups            : %s\n", strings.TrimSpace(id.Stdout))
+			for _, path := range []string{drmDevice, renderNode, "/dev/uinput", "/dev/nvidiactl", "/dev/nvidia0", "/dev/nvidia-uvm"} {
+				if strings.TrimSpace(path) == "" {
+					continue
+				}
+				ls := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: []string{"ls", "-l", path}, LogFile: "-", Timeout: 5 * time.Second})
+				if ls.Err == nil {
+					fmt.Printf("  %-22s: %s\n", path, strings.TrimSpace(ls.Stdout))
+				} else {
+					fmt.Printf("  %-22s: missing/unreadable (%v)\n", path, ls.Err)
+				}
+			}
+			for _, path := range []string{drmDevice, renderNode, "/dev/uinput"} {
+				if strings.TrimSpace(path) == "" {
+					continue
+				}
+				acl := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: []string{"getfacl", "-p", path}, LogFile: "-", Timeout: 5 * time.Second})
+				if acl.Err == nil {
+					fmt.Printf("  getfacl %-14s: %s\n", path, oneLine(strings.TrimSpace(acl.Stdout)))
+				}
+			}
 			if fileExists(cfg.InstallBin) {
 				res := deps.Runner.Exec(ctx, runner.CommandSpec{
 					Argv:    []string{"getcap", cfg.InstallBin},
@@ -1266,11 +1306,19 @@ func newDoctorSunshineCmd() *cobra.Command {
 				LogFile: "-",
 				Timeout: 10 * time.Second,
 			})
+			show := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"systemctl", "show", "sunshine-headless.service", "-p", "DevicePolicy", "-p", "DeviceAllow", "-p", "AmbientCapabilities", "-p", "CapabilityBoundingSet", "-p", "NoNewPrivileges"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			if show.Err == nil {
+				fmt.Printf("  service restrictions   : %s\n", oneLine(strings.TrimSpace(show.Stdout)))
+			}
 			if unit.Err == nil {
 				fmt.Printf("  service has force HDR  : %v\n", strings.Contains(unit.Stdout, "SUNSHINE_FORCE_AV1_HDR10=1"))
 				fmt.Printf("  service uses kwin-realvt: %v\n", strings.Contains(unit.Stdout, "kwin-realvt.service"))
 				fmt.Printf("  service has CAP_SYS_ADMIN: %v\n", strings.Contains(unit.Stdout, "AmbientCapabilities=CAP_SYS_ADMIN"))
-				fmt.Printf("  service DeviceAllow uinput: %v\n", strings.Contains(unit.Stdout, "DeviceAllow=/dev/uinput rw"))
+				fmt.Printf("  service standalone DeviceAllow: %v\n", strings.Contains(unit.Stdout, "DeviceAllow="))
 			} else {
 				fmt.Println("  service                : sunshine-headless.service not installed")
 			}
@@ -1292,6 +1340,144 @@ func newDoctorSunshineCmd() *cobra.Command {
 					fmt.Printf("  log marker %-36s: %v\n", marker, strings.Contains(journal.Stdout, marker))
 				}
 			}
+			return nil
+		},
+	}
+}
+
+func newDoctorSunshineWebCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sunshine-web",
+		Short: "Report Sunshine Web UI asset/rendering state (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			root := "/usr/local/assets/web"
+			index := filepath.Join(root, "index.html")
+			js, css := countWebAssets(root)
+			raw := doctorRawWebMarkers(root)
+			fmt.Println("doctor sunshine-web:")
+			fmt.Printf("  runtime asset root     : %s\n", root)
+			fmt.Printf("  index path             : %s\n", index)
+			fmt.Printf("  index exists           : %v\n", fileExists(index))
+			fmt.Printf("  JS asset count         : %d\n", js)
+			fmt.Printf("  CSS asset count        : %d\n", css)
+			fmt.Printf("  raw template markers   : %v\n", raw)
+			fmt.Printf("  localhost Web UI       : %s\n", curlHTTPStatus(ctx, deps, "https://127.0.0.1:47990"))
+			fmt.Printf("  localhost /welcome     : %s\n", curlHTTPStatus(ctx, deps, "https://127.0.0.1:47990/welcome"))
+			if raw {
+				fmt.Println("  diagnosis              : runtime web assets still look like raw Vue/template source; pairing helper remains CLI/API-safe.")
+			}
+			return nil
+		},
+	}
+}
+
+func newDoctorStreamSessionCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "stream-session",
+		Short: "Report latest Sunshine/Moonlight session negotiation markers (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			journal := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"journalctl", "-u", "sunshine-headless.service", "-n", "800", "--no-pager"},
+				LogFile: "-",
+				Timeout: 15 * time.Second,
+			})
+			logs := journal.Stdout
+			fmt.Println("doctor stream-session:")
+			for _, label := range []string{
+				"STREAM_DIAG kms capture selected",
+				"Encode selection:",
+				"h264_nvenc: dynamic range not supported",
+				"hevc_nvenc initialized successfully",
+				"Color coding: HDR",
+				"Color depth: 10-bit",
+				"selected_pix_fmt=p010",
+			} {
+				fmt.Printf("  %-42s: %s\n", label, lastMatchingLine(logs, label))
+			}
+			if strings.Contains(logs, "codec=H.264") && (strings.Contains(logs, "selected_colorspace=HDR") || strings.Contains(logs, "selected_pix_fmt=p010")) {
+				fmt.Println("  invalid combination    : H.264 selected with HDR/10-bit/p010; this must fail validation.")
+			}
+			return nil
+		},
+	}
+}
+
+func newDoctorCodecsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "codecs",
+		Short: "Report GPU/NVENC codec and Sunshine advertisement clues (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			fmt.Println("doctor codecs:")
+			gpu := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			fmt.Printf("  GPU / driver           : %s\n", strings.TrimSpace(gpu.Stdout))
+			serverInfo := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"curl", "-fsS", "--max-time", "5", "http://127.0.0.1:47989/serverinfo"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			fmt.Printf("  serverinfo reachable   : %v\n", serverInfo.Err == nil)
+			fmt.Printf("  ServerCodecModeSupport : %s\n", serverInfoValue(serverInfo.Stdout, "ServerCodecModeSupport"))
+			journal := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"journalctl", "-u", "sunshine-headless.service", "-n", "800", "--no-pager"},
+				LogFile: "-",
+				Timeout: 15 * time.Second,
+			})
+			logs := journal.Stdout
+			fmt.Printf("  H.264 NVENC seen       : %v\n", strings.Contains(logs, "h264_nvenc"))
+			fmt.Printf("  HEVC NVENC seen        : %v\n", strings.Contains(logs, "hevc_nvenc"))
+			fmt.Printf("  AV1 NVENC seen         : %v\n", strings.Contains(logs, "av1_nvenc"))
+			fmt.Printf("  AV1 unsupported marker : %v\n", strings.Contains(logs, "does not support AV1"))
+			fmt.Printf("  HEVC HDR Main10 marker : %v\n", strings.Contains(logs, "Color coding: HDR") && strings.Contains(logs, "Color depth: 10-bit"))
+			return nil
+		},
+	}
+}
+
+func newDoctorMoonlightCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "moonlight",
+		Short: "Print Moonlight-facing URLs and stream diagnostic hints",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			ip := ""
+			if ph := deps.State.Get(phase.TailscaleName); ph != nil && ph.Details != nil {
+				if v, ok := ph.Details["tailscale_ip"].(string); ok {
+					ip = strings.TrimSpace(v)
+				}
+			}
+			fmt.Println("doctor moonlight:")
+			fmt.Printf("  local serverinfo       : %s\n", curlHTTPStatus(ctx, deps, "http://127.0.0.1:47989/serverinfo"))
+			if ip != "" {
+				fmt.Printf("  Tailscale serverinfo   : %s\n", curlHTTPStatus(ctx, deps, "http://"+ip+":47989/serverinfo"))
+				fmt.Printf("  Pair/Web UI            : https://%s:47990\n", ip)
+				fmt.Printf("  Moonlight host         : %s\n", ip)
+			} else {
+				fmt.Println("  Tailscale IP           : missing; use doctor network for firewall/tunnel fallback.")
+			}
+			fmt.Println("  target                 : HEVC Main10 HDR on Ampere/A5000/A6000; AV1 only when GPU/client support it.")
 			return nil
 		},
 	}
@@ -1412,6 +1598,104 @@ func firstLineContainingLocal(s, needle string) string {
 		}
 	}
 	return "(missing)"
+}
+
+func oneLine(s string) string {
+	fields := strings.Fields(s)
+	if len(fields) == 0 {
+		return ""
+	}
+	out := strings.Join(fields, " ")
+	if len(out) > 500 {
+		return out[:500] + "..."
+	}
+	return out
+}
+
+func countWebAssets(root string) (js int, css int) {
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(path)) {
+		case ".js":
+			js++
+		case ".css":
+			css++
+		}
+		return nil
+	})
+	return js, css
+}
+
+func doctorRawWebMarkers(root string) bool {
+	raw := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || raw || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".html" && ext != ".js" && ext != ".ts" && ext != ".vue" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err == nil && (strings.Contains(string(b), "<%- header %>") ||
+			strings.Contains(string(b), "import { createApp } from 'vue'") ||
+			strings.Contains(string(b), `import { createApp } from "vue"`) ||
+			strings.Contains(string(b), ".vue'") ||
+			strings.Contains(string(b), `.vue"`) ||
+			strings.Contains(string(b), "{{ $t(")) {
+			raw = true
+		}
+		return nil
+	})
+	return raw
+}
+
+func lastMatchingLine(s, needle string) string {
+	out := "(missing)"
+	for _, line := range strings.Split(s, "\n") {
+		if strings.Contains(line, needle) {
+			out = strings.TrimSpace(line)
+		}
+	}
+	if len(out) > 220 {
+		return out[:220] + "..."
+	}
+	return out
+}
+
+func serverInfoValue(s, key string) string {
+	if strings.TrimSpace(s) == "" {
+		return "(missing)"
+	}
+	for _, pat := range []string{"<" + key + ">", key + "=\""} {
+		idx := strings.Index(s, pat)
+		if idx < 0 {
+			continue
+		}
+		rest := s[idx+len(pat):]
+		if strings.HasSuffix(pat, ">") {
+			if end := strings.Index(rest, "</"+key+">"); end >= 0 {
+				return strings.TrimSpace(rest[:end])
+			}
+		} else if end := strings.Index(rest, "\""); end >= 0 {
+			return strings.TrimSpace(rest[:end])
+		}
+	}
+	return "(missing)"
+}
+
+func doctorRenderNodeForCard(card string) string {
+	card = strings.TrimSpace(card)
+	if !strings.HasPrefix(card, "/dev/dri/card") {
+		return ""
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(card, "/dev/dri/card"))
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("/dev/dri/renderD%d", 128+n)
 }
 
 // -----------------------------------------------------------------------------

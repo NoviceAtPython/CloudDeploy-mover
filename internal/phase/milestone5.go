@@ -186,6 +186,14 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	details["assets_apps_json"] = assets.AppsJSON
 	details["assets_web_index"] = assets.WebIndex
 	details["web_asset_mode"] = assets.WebAssetMode
+	details["web_raw_markers_present"] = assets.WebRawMarkers
+	details["web_build_attempted"] = assets.WebBuildAttempted
+	if assets.WebBuildSource != "" {
+		details["web_build_source"] = assets.WebBuildSource
+	}
+	if assets.WebBuildError != "" {
+		details["web_build_error"] = assets.WebBuildError
+	}
 	ver, _ := output(ctx, deps, "", []string{cfg.InstallBin, "--version"}, 20*time.Second, false)
 	details["version"] = strings.TrimSpace(ver)
 	details["install_method"] = "fork"
@@ -225,10 +233,14 @@ func attemptSunshineSetcap(ctx context.Context, deps *Deps, details map[string]a
 }
 
 type sunshineAssetInfo struct {
-	AppsJSON      bool
-	WebIndex      bool
-	WebAssetMode  string
-	FilesystemWeb string
+	AppsJSON          bool
+	WebIndex          bool
+	WebAssetMode      string
+	FilesystemWeb     string
+	WebRawMarkers     bool
+	WebBuildAttempted bool
+	WebBuildSource    string
+	WebBuildError     string
 }
 
 func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) (sunshineAssetInfo, error) {
@@ -241,13 +253,19 @@ func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) (su
 		return info, err
 	}
 	_ = run(ctx, deps, "", []string{"bash", "-lc", "if [ -d /usr/share/sunshine/web ]; then mkdir -p /usr/local/assets/web && cp -a /usr/share/sunshine/web/. /usr/local/assets/web/; fi"}, 2*time.Minute, true)
+	ensureBuiltSunshineWebAssets(ctx, deps, buildDir, &info)
 	if _, err := os.Stat("/usr/local/assets/apps.json"); err != nil {
 		return info, fmt.Errorf("/usr/local/assets/apps.json missing after asset install")
 	}
 	info.AppsJSON = true
 	if _, err := os.Stat("/usr/local/assets/web/index.html"); err == nil {
 		info.WebIndex = true
-		info.WebAssetMode = "filesystem"
+		info.WebRawMarkers = sunshineWebRawMarkers("/usr/local/assets/web")
+		if info.WebRawMarkers {
+			info.WebAssetMode = "raw-source"
+		} else {
+			info.WebAssetMode = "filesystem"
+		}
 		info.FilesystemWeb = "/usr/local/assets/web/index.html"
 	} else {
 		// Some Sunshine fork builds serve the UI from embedded or
@@ -257,6 +275,96 @@ func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) (su
 		info.WebAssetMode = "embedded-or-unknown"
 	}
 	return info, nil
+}
+
+func ensureBuiltSunshineWebAssets(ctx context.Context, deps *Deps, buildDir string, info *sunshineAssetInfo) {
+	needsBuild := sunshineWebRawMarkers("/usr/local/assets/web") || !pathExists("/usr/local/assets/web/index.html")
+	if info == nil || deps.DryRun || !needsBuild {
+		return
+	}
+	foundPackage := false
+	for _, candidate := range []string{
+		filepath.Join(buildDir, "src_assets", "common", "assets", "web"),
+		filepath.Join(buildDir, "src_assets", "common", "web"),
+		filepath.Join(buildDir, "src_assets", "web"),
+		filepath.Join(buildDir, "web"),
+	} {
+		if _, err := os.Stat(filepath.Join(candidate, "package.json")); err != nil {
+			continue
+		}
+		foundPackage = true
+		info.WebBuildAttempted = true
+		info.WebBuildSource = candidate
+		if err := buildAndInstallSunshineWeb(ctx, deps, candidate); err != nil {
+			info.WebBuildError = err.Error()
+			continue
+		}
+		if !sunshineWebRawMarkers("/usr/local/assets/web") {
+			info.WebBuildError = ""
+			return
+		}
+		info.WebBuildError = "web build completed but runtime assets still contain raw Vue/template markers"
+	}
+	if !foundPackage && info.WebBuildError == "" {
+		info.WebBuildError = "runtime web assets are missing or raw, but no Sunshine web package.json was found under known source locations"
+	}
+}
+
+func buildAndInstallSunshineWeb(ctx context.Context, deps *Deps, src string) error {
+	if _, err := os.Stat(filepath.Join(src, "package-lock.json")); err == nil {
+		if err := run(ctx, deps, src, []string{"npm", "ci"}, 15*time.Minute, true); err != nil {
+			return err
+		}
+	} else if err := run(ctx, deps, src, []string{"npm", "install"}, 15*time.Minute, true); err != nil {
+		return err
+	}
+	if err := run(ctx, deps, src, []string{"npm", "run", "build"}, 20*time.Minute, true); err != nil {
+		return err
+	}
+	for _, out := range []string{"dist", "build", "out"} {
+		p := filepath.Join(src, out)
+		if st, err := os.Stat(p); err == nil && st.IsDir() {
+			if err := run(ctx, deps, "", []string{"install", "-d", "-m", "0755", "/usr/local/assets/web"}, time.Minute, true); err != nil {
+				return err
+			}
+			return run(ctx, deps, "", []string{"bash", "-lc", "cp -a " + shellQuote(p) + "/. /usr/local/assets/web/"}, 5*time.Minute, true)
+		}
+	}
+	return fmt.Errorf("npm build succeeded in %s but no dist/build/out directory was found", src)
+}
+
+func sunshineWebRawMarkers(root string) bool {
+	for _, rel := range []string{"index.html", "main.js", "main.ts", "src/main.js", "src/main.ts"} {
+		b, err := os.ReadFile(filepath.Join(root, rel))
+		if err == nil && containsRawWebMarker(string(b)) {
+			return true
+		}
+	}
+	raw := false
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
+		if err != nil || raw || d.IsDir() {
+			return nil
+		}
+		ext := strings.ToLower(filepath.Ext(path))
+		if ext != ".html" && ext != ".js" && ext != ".ts" && ext != ".vue" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err == nil && containsRawWebMarker(string(b)) {
+			raw = true
+		}
+		return nil
+	})
+	return raw
+}
+
+func containsRawWebMarker(s string) bool {
+	return strings.Contains(s, "<%- header %>") ||
+		strings.Contains(s, "import { createApp } from 'vue'") ||
+		strings.Contains(s, `import { createApp } from "vue"`) ||
+		strings.Contains(s, ".vue'") ||
+		strings.Contains(s, `.vue"`) ||
+		strings.Contains(s, "{{ $t(")
 }
 
 type doxygenInfo struct {
@@ -677,8 +785,13 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "load-module", "module-null-sink", "sink_name=" + cfg.VirtualSink, "sink_properties=device.description=CloudDeploy"}, time.Minute)
 	wpctl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"wpctl", "status"}, 15*time.Second)
 	pactl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sinks"}, 15*time.Second)
+	sources, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sources"}, 15*time.Second)
+	info, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "info"}, 15*time.Second)
 	details["wpctl_seen"] = strings.TrimSpace(wpctl) != ""
 	details["pactl_sinks"] = strings.TrimSpace(pactl)
+	details["pactl_sources"] = strings.TrimSpace(sources)
+	details["pactl_info_excerpt"] = lastLines(info, 8)
+	details["virtual_sink_seen"] = strings.Contains(pactl, cfg.VirtualSink)
 	if !deps.DryRun && strings.TrimSpace(wpctl) == "" && strings.TrimSpace(pactl) == "" {
 		return failPhase(deps, PipeWireAudioName, details, "PipeWire validation failed", fmt.Errorf("neither wpctl nor pactl returned audio devices"), true)
 	}
@@ -723,6 +836,13 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 		}
 		_ = run(ctx, deps, "", []string{forceKwinModeScriptPath}, 90*time.Second, true)
 		ensureUinput(ctx, deps, desk.User, details)
+		drm := selectedDRMDevice(deps)
+		if drm == "" {
+			drm = "/dev/dri/card1"
+		}
+		if err := verifySunshineDeviceAccess(ctx, deps, desk.User, drm, details); err != nil {
+			return failPhase(deps, StreamingServicesName, details, "Sunshine device access blocked", err, true)
+		}
 		credsSet, credsUser, credsErr := setSunshineCredentials(ctx, deps, desk.User, cfg.InstallBin)
 		details["sunshine_credentials_set"] = credsSet
 		if credsUser != "" {
@@ -730,6 +850,9 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 		}
 		if credsErr != nil {
 			details["sunshine_credentials_warning"] = credsErr.Error()
+			if deps.Unattended || (deps.Profile != nil && deps.Profile.Deploy.Unattended) {
+				return failPhase(deps, StreamingServicesName, details, "Sunshine credentials missing", credsErr, true)
+			}
 		}
 		if err := run(ctx, deps, "", []string{"systemctl", "restart", "sunshine-headless.service"}, time.Minute, true); err != nil {
 			return failPhase(deps, StreamingServicesName, details, "start Sunshine", err, true)
@@ -751,6 +874,90 @@ func ensureUinput(ctx context.Context, deps *Deps, user string, details map[stri
 	details["uinput_exists"] = pathExists("/dev/uinput")
 	details["uinput_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"}, 15*time.Second, true) == nil
 	details["uinput_rule"] = "/etc/udev/rules.d/70-clouddeploy-uinput.rules"
+}
+
+type deviceAccessProbe struct {
+	Path   string
+	OK     bool
+	Err    string
+	Stderr string
+}
+
+func verifySunshineDeviceAccess(ctx context.Context, deps *Deps, user, drm string, details map[string]any) error {
+	if strings.TrimSpace(drm) == "" {
+		return fmt.Errorf("selected DRM device is empty")
+	}
+	render := renderNodeForCard(drm)
+	probes := []struct {
+		label    string
+		path     string
+		required bool
+	}{
+		{label: "drm_card", path: drm, required: true},
+		{label: "drm_render", path: render, required: render != ""},
+		{label: "uinput", path: "/dev/uinput", required: false},
+	}
+	for _, item := range probes {
+		if item.path == "" {
+			continue
+		}
+		probe := probeDeviceOpenAsUser(ctx, deps, user, item.path)
+		details["device_probe_"+item.label+"_path"] = probe.Path
+		details["device_probe_"+item.label+"_ok"] = probe.OK
+		if probe.Err != "" {
+			details["device_probe_"+item.label+"_err"] = probe.Err
+		}
+		if probe.Stderr != "" {
+			details["device_probe_"+item.label+"_stderr"] = probe.Stderr
+		}
+		if item.required && !probe.OK {
+			return fmt.Errorf("service user %s cannot open %s read/write: %s", user, item.path, firstNonEmpty(probe.Err, probe.Stderr, "unknown error"))
+		}
+	}
+	details["drm_device_access_ok"] = true
+	details["render_device_access_ok"] = render == "" || details["device_probe_drm_render_ok"] == true
+	details["uinput_access_ok"] = details["device_probe_uinput_ok"] == true
+	return nil
+}
+
+func probeDeviceOpenAsUser(ctx context.Context, deps *Deps, user, path string) deviceAccessProbe {
+	probe := deviceAccessProbe{Path: path}
+	if deps.DryRun {
+		probe.OK = true
+		return probe
+	}
+	script := `import os, sys
+path = sys.argv[1]
+fd = os.open(path, os.O_RDWR)
+os.close(fd)
+`
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"runuser", "-u", user, "--", "python3", "-c", script, path},
+		Sudo:    true,
+		Timeout: 15 * time.Second,
+		LogFile: "-",
+	})
+	probe.OK = res.Err == nil
+	if res.Err != nil {
+		probe.Err = res.Err.Error()
+	}
+	if strings.TrimSpace(res.Stderr) != "" {
+		probe.Stderr = lastLines(res.Stderr, 4)
+	}
+	return probe
+}
+
+func renderNodeForCard(card string) string {
+	card = strings.TrimSpace(card)
+	m := regexp.MustCompile(`^/dev/dri/card([0-9]+)$`).FindStringSubmatch(card)
+	if len(m) != 2 {
+		return ""
+	}
+	n, err := strconv.Atoi(m[1])
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("/dev/dri/renderD%d", 128+n)
 }
 
 type StreamValidate struct {
@@ -853,6 +1060,10 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	details["resolution_marker"] = ev.Resolution4K
 	details["selected_capture_line"] = ev.SelectedCaptureLine
 	details["selected_encoder_line"] = ev.SelectedEncoderLine
+	details["encode_selection_line"] = ev.EncodeSelectionLine
+	details["selected_codec"] = ev.SelectedCodec
+	details["video_format"] = ev.VideoFormat
+	details["client_dynamic_range"] = ev.ClientDynamicRange
 	details["hdr_line"] = ev.HDRLine
 	details["cuda_interop_warning"] = ev.CUDAInteropWarning
 	details["av1_available"] = ev.AV1
@@ -864,6 +1075,9 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	}
 	if ev.Fatal {
 		return failPhase(deps, StreamValidateName, details, "fatal Sunshine encoder/display log marker", fmt.Errorf("Sunshine fatal marker in journal"), true)
+	}
+	if ev.InvalidH264HDR || ev.H264DynamicRangeUnsupported {
+		return failPhase(deps, StreamValidateName, details, "invalid Sunshine H.264 HDR encode selection", fmt.Errorf("H.264 session selected HDR/10-bit/p010 or h264_nvenc rejected dynamic range: %s", ev.EncodeSelectionLine), true)
 	}
 	if ev.SelectedCaptureLine == "" {
 		deps.State.MarkPendingMoonlightConnect(StreamValidateName, "Sunshine serverinfo is reachable; waiting for Moonlight stream attempt to produce KMS/NVENC markers")
@@ -951,7 +1165,6 @@ SupplementaryGroups=video render input audio
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE
 NoNewPrivileges=false
-DeviceAllow=/dev/uinput rw
 WorkingDirectory=/home/%s
 Environment=HOME=/home/%s
 Environment=USER=%s
@@ -1106,19 +1319,25 @@ func sunshineJournalSinceStart(ctx context.Context, deps *Deps) (string, error) 
 }
 
 type sunshineStreamEvidence struct {
-	KMS                 bool
-	NVENC               bool
-	HEVC                bool
-	AV1                 bool
-	Resolution4K        bool
-	HDR                 bool
-	ColorDepth10        bool
-	P010                bool
-	Fatal               bool
-	CUDAInteropWarning  bool
-	SelectedCaptureLine string
-	SelectedEncoderLine string
-	HDRLine             string
+	KMS                         bool
+	NVENC                       bool
+	HEVC                        bool
+	AV1                         bool
+	Resolution4K                bool
+	HDR                         bool
+	ColorDepth10                bool
+	P010                        bool
+	Fatal                       bool
+	CUDAInteropWarning          bool
+	InvalidH264HDR              bool
+	H264DynamicRangeUnsupported bool
+	SelectedCaptureLine         string
+	SelectedEncoderLine         string
+	EncodeSelectionLine         string
+	SelectedCodec               string
+	VideoFormat                 string
+	ClientDynamicRange          string
+	HDRLine                     string
 }
 
 func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
@@ -1131,6 +1350,20 @@ func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
 		}
 		if strings.Contains(line, "STREAM_DIAG kms capture selected") || strings.Contains(line, "kms capture selected") {
 			ev.SelectedCaptureLine = line
+		}
+		if strings.Contains(line, "Encode selection:") {
+			ev.EncodeSelectionLine = line
+			ev.SelectedCodec = parseLogKV(line, "codec")
+			ev.VideoFormat = parseLogKV(line, "videoFormat")
+			ev.ClientDynamicRange = parseLogKV(line, "client_dynamicRange")
+			if strings.Contains(lower, "codec=h.264") &&
+				(strings.Contains(lower, "selected_colorspace=hdr") ||
+					strings.Contains(lower, "rec. 2020") ||
+					strings.Contains(lower, "smpte 2084") ||
+					strings.Contains(lower, "selected_bit_depth=10-bit") ||
+					strings.Contains(lower, "selected_pix_fmt=p010")) {
+				ev.InvalidH264HDR = true
+			}
 		}
 		if strings.Contains(line, "Found monitor for DRM screencasting") || strings.Contains(line, "Screencasting with KMS") {
 			ev.KMS = true
@@ -1170,6 +1403,9 @@ func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
 		if strings.Contains(line, "Attempting to use NVENC without CUDA support") {
 			ev.CUDAInteropWarning = true
 		}
+		if strings.Contains(lower, "h264_nvenc: dynamic range not supported") {
+			ev.H264DynamicRangeUnsupported = true
+		}
 		if strings.Contains(line, "Fatal: Unable to find display or encoder") ||
 			strings.Contains(line, "Couldn't find any working encoder") ||
 			strings.Contains(line, "Encoder [nvenc] failed") {
@@ -1177,6 +1413,30 @@ func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
 		}
 	}
 	return ev
+}
+
+func parseLogKV(line, key string) string {
+	idx := strings.Index(line, key+"=")
+	if idx < 0 {
+		return ""
+	}
+	rest := line[idx+len(key)+1:]
+	if strings.HasPrefix(rest, "\"") {
+		rest = strings.TrimPrefix(rest, "\"")
+		if end := strings.Index(rest, "\""); end >= 0 {
+			return rest[:end]
+		}
+		return rest
+	}
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return strings.TrimSpace(rest)
+	}
+	val := strings.Trim(fields[0], ",)")
+	if key == "codec" && len(fields) > 1 && strings.HasPrefix(fields[1], "(") {
+		return val
+	}
+	return val
 }
 
 func validateSunshineSelectedCapture(line, drm, connector, width, height string) error {
@@ -1422,4 +1682,13 @@ func containsAny(s string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+func firstNonEmpty(values ...string) string {
+	for _, v := range values {
+		if strings.TrimSpace(v) != "" {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
 }
