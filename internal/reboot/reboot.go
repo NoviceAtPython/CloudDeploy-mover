@@ -46,8 +46,18 @@ const UnitName = "clouddeploy-v3-continue.service"
 const DefaultUnitPath = "/etc/systemd/system/" + UnitName
 
 // DefaultEnvFile holds the continuation environment (profile +
-// state path). The unit's EnvironmentFile= references it.
+// state path). The unit's EnvironmentFile= references it. This file
+// is non-secret and lives at 0644 by design - it contains paths +
+// boolean flags only. NEVER write secrets here.
 const DefaultEnvFile = "/etc/clouddeploy/continue.env"
+
+// DefaultSecretsEnvFile holds operator-supplied secrets that must
+// survive across reboot (Tailscale auth key, future API tokens, etc).
+// systemd's EnvironmentFile= reads it on resume. The bootstrap +
+// internal/clouddeploy/secrets helper write it 0600 root:root. The
+// unit references it with a leading dash so a deploy without
+// secrets still starts cleanly.
+const DefaultSecretsEnvFile = "/etc/clouddeploy/secrets.env"
 
 // DefaultBinary is the path the continuation unit invokes. bootstrap
 // installs the binary here.
@@ -58,11 +68,12 @@ const DefaultConfigDir = "/opt/clouddeploy-mover/config"
 // Service is the configurable surface. Construct one per CLI
 // invocation; safe to leave fields zero-valued for the defaults.
 type Service struct {
-	UnitPath string // default: /etc/systemd/system/clouddeploy-v3-continue.service
-	EnvFile  string // default: /etc/clouddeploy/continue.env
-	Binary   string // default: /usr/local/bin/clouddeployctl
-	Runner   *runner.Runner
-	DryRun   bool
+	UnitPath       string // default: /etc/systemd/system/clouddeploy-v3-continue.service
+	EnvFile        string // default: /etc/clouddeploy/continue.env
+	SecretsEnvFile string // default: /etc/clouddeploy/secrets.env (loaded with EnvironmentFile=- so its absence is fine)
+	Binary         string // default: /usr/local/bin/clouddeployctl
+	Runner         *runner.Runner
+	DryRun         bool
 }
 
 // Args is the data the unit template consumes.
@@ -86,6 +97,13 @@ RemainAfterExit=no
 TimeoutStartSec=infinity
 Restart=no
 EnvironmentFile=-{{ .EnvFile }}
+# Secrets file (Tailscale auth key, future API tokens). The leading
+# dash makes this load best-effort: a deploy with no secrets at all
+# still starts the unit cleanly. The file itself is written 0600
+# root:root by the bootstrap secrets prompt + the internal/clouddeploy/
+# secrets helper. systemd imports its KEY=VALUE pairs into the
+# resume process's environment.
+EnvironmentFile=-{{ .SecretsEnvFile }}
 ExecStartPre=/bin/mkdir -p /var/log/clouddeploy
 ExecStart={{ .Binary }} resume --profile {{ .Profile }} --config-dir {{ .ConfigDir }} --state-path {{ .StatePath }}{{ .AutoRebootFlag }}{{ .UnattendedFlag }}
 # Append to a dedicated host log so the operator can grep without
@@ -169,20 +187,29 @@ func (s *Service) IsInstalled() bool {
 // RenderUnit returns the rendered unit text for the given args.
 // Exported so tests can assert the exact bytes without touching disk.
 func RenderUnit(args Args, envFile, binary string) string {
+	return RenderUnitWithSecrets(args, envFile, binary, DefaultSecretsEnvFile)
+}
+
+// RenderUnitWithSecrets is the explicit-arity overload that lets
+// callers (and the Service helper) point at a non-default secrets
+// env file. An empty `secretsEnvFile` falls back to DefaultSecretsEnvFile.
+func RenderUnitWithSecrets(args Args, envFile, binary, secretsEnvFile string) string {
 	if envFile == "" {
 		envFile = DefaultEnvFile
 	}
 	if binary == "" {
 		binary = DefaultBinary
 	}
+	if secretsEnvFile == "" {
+		secretsEnvFile = DefaultSecretsEnvFile
+	}
 	if args.ConfigDir == "" {
 		args.ConfigDir = DefaultConfigDir
 	}
-	// Manual substitution; avoids pulling in text/template just for
-	// 5 placeholders.
 	out := unitTemplate
 	out = strings.ReplaceAll(out, "{{ .StatePath }}", args.StatePath)
 	out = strings.ReplaceAll(out, "{{ .EnvFile }}", envFile)
+	out = strings.ReplaceAll(out, "{{ .SecretsEnvFile }}", secretsEnvFile)
 	out = strings.ReplaceAll(out, "{{ .Binary }}", binary)
 	out = strings.ReplaceAll(out, "{{ .Profile }}", args.Profile)
 	out = strings.ReplaceAll(out, "{{ .ConfigDir }}", args.ConfigDir)
@@ -209,7 +236,7 @@ func RenderEnvFile(args Args) string {
 }
 
 func (s *Service) writeUnit(args Args) error {
-	body := RenderUnit(args, s.envFile(), s.binary())
+	body := RenderUnitWithSecrets(args, s.envFile(), s.binary(), s.secretsEnvFile())
 	path := s.unitPath()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("reboot: mkdir %s: %w", filepath.Dir(path), err)
@@ -218,6 +245,20 @@ func (s *Service) writeUnit(args Args) error {
 		return fmt.Errorf("reboot: write unit: %w", err)
 	}
 	return nil
+}
+
+// secretsEnvFile returns the configured secrets env file path,
+// falling back to DefaultSecretsEnvFile. Honors CLOUDDEPLOY_SECRETS_ENV
+// as an environment override so tests / unusual deployments can
+// redirect the path without code changes.
+func (s *Service) secretsEnvFile() string {
+	if s.SecretsEnvFile != "" {
+		return s.SecretsEnvFile
+	}
+	if v := strings.TrimSpace(os.Getenv("CLOUDDEPLOY_SECRETS_ENV")); v != "" {
+		return v
+	}
+	return DefaultSecretsEnvFile
 }
 
 func (s *Service) writeEnvFile(args Args) error {

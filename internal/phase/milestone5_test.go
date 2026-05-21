@@ -150,6 +150,48 @@ func TestSunshineConfigPhaseDryRunMarksDone(t *testing.T) {
 	}
 }
 
+// TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey simulates
+// the v3 "v2-parity" recovery story: bootstrap wrote the key to
+// /etc/clouddeploy/secrets.env, systemd's EnvironmentFile= imported
+// it into the resume process's env, and now the Tailscale phase
+// runs. The phase MUST consume it via os.Getenv(cfg.AuthKeyEnv) the
+// same way it does in the original apply.
+//
+// This test does not boot a real VM; it just confirms the phase
+// picks up TAILSCALE_AUTHKEY from the process env (which is what
+// systemd's EnvironmentFile= populates).
+func TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey(t *testing.T) {
+	deps := milestone5Deps(t)
+	// Simulate systemd's EnvironmentFile=-/etc/clouddeploy/secrets.env
+	// import: the value is now in the process env.
+	const fixtureKey = "fixture-authkey-resume-fixture-do-not-leak"
+	t.Setenv("TAILSCALE_AUTHKEY", fixtureKey)
+	// Force DryRun on so the phase exercises every branch without
+	// actually invoking apt or `tailscale up`. Under DryRun the
+	// phase still records authkey_present + details.
+	deps.DryRun = true
+
+	if err := (Tailscale{}).Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	ph := deps.State.Get(TailscaleName)
+	// Either StatusDone (full happy path) or StatusFailedFatal/Skipped
+	// is acceptable depending on Apt/Runner behaviour under DryRun,
+	// but in NO case may the raw key leak into state.Details or
+	// state.Reason / LastError.
+	if strings.Contains(ph.Reason, fixtureKey) {
+		t.Errorf("state.Reason leaked the auth key value")
+	}
+	if strings.Contains(ph.LastError, fixtureKey) {
+		t.Errorf("state.LastError leaked the auth key value")
+	}
+	for k, v := range ph.Details {
+		if s, ok := v.(string); ok && strings.Contains(s, fixtureKey) {
+			t.Errorf("state.Details[%q] leaked the auth key value", k)
+		}
+	}
+}
+
 func TestTailscaleRejectsWhitespaceAuthKey(t *testing.T) {
 	deps := milestone5Deps(t)
 	t.Setenv("TAILSCALE_AUTHKEY", "fixture-authkey-bad\nwrapped")

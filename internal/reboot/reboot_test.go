@@ -21,6 +21,10 @@ func TestRenderUnit_ContainsKeys(t *testing.T) {
 		"Type=oneshot",
 		"TimeoutStartSec=infinity",
 		"EnvironmentFile=-/etc/clouddeploy/continue.env",
+		// Secrets file loaded with EnvironmentFile=- so the absence
+		// is fine; presence preserves operator-supplied credentials
+		// (Tailscale auth key, future tokens) across the reboot.
+		"EnvironmentFile=-/etc/clouddeploy/secrets.env",
 		"ExecStart=/usr/local/bin/clouddeployctl resume --profile hdr-4k120 --config-dir /opt/clouddeploy-mover/config --state-path /var/lib/clouddeploy/state.json",
 		"WantedBy=multi-user.target",
 	}
@@ -28,6 +32,36 @@ func TestRenderUnit_ContainsKeys(t *testing.T) {
 		if !strings.Contains(body, w) {
 			t.Errorf("unit missing %q\n--- unit ---\n%s", w, body)
 		}
+	}
+}
+
+func TestRenderUnitWithSecrets_CustomSecretsPath(t *testing.T) {
+	body := RenderUnitWithSecrets(
+		Args{Profile: "hdr-4k120", StatePath: "/var/lib/clouddeploy/state.json"},
+		"", "", "/run/secrets-custom.env",
+	)
+	if !strings.Contains(body, "EnvironmentFile=-/run/secrets-custom.env") {
+		t.Errorf("custom secrets path not in unit body:\n%s", body)
+	}
+	// Default continue.env should still be present.
+	if !strings.Contains(body, "EnvironmentFile=-/etc/clouddeploy/continue.env") {
+		t.Errorf("non-secret continue.env line missing:\n%s", body)
+	}
+}
+
+func TestService_SecretsEnvFile_HonorsEnvOverride(t *testing.T) {
+	t.Setenv("CLOUDDEPLOY_SECRETS_ENV", "/run/from-env.env")
+	dir := t.TempDir()
+	unitPath := filepath.Join(dir, "continue.service")
+	s := &Service{UnitPath: unitPath, EnvFile: filepath.Join(dir, "continue.env")}
+	if err := s.Install(context.Background(), Args{Profile: "p", StatePath: "/s.json"}); err == nil {
+		// Install always runs systemctl daemon-reload, which fails
+		// outside Linux. The path resolution happens during writeUnit
+		// BEFORE systemctl, so we read the file regardless.
+	}
+	body, _ := os.ReadFile(unitPath)
+	if !strings.Contains(string(body), "EnvironmentFile=-/run/from-env.env") {
+		t.Errorf("CLOUDDEPLOY_SECRETS_ENV override not honored:\n%s", string(body))
 	}
 }
 

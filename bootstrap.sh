@@ -327,10 +327,112 @@ run_apply() {
     esac
 }
 
+prompt_secrets() {
+    # Only relevant for unattended / auto-reboot paths. The whole
+    # point of this prompt is "ask the operator once at the terminal
+    # so the resume step (which has no terminal) can still log in to
+    # Tailscale". For interactive runs the operator can set
+    # TAILSCALE_AUTHKEY in their env before invoking bootstrap and
+    # this function falls through silently.
+    if [[ "${CLOUDDEPLOY_UNATTENDED}" != "1" && "${CLOUDDEPLOY_AUTO_REBOOT}" != "1" ]]; then
+        return 0
+    fi
+
+    local secrets_path
+    secrets_path="${CLOUDDEPLOY_SECRETS_ENV:-/etc/clouddeploy/secrets.env}"
+
+    # Check whether the active profile actually wants Tailscale. The
+    # selected YAML lives at <repo>/config/profiles/<PROFILE>.yaml.
+    # Cheap grep keeps bootstrap dependency-free (no yq/python).
+    local profile_yaml="${CLOUDDEPLOY_REPO_DIR}/config/profiles/${PROFILE}.yaml"
+    local wants_tailscale=0
+    if [[ -f "${profile_yaml}" ]]; then
+        if grep -E '^\s*enabled:\s*(true|yes|1)\s*$' "${profile_yaml}" >/dev/null 2>&1; then
+            # Crude but reliable: a single "enabled: true" line within
+            # a `tailscale:` block. The full YAML semantics live in
+            # internal/config; bootstrap only needs the "do we even
+            # need a key?" hint.
+            if awk '
+                /^[A-Za-z][A-Za-z0-9_-]*:[[:space:]]*$/ { block=$1 }
+                block ~ /^tailscale:/ && /^[[:space:]]+enabled:[[:space:]]*(true|yes|1)[[:space:]]*$/ { found=1 }
+                END { exit found ? 0 : 1 }
+            ' "${profile_yaml}"; then
+                wants_tailscale=1
+            fi
+        fi
+    fi
+
+    if [[ "${wants_tailscale}" != "1" ]]; then
+        log "Profile ${PROFILE} does not enable Tailscale; skipping authkey prompt."
+        return 0
+    fi
+
+    # Operator already exported the key (e.g. from a CI runner)?
+    # Persist it to secrets.env so the post-reboot resume sees it too.
+    if [[ -n "${TAILSCALE_AUTHKEY:-}" ]]; then
+        log "TAILSCALE_AUTHKEY found in environment; persisting to ${secrets_path}."
+        write_secrets_file "${secrets_path}" "${TAILSCALE_AUTHKEY}"
+        return 0
+    fi
+
+    # Interactive prompt. Use -s so the key never echoes to the TTY.
+    # `< /dev/tty` (where available) forces the prompt to the
+    # terminal even if stdin is a pipe (`curl ... | bash`).
+    log "Profile ${PROFILE} has Tailscale enabled and unattended/auto-reboot is on."
+    log "Tailscale auth key is needed once now so the post-reboot resume can log Tailscale in."
+    local key=""
+    if [[ -r /dev/tty ]]; then
+        read -rsp "Tailscale auth key (blank to skip Tailscale): " key < /dev/tty
+        echo >/dev/tty
+    else
+        read -rsp "Tailscale auth key (blank to skip Tailscale): " key
+        echo
+    fi
+    if [[ -z "${key}" ]]; then
+        log "No auth key entered; Tailscale phase will skip nonfatally."
+        return 0
+    fi
+    write_secrets_file "${secrets_path}" "${key}"
+    # Export to this process too so apply (before the first reboot)
+    # can use it without re-reading the file.
+    export TAILSCALE_AUTHKEY="${key}"
+    # Local var goes out of scope at function return; clear belt+suspenders.
+    key=""
+}
+
+# write_secrets_file installs a 0600 root:root file at $1 containing
+# TAILSCALE_AUTHKEY=$2, shell-escaped. NEVER logs the value.
+write_secrets_file() {
+    local path="$1"
+    local key="$2"
+    local dir
+    dir="$(dirname "${path}")"
+    install -d -m 0755 -o root -g root "${dir}"
+    # Single-quote escape so embedded special chars don't break the
+    # KEY='value' syntax. Same encoding internal/secrets/secrets.go
+    # produces, so a value written by bootstrap is round-trippable
+    # via secrets.Load.
+    local escaped="${key//\'/\'\\\'\'}"
+    local tmp
+    tmp="$(mktemp "${dir}/.secrets-XXXXXX.env")"
+    chmod 0600 "${tmp}"
+    # Write via printf rather than echo to avoid backslash mangling.
+    printf '# managed by clouddeployctl bootstrap: operator secrets for the resume continuation service.\n' > "${tmp}"
+    printf '# DO NOT EDIT BY HAND. mode 0600 root:root. systemd reads this via EnvironmentFile=.\n' >> "${tmp}"
+    printf "TAILSCALE_AUTHKEY='%s'\n" "${escaped}" >> "${tmp}"
+    chown root:root "${tmp}"
+    chmod 0600 "${tmp}"
+    mv -f "${tmp}" "${path}"
+    chmod 0600 "${path}"
+    chown root:root "${path}"
+    log "Wrote ${path} (0600 root:root); key length=$(printf '%s' "${key}" | wc -c)"
+}
+
 main() {
     ensure_go
     ensure_repo
     build_binary
+    prompt_secrets
     run_apply
 }
 
