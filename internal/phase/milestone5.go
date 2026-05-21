@@ -1054,33 +1054,31 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	details["serverinfo_codec_mode_support"] = codecRaw
 	details["serverinfo_codec_mode_support_present"] = codecOK
 	details["serverinfo_codec_flags"] = codecSupport.Names()
+	hevcMain10Ready := codecOK && codecSupport.HEVCMain10 && maxLumaOK && maxLumaHEVC > 0
+	av1Main10Ready := codecOK && codecSupport.AV1Main10
 	details["serverinfo_hevc_main10"] = codecOK && codecSupport.HEVCMain10
-	details["serverinfo_av1_main10"] = codecOK && codecSupport.AV1Main10
+	details["serverinfo_av1_main10"] = av1Main10Ready
+	details["serverinfo_hevc_main10_ready"] = hevcMain10Ready
+	details["serverinfo_av1_main10_ready"] = av1Main10Ready
+	details["serverinfo_hdr_main10_ready"] = av1Main10Ready || hevcMain10Ready
 	details["serverinfo_max_luma_pixels_hevc"] = maxLumaHEVC
 	details["serverinfo_max_luma_pixels_hevc_present"] = maxLumaOK
 	if deps.Profile != nil && deps.Profile.Display.HDR {
 		if !codecOK {
 			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo missing codec support", fmt.Errorf("ServerCodecModeSupport missing from /serverinfo"), true)
 		}
-		// AV1 Main10 is the PRIMARY HDR path on v3 (AV1-first). If
-		// it's absent from /serverinfo the Sunshine encoder probe
-		// rejected AV1 -- the same upstream bug that left Moonlight
-		// falling back to H.264 + p010 on the live VM. The deploy
-		// fails here so the operator gets a clear codec-advertise
-		// regression instead of an obscure "h264_nvenc dynamic range
-		// not supported" at session-negotiation time.
-		if !codecSupport.AV1Main10 {
-			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks AV1 Main10", fmt.Errorf("AV1 Main10 missing from /serverinfo: ServerCodecModeSupport=%d (%s). Confirm sunshine.av1_mode=3 in the rendered sunshine.conf and that the encoder probe found NVENC AV1 10-bit", codecRaw, codecSupport.String()), true)
+		// AV1 Main10 is preferred when the GPU exposes NVENC AV1, but
+		// Ampere/A5000/A6000-class GPUs only provide the HEVC Main10 HDR
+		// path. Treat either advertised AV1 Main10 OR advertised HEVC
+		// Main10 with nonzero MaxLumaPixelsHEVC as sufficient for HDR.
+		// The separate H.264+HDR/p010 log gate below remains fatal.
+		if !av1Main10Ready && !hevcMain10Ready {
+			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks HDR Main10 codec path", fmt.Errorf("ServerCodecModeSupport=%d (%s), MaxLumaPixelsHEVC=%d present=%v. Need AV1 Main10 or HEVC Main10 with nonzero HEVC luma capacity; H.264 HDR/p010 is invalid.", codecRaw, codecSupport.String(), maxLumaHEVC, maxLumaOK), true)
 		}
-		// HEVC Main10 is the FALLBACK HDR path Moonlight uses when
-		// the client doesn't advertise AV1. Missing it isn't fatal
-		// to AV1 streaming but it leaves clients without AV1
-		// stranded; record it as required for full HDR parity.
-		if !codecSupport.HEVCMain10 {
-			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks HEVC Main10", fmt.Errorf("HEVC Main10 missing from /serverinfo: ServerCodecModeSupport=%d (%s). Confirm sunshine.hevc_mode=3 in the rendered sunshine.conf and that the encoder probe found NVENC HEVC 10-bit", codecRaw, codecSupport.String()), true)
-		}
-		if !maxLumaOK || maxLumaHEVC <= 0 {
-			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks HEVC luma capacity", fmt.Errorf("MaxLumaPixelsHEVC=%d present=%v", maxLumaHEVC, maxLumaOK), true)
+		if !av1Main10Ready && hevcMain10Ready {
+			details["serverinfo_hdr_codec_fallback"] = "hevc-main10"
+		} else if av1Main10Ready {
+			details["serverinfo_hdr_codec_primary"] = "av1-main10"
 		}
 	}
 	webStatus, webErr := webUIStatusFn(ctx, deps, "https://127.0.0.1:47990")
@@ -1216,9 +1214,9 @@ func renderSunshineService(user, uid, bin, conf string, cfg config.SunshineConfi
 	// force-HDR env vars demanded ("dynamic range not supported").
 	// Now we render those lines only when the profile asks for them;
 	// the SunshineConfig validator already requires both fields to
-	// be true for HDR profiles AND requires hevc_mode>=3 +
-	// av1_mode>=3, so reaching `force_av1_hdr10=true` implies
-	// Moonlight will be offered HDR Main10 on at least one branch.
+	// be true for HDR profiles AND requires hevc_mode>=3, so
+	// Ampere-class GPUs still offer a valid HEVC Main10 HDR fallback.
+	// AV1 Main10 remains preferred when the GPU/encoder advertises it.
 	hdrEnvBlock := ""
 	if cfg.ForceAV1HDR10 {
 		hdrEnvBlock += "Environment=SUNSHINE_FORCE_AV1_HDR10=1\n"

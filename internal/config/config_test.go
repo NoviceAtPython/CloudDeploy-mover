@@ -75,6 +75,24 @@ func TestHDRProfileSpec(t *testing.T) {
 	}
 }
 
+func TestHDRProfileAllowsHEVCMain10FallbackWithoutAV1Main10(t *testing.T) {
+	dir := repoConfigDir(t)
+	p, err := LoadProfile(dir, "hdr-4k120")
+	if err != nil {
+		t.Fatalf("LoadProfile: %v", err)
+	}
+	// Ampere/A5000/A6000 expose HEVC Main10 but no NVENC AV1. The
+	// profile may keep av1_mode=3 for AV1-capable GPUs, but validation
+	// must not reject an explicit HEVC-only HDR fallback profile.
+	one := 1
+	three := 3
+	p.Sunshine.Av1Mode = &one
+	p.Sunshine.HevcMode = &three
+	if err := ValidateProfile(p); err != nil {
+		t.Fatalf("ValidateProfile should accept HEVC Main10 fallback without AV1 Main10: %v", err)
+	}
+}
+
 // TestHDRCudaProfileSpec locks the strict CUDA-13-only invariants for
 // hdr-4k120-cuda: exact-major=13, no Ubuntu archive fallback, compile
 // smoke test on, runfile pin held empty pending a known-good artifact.
@@ -548,11 +566,7 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Display.HDR = true
 			p.Sunshine.ForceAV1HDR10 = false
 		}, "force_av1_hdr10"},
-		{"hdr with av1_mode below Main10", func(p *Profile) {
-			p.Display.HDR = true
-			two := 2
-			p.Sunshine.Av1Mode = &two
-		}, "sunshine.av1_mode"},
+
 		{"hdr with hevc_mode below Main10", func(p *Profile) {
 			p.Display.HDR = true
 			two := 2

@@ -217,14 +217,74 @@ func TestStreamValidateRetriesServerInfoUntilReady(t *testing.T) {
 	}
 }
 
-func TestStreamValidateFailsHDRProfileWhenServerInfoLacksHEVCMain10(t *testing.T) {
+func TestStreamValidateHDRProfilePassesAV1Main10WithoutHEVCFallback(t *testing.T) {
 	deps := milestone5Deps(t)
 	deps.DryRun = false
 	// Bits: H264 + HEVC + AV1 Main8 + AV1 Main10 (= 1 + 0x100 +
-	// 0x10000 + 0x20000 = 196865). NO HEVC Main10 (0x200) - so the
-	// AV1 gate passes and we land on the HEVC Main10 gate, which is
-	// the regression this test pins.
+	// 0x10000 + 0x20000 = 196865). NO HEVC Main10 (0x200), but AV1
+	// Main10 is enough for AV1-capable GPUs.
 	const codecBits = 196865
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC></root>`, codecBits), nil
+		},
+		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("AV1 Main10 should satisfy the HDR codec gate without HEVC fallback: %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["serverinfo_av1_main10_ready"] != true {
+		t.Fatalf("serverinfo_av1_main10_ready detail: got %v want true", details["serverinfo_av1_main10_ready"])
+	}
+	if details["serverinfo_hevc_main10_ready"] != false {
+		t.Fatalf("serverinfo_hevc_main10_ready detail: got %v want false", details["serverinfo_hevc_main10_ready"])
+	}
+}
+
+func TestStreamValidateHDRProfilePassesHEVCMain10FallbackWithoutAV1(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	// Bits: H264 + HEVC + HEVC Main10 + AV1 Main8 (= 1 + 0x100 +
+	// 0x200 + 0x10000 = 66305). NO AV1 Main10 (0x20000). This is
+	// the Ampere/A5000/A6000 path: HEVC Main10 HDR is valid fallback.
+	const codecBits = 66305
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC></root>`, codecBits), nil
+		},
+		JournalFn: func(context.Context, *Deps) (string, error) {
+			return "Encoder [nvenc] does not support AV1 on this system", nil
+		},
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("HEVC Main10 fallback should satisfy HDR codec gate without AV1 Main10: %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["serverinfo_av1_main10"] != false {
+		t.Fatalf("serverinfo_av1_main10 detail: got %v want false", details["serverinfo_av1_main10"])
+	}
+	if details["serverinfo_hevc_main10_ready"] != true {
+		t.Fatalf("serverinfo_hevc_main10_ready detail: got %v want true", details["serverinfo_hevc_main10_ready"])
+	}
+	if details["serverinfo_hdr_codec_fallback"] != "hevc-main10" {
+		t.Fatalf("serverinfo_hdr_codec_fallback detail: got %v want hevc-main10", details["serverinfo_hdr_codec_fallback"])
+	}
+}
+
+func TestStreamValidateFailsHDRProfileWhenServerInfoLacksAnyMain10Path(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	// H264 + HEVC Main8 + AV1 Main8 only. No HEVC Main10 and no AV1
+	// Main10, so a client can only fall back to H.264/8-bit. That is
+	// not a valid HDR substrate.
+	const codecBits = 65793
 	ph := StreamValidate{
 		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
@@ -236,56 +296,14 @@ func TestStreamValidateFailsHDRProfileWhenServerInfoLacksHEVCMain10(t *testing.T
 	}
 	err := ph.Run(context.Background(), deps)
 	if err == nil {
-		t.Fatalf("expected missing HEVC Main10 advertisement to fail")
+		t.Fatalf("expected missing AV1/HEVC Main10 advertisement to fail")
 	}
-	if !strings.Contains(err.Error(), "HEVC Main10") {
-		t.Fatalf("error should mention HEVC Main10: %v", err)
-	}
-	details := deps.State.Get(StreamValidateName).Details
-	if details["serverinfo_hevc_main10"] != false {
-		t.Fatalf("serverinfo_hevc_main10 detail: got %v want false", details["serverinfo_hevc_main10"])
-	}
-}
-
-// TestStreamValidateFailsHDRProfileWhenServerInfoLacksAV1Main10 pins
-// the live-VM root cause: hevc_mode=0 + av1_mode=2 left
-// ServerCodecModeSupport without AV1 Main10, Moonlight fell back to
-// H.264, and the unconditional HDR force env still demanded p010
-// which h264_nvenc rejected.
-//
-// AV1 Main10 is the PRIMARY HDR path on v3 (AV1-first). The new gate
-// fails the deploy here, BEFORE any Moonlight client tries to
-// negotiate, so the operator sees a clear "AV1 Main10 missing from
-// /serverinfo" regression instead of an obscure "h264_nvenc dynamic
-// range not supported" later.
-func TestStreamValidateFailsHDRProfileWhenServerInfoLacksAV1Main10(t *testing.T) {
-	deps := milestone5Deps(t)
-	deps.DryRun = false
-	// Bits: H264 + HEVC + HEVC Main10 + AV1 Main8 (= 1 + 0x100 +
-	// 0x200 + 0x10000 = 66305). NO AV1 Main10 (0x20000).
-	const codecBits = 66305
-	ph := StreamValidate{
-		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
-		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
-		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
-			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC></root>`, codecBits), nil
-		},
-		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
-		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
-	}
-	err := ph.Run(context.Background(), deps)
-	if err == nil {
-		t.Fatalf("expected missing AV1 Main10 advertisement to fail an HDR profile")
-	}
-	if !strings.Contains(err.Error(), "AV1 Main10") {
-		t.Fatalf("error should mention AV1 Main10: %v", err)
-	}
-	if !strings.Contains(err.Error(), "av1_mode=3") {
-		t.Fatalf("error should hint at sunshine.av1_mode=3 fix: %v", err)
+	if !strings.Contains(err.Error(), "HDR Main10 codec path") {
+		t.Fatalf("error should mention missing HDR Main10 codec path: %v", err)
 	}
 	details := deps.State.Get(StreamValidateName).Details
-	if details["serverinfo_av1_main10"] != false {
-		t.Fatalf("serverinfo_av1_main10 detail: got %v want false", details["serverinfo_av1_main10"])
+	if details["serverinfo_hdr_main10_ready"] != false {
+		t.Fatalf("serverinfo_hdr_main10_ready detail: got %v want false", details["serverinfo_hdr_main10_ready"])
 	}
 }
 

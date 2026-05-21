@@ -294,9 +294,10 @@ type CUDAConfig struct {
 //	av1_mode = 2     AV1 Main only (8-bit).
 //	av1_mode = 3     AV1 Main + Main10 (HDR-capable).
 //
-// HDR profiles MUST pin av1_mode=3 (AV1-first for any client that
-// supports it) AND hevc_mode=3 (HEVC Main10 fallback). The validator
-// rejects force_av1_hdr10=true with av1_mode<3.
+// HDR profiles MUST pin hevc_mode=3 (HEVC Main10 fallback). AV1 remains
+// preferred when available, and profiles may keep av1_mode=3 so AV1-capable
+// GPUs advertise Main10 too, but Ampere/A5000/A6000 deployments must not
+// fail solely because NVENC AV1 is unavailable.
 type SunshineConfig struct {
 	Source                  string   `yaml:"source"`
 	ForkRepo                string   `yaml:"fork_repo"`
@@ -898,19 +899,16 @@ func ValidateProfile(p *Profile) error {
 		if !p.Sunshine.SynthesizeHDR10Metadata {
 			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.synthesize_hdr10_metadata=true", p.Profile)
 		}
-		// Codec advertisement gate. Live-VM bug: with hevc_mode=0 +
-		// av1_mode=2 the Sunshine probe left active_hevc_mode below 3
-		// and active_av1_mode below 3, so Moonlight saw no HDR
-		// Main10 capability and fell back to H.264 - while the force
-		// HDR env vars kept demanding p010 10-bit, which h264_nvenc
-		// rejects. Refuse the deploy here rather than later, with a
-		// specific error that names both knobs.
-		if !p.Sunshine.AdvertisesAV1Main10() {
-			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.av1_mode>=3 (AV1 Main10); got %d. Live-VM regression: av1_mode<3 leaves ServerCodecModeSupport without the AV1 Main10 bit and Moonlight falls back to H.264 + p010 which h264_nvenc refuses.",
-				p.Profile, p.Sunshine.Av1ModeValue())
-		}
+		// Codec advertisement gate. Live-VM bug: with hevc_mode=0 the
+		// Sunshine probe left active_hevc_mode below 3, so Ampere-class
+		// GPUs had no HEVC Main10 fallback and Moonlight fell back to
+		// H.264 while the force-HDR env vars still demanded p010 10-bit.
+		// AV1 Main10 remains preferred when the encoder supports it, but
+		// A5000/A6000/Ampere cards do not expose NVENC AV1. Do not reject
+		// those deployments at config time; stream_validate verifies that
+		// either AV1 Main10 OR HEVC Main10 is actually advertised.
 		if !p.Sunshine.AdvertisesHEVCMain10() {
-			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.hevc_mode>=3 (HEVC Main10); got %d. AV1 is the preferred path, but HEVC Main10 is the safe fallback - hevc_mode<3 leaves both branches unable to honor HDR.",
+			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.hevc_mode>=3 (HEVC Main10); got %d. AV1 is preferred when available, but HEVC Main10 is the required Ampere-safe HDR fallback.",
 				p.Profile, p.Sunshine.HevcModeValue())
 		}
 		// KMS+NVENC HDR streaming does not require CUDA for the streaming
