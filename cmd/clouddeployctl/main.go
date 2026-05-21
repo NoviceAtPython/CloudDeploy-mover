@@ -1,12 +1,15 @@
 // Command clouddeployctl is the v3 CloudDeploy orchestrator entry point.
 //
 // State at Milestone 4 (in progress): doctor (apt/nvidia/cuda/system) is
-// real and read-only; apply / resume / phase ubuntu-upgrade /
-// base-packages / nvidia-driver / cuda / edid are real and implemented.
-// The reboot continuation service is implemented. KWin real-VT and the
-// patched-KWin build/install phase are implemented; Sunshine / Tailscale /
-// PipeWire / HDR stream validators are NOT yet implemented, so apply exits
-// after the implemented phases with a clear partial-apply banner.
+// real and read-only; apply / resume implement apt-health -> ubuntu-
+// upgrade -> base-packages -> nvidia-driver -> cuda -> edid ->
+// headless-user -> desktop-packages -> desktop-runtime -> kwin-patch
+// -> kwin-session -> drm-display-validate. KWin real-VT (direct
+// kwin_wayland) is the validated Milestone-4 default (live-VM proof
+// 2026-05-21 of DP-1 3840x2160@120 + private HDR + Wide Color Gamut).
+// Sunshine / Tailscale / PipeWire / HDR stream validators are NOT yet
+// implemented, so apply exits after the implemented phases with a
+// clear partial-apply banner.
 //
 // See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability audit,
 // docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
@@ -88,10 +91,12 @@ docs/V3-ROADMAP.md for milestone status, and
 docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
 Milestone 4 (in progress):
-  doctor apt | nvidia | cuda | system                  read-only checks
-  phase ubuntu-upgrade | base-packages |
+  doctor apt | nvidia | cuda | system | kwin | lock     read-only checks
+  phase apt-health | ubuntu-upgrade | base-packages |
         nvidia-driver | cuda | edid |
-        kwin-patch                                      implemented
+        headless-user | desktop-packages |
+        desktop-runtime | kwin-patch |
+        kwin-session | drm-display-validate             implemented
   apply                                                runs the implemented
                                                        phases above (in
                                                        that order) then

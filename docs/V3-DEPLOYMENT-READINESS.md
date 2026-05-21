@@ -24,15 +24,12 @@ gap between "v3 today" and "no-contact full deploy" honest.
 
 It does **not** yet:
 
-* Create the headless user / sudo / loginctl-linger setup.
 * Block on cloud-init's apt lock (we wait on dpkg locks but not
   on cloud-init's lifecycle).
 * Repair the snapd / libblockdev / corrupt-`/var/lib/dpkg/updates`
   failure modes the v2 path handles.
-* Install KDE / Plasma / KWin.
-* Patch / build / install the patched-KWin NVIDIA private HDR path.
 * Build the Sunshine fork at `464bccf1`.
-* Generate the KWin / Plasma / Sunshine systemd units.
+* Generate the full Plasma shell / Sunshine systemd service chain.
 * Wire Tailscale.
 * Install the PipeWire virtual sink.
 * Run the streaming or HDR validators.

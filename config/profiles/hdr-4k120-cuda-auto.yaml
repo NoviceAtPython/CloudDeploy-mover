@@ -60,6 +60,19 @@ kwin:
   patched_hdr: true
   patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
 
+desktop:
+  # Live-VM-validated Milestone-4 path (2026-05-21):
+  #   - real-VT logind session (the v2-parity ingredient that makes
+  #     logind hand DRM master to the compositor).
+  #   - DIRECT kwin_wayland (NOT startplasma-wayland). On the live VM
+  #     Plasma's startplasma-wayland exited with status=4 even after
+  #     the patched KWin built cleanly, while direct kwin_wayland
+  #     came up with DP-1 3840x2160@120 + HDR + WCG.
+  session_backend: realvt
+  compositor_mode: kwin
+  # enable_linger defaults to true; pinning here for documentation.
+  enable_linger: true
+
 deploy:
   auto_upgrade_ubuntu: true
   accept_non_lts: true

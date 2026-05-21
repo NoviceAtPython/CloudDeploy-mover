@@ -337,7 +337,24 @@ func (p KWinPatch) buildInstall(ctx context.Context, deps *Deps, cfg config.KWin
 	if err != nil || len(debs) == 0 {
 		return nil, fmt.Errorf("no generated .deb packages found under %s", work)
 	}
-	args := append([]string{"apt-get", "-y", "install"}, debs...)
+	// Live VM (2026-05-21): the rebuilt patched .debs carry the
+	// archive's source version (e.g. 6.4.5-0ubuntu3) which apt-get
+	// install treats as a downgrade vs. whatever the distro is
+	// currently advertising. Without --allow-downgrades the install
+	// aborts with "Packages were downgraded and -y was used without
+	// --allow-downgrades", and the patched stack never lands.
+	//
+	// --allow-change-held-packages covers the re-run case: if the
+	// previous attempt already apt-mark hold'd the same packages,
+	// the next `apt-get install` would otherwise refuse to touch
+	// them. Both flags are safe because:
+	//   - the only -y install in this codepath is THIS file's
+	//     locally-built KWin .debs (operator-explicit intent);
+	//   - we re-hold immediately after via the HoldPackages block.
+	args := append(
+		[]string{"apt-get", "-y", "--allow-downgrades", "--allow-change-held-packages", "install"},
+		debs...,
+	)
 	if err := run(ctx, deps, "", args, 45*time.Minute, true); err != nil {
 		return nil, err
 	}

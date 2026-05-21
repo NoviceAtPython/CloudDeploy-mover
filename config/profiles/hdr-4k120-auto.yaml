@@ -52,6 +52,14 @@ kwin:
   patched_hdr: true
   patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
 
+desktop:
+  # Direct kwin_wayland real-VT is the Milestone-4 validated
+  # compositor target (see hdr-4k120-cuda-auto for the live-VM
+  # postmortem that established this default).
+  session_backend: realvt
+  compositor_mode: kwin
+  enable_linger: true
+
 deploy:
   auto_upgrade_ubuntu: true
   accept_non_lts: true

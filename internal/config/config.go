@@ -418,7 +418,15 @@ const DefaultDesktopShell = "/bin/bash"
 const DefaultSessionBackend = "realvt"
 
 // DefaultCompositorMode is what realvt launches by default.
-const DefaultCompositorMode = "plasma"
+//
+// Live-VM evidence (2026-05-21): the direct kwin_wayland real-VT
+// path produced a working DP-1 3840x2160@120 + private HDR + WCG
+// session on Ubuntu 25.10 + NVIDIA 580 + RTX A6000. The full Plasma
+// path (startplasma-wayland) exited with status=4 on the same host,
+// even though the underlying KWin runtime was the patched one we
+// just built. So `kwin` is now the validated Milestone-4 default;
+// `plasma` is kept as an opt-in for future Plasma-UX work.
+const DefaultCompositorMode = "kwin"
 
 // DefaultKwinVT is the virtual terminal the realvt service claims.
 const DefaultKwinVT = 7

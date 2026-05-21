@@ -170,6 +170,13 @@ type DRMDisplayValidate struct {
 	// nil = `sudo -u <user> XDG_RUNTIME_DIR=/run/user/<uid>
 	//        kscreen-doctor -o` via the runner.
 	KScreenFn func(ctx context.Context, deps *Deps, user, uid string) (string, error)
+
+	// KWinDBusFn is the preflight check: when KWin is half-initialized
+	// kscreen-doctor hangs instead of returning an error, which made
+	// the phase look "stuck" on the live VM. We probe org.kde.KWin's
+	// DBus name first and bail out cleanly if it's missing. nil =
+	// real `qdbus --session org.kde.KWin /KWin Introspect`.
+	KWinDBusFn func(ctx context.Context, deps *Deps, user, uid string) (bool, string, error)
 }
 
 // Name implements Phase.
@@ -208,6 +215,8 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		"selected_mode":     "",
 		"modes":             []string{},
 	}
+	unitName := UnitNameForSession(desk.SessionBackend, desk.CompositorMode)
+	details["service_name"] = unitName
 
 	if uid == "" || connector == "" {
 		err := fmt.Errorf("drm-display-validate needs uid (from headless_user) and display.forced_connector to be set; uid=%q connector=%q", uid, connector)
@@ -233,6 +242,34 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		}
 	}
 	details["wayland_socket_ok"] = waylandSocketExists(uid)
+
+	// Preflight: confirm org.kde.KWin owns the session bus name
+	// BEFORE asking kscreen-doctor to talk to it. Live VM (2026-05-21)
+	// regression: kscreen-doctor hung indefinitely on a host where
+	// the wayland-0 socket existed but KWin was still finishing
+	// startup (or had picked the nested-Wayland backend). Failing
+	// fast with a clean diagnostic is much friendlier than a
+	// 15-minute hang.
+	if !deps.DryRun {
+		ok, info, derr := p.kwinDBusReady(ctx, deps, desk.User, uid)
+		details["dbus_kwin_ok"] = ok
+		if info != "" {
+			details["dbus_kwin_info"] = info
+		}
+		if !ok {
+			err := fmt.Errorf("org.kde.KWin is not present on %s's session bus; "+
+				"kscreen-doctor would hang. Recover with: "+
+				"sudo systemctl status %s; "+
+				"sudo journalctl -u %s -n 200 --no-pager. "+
+				"(probe error: %v info=%q)",
+				desk.User, unitName, unitName, derr, info)
+			details["err"] = err.Error()
+			deps.State.MarkFailed(DRMDisplayValidateName, "org.kde.KWin missing on session bus", err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
+		}
+	}
 
 	rawOut, err := p.runKScreen(ctx, deps, desk.User, uid)
 	if err != nil {
@@ -282,6 +319,33 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		"selected_mode", conn.CurrentMode, "expected_mode", wantMode,
 		"mode_count", len(conn.Modes))
 	return nil
+}
+
+// kwinDBusReady probes the headless user's session bus for
+// org.kde.KWin. Returns (true, info, nil) when the service answers.
+// Tests inject KWinDBusFn; production shells out to `qdbus --session
+// org.kde.KWin /KWin Introspect`.
+func (p DRMDisplayValidate) kwinDBusReady(ctx context.Context, deps *Deps, user, uid string) (bool, string, error) {
+	if p.KWinDBusFn != nil {
+		return p.KWinDBusFn(ctx, deps, user, uid)
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv: []string{
+			"sudo", "-u", user,
+			"env",
+			"XDG_RUNTIME_DIR=/run/user/" + uid,
+			"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
+			"qdbus", "--session", "org.kde.KWin", "/KWin",
+			"org.freedesktop.DBus.Introspectable.Introspect",
+		},
+		Sudo:    true,
+		LogFile: "-",
+		Timeout: 8 * time.Second,
+	})
+	if res.Err != nil {
+		return false, lastLines(res.Stderr, 2), res.Err
+	}
+	return true, "introspect OK", nil
 }
 
 func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, uid string) (string, error) {

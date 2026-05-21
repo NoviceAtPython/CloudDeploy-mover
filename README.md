@@ -5,16 +5,14 @@
 | Branch | Status | What it deploys |
 | --- | --- | --- |
 | [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Production. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of v2 commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
-| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **Milestone 4 in progress — Ubuntu-only — NOT v2-equivalent.** | `clouddeployctl` Go orchestrator. Real: `doctor` + `phase ubuntu-upgrade / base-packages / nvidia-driver / cuda / edid` + `apply` / `resume` + `collect-logs`. Missing: KDE/KWin install + patched-KWin HDR build + Sunshine fork build + Tailscale + PipeWire + streaming/HDR validators. **See [`docs/V2-V3-PARITY.md`](docs/V2-V3-PARITY.md) for the full audit.** |
+| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **Milestone 4 in progress — Ubuntu-only — NOT v2-equivalent.** | `clouddeployctl` Go orchestrator. Real through patched direct KWin real-VT validation: apt/NVIDIA/CUDA/EDID, headless user, desktop packages/runtime, `kwin-patch`, `kwin-session`, `drm-display-validate`, `apply` / `resume` / `collect-logs`. Missing: Sunshine fork build/service chain, Tailscale, PipeWire, streaming/HDR validators. **See [`docs/V2-V3-PARITY.md`](docs/V2-V3-PARITY.md) for the full audit.** |
 
 > **`clouddeployctl apply` is NOT a v2-equivalent deploy.** v3 today
-> covers the bootstrap-blocker phases (ubuntu-upgrade, base-packages,
-> nvidia-driver, cuda, edid, reboot continuation). It does **not** yet
-> install Plasma 6 / KWin, build the patched-KWin NVIDIA private HDR
-> path, build Sunshine, generate KWin/Plasma/Sunshine systemd units,
-> wire Tailscale, install the PipeWire virtual sink, or run the
-> streaming / HDR validators. The `apply` command prints a banner
-> naming the missing phases when it finishes.
+> covers the bootstrap, patched-KWin, direct KWin real-VT, and display
+> validation phases. It does **not** yet build Sunshine, generate the
+> full Sunshine/Tailscale/PipeWire service chain, or run the streaming
+> / HDR validators. The `apply` command prints a banner naming the
+> missing phases when it finishes.
 >
 > For a full deploy that reaches Moonlight `AV1 10-bit HDR`, keep
 > using v2:

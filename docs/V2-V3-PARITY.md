@@ -68,10 +68,10 @@ Milestone 4 work into `v3`).
 
 | v2 capability | Why it exists | v3 status | v3 owner | Notes |
 | --- | --- | --- | --- | --- |
-| KDE / Plasma / KWin package install (`kde_plasma_package_list`) | Installs Plasma 6 + KWin Wayland + plasma-shell. | missing | TBD `internal/phase/kde.go` | Depends on `base-packages` and `nvidia-driver`. |
-| Plasma 6 availability checks (`installed_plasma_version`, `installed_kwin_version`) | v2 refuses if Plasma 6 isn't available on the running release; this is the link to the ubuntu-upgrade phase. | missing | TBD `internal/kde` | Pairs with `kde` phase. |
-| KWin private HDR patch build / install (`build_install_patched_kwin`) | Applies `patches/kwin-clouddeploy-nvidia-private-hdr.patch`, builds, installs. | missing | TBD `internal/kwin` | The single highest-impact missing piece for HDR. |
-| KWin apt pin / hold / marker (`write_patched_kwin_apt_pin`) | Prevents `unattended-upgrades` from replacing the patched build. | missing | TBD `internal/kwin` | |
+| KDE / Plasma / KWin package install (`kde_plasma_package_list`) | Installs Plasma 6 + KWin Wayland + plasma-shell. | real | `internal/phase/desktop_packages.go` | Package retry/idempotency is in place; full Plasma shell service chain is still later. |
+| Plasma 6 availability checks (`installed_plasma_version`, `installed_kwin_version`) | v2 refuses if Plasma 6 isn't available on the running release; this is the link to the ubuntu-upgrade phase. | real | `internal/phase/desktop_packages.go` | Native package probing is used for the 25.10 path. |
+| KWin private HDR patch build / install (`build_install_patched_kwin`) | Applies `patches/kwin-clouddeploy-nvidia-private-hdr.patch`, builds, installs. | real | `internal/phase/kwin_patch.go` | Builds patched KWin source packages and installs the resulting `.debs`. |
+| KWin apt pin / hold / marker (`write_patched_kwin_apt_pin`) | Prevents `unattended-upgrades` from replacing the patched build. | real | `internal/phase/kwin_patch.go` + `internal/kwin` | Writes `/var/lib/clouddeploy/kwin-patch.json` and holds the patched packages. |
 | Sunshine fork clone / build / pin (`install_sunshine_from_fork_if_requested`) | Pins `464bccf1`, builds, dual-installs, setcap. | missing | TBD `internal/sunshine` | Second-highest impact. |
 | Sunshine setcap (cap_sys_admin + cap_net_bind_service + cap_sys_nice) | Without it, NVENC scheduling breaks at 4K120. | missing | TBD `internal/sunshine` | |
 | Sunshine runtime assets (`/usr/local/assets/`) | Web UI + apps.json. | missing | TBD `internal/sunshine` | |
@@ -80,7 +80,7 @@ Milestone 4 work into `v3`).
 | KWin / Plasma / Sunshine systemd units (`install_clouddeploy_systemd_units`) | The runtime services that drive the streaming stack. | missing | TBD `internal/systemd` | |
 | Tailscale install + auth + connect (`validate_tailscale_authkey`) | Required to reach the VM from Moonlight. | missing | TBD `internal/phase/tailscale.go` | Needs `TAILSCALE_AUTHKEY` secret. |
 | PipeWire virtual sink (`install_clouddeploy_pipewire_virtual_sink`) | Sunshine audio capture needs a sink in the VM (no real HDA). | missing | TBD `internal/phase/audio.go` | |
-| Force-KWin-mode helper (`clouddeploy-force-kwin-mode.sh` writer) | Periodically asserts `kscreen-doctor output.DP-1.mode.3840x2160@120`. | missing | TBD `internal/kwin` | |
+| Force-KWin-mode helper (`clouddeploy-force-kwin-mode.sh` writer) | Periodically asserts `kscreen-doctor output.DP-1.mode.3840x2160@120`. | real | `internal/phase/kwin_session.go` | Resolves KScreen output/mode IDs and enables HDR/WCG when the profile is HDR. |
 | Reset-streaming helper (`clouddeploy-reset-streaming`) | One-button "restart the streaming stack" for the operator. | missing | TBD `internal/systemd` | |
 | Watchdog service / timer (`clouddeploy-watch-streaming.timer`) | Restarts Sunshine if it falls over. | missing | TBD `internal/systemd` | |
 | Final streaming validation (`validate_streaming_stack_ready`) | Walks the journal + DRM state + `nvidia-smi` + `kscreen-doctor` and confirms everything. | missing | TBD `internal/validate` | |

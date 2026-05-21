@@ -47,22 +47,27 @@ func happyKwin(unitPath string) KWinSession {
 		JournalRecentFn: func(context.Context, *Deps, string, int) (string, error) {
 			return "kwin_core: starting up\nDP-1 enabled\n", nil
 		},
+		KWinDBusFn: func(context.Context, *Deps, string, string) (bool, string, error) {
+			return true, "introspect OK", nil
+		},
+		SupportInformationFn: func(context.Context, *Deps, string, string) (string, error) {
+			return "Output backend: DRM\nCompositing backend: OpenGL\nOutput: DP-1\n", nil
+		},
 		SocketWait:      2 * time.Second,
 		SocketStability: 100 * time.Millisecond,
 	}
 }
 
 // -----------------------------------------------------------------------------
-// rendered unit text (default = realvt/plasma)
+// rendered unit text (default = realvt/kwin)
 // -----------------------------------------------------------------------------
 
-func TestRenderUnitText_RealVTPlasmaIsTheDefault(t *testing.T) {
+func TestRenderUnitText_RealVTKWinIsTheDefault(t *testing.T) {
 	out := RenderUnitText("cloudgamer", "1001")
 	for _, want := range []string{
 		"User=cloudgamer",
 		"XDG_RUNTIME_DIR=/run/user/1001",
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus",
-		"WAYLAND_DISPLAY=wayland-0",
 		"TTYPath=/dev/tty7",
 		"PAMName=login",
 		"TTYReset=yes",
@@ -79,12 +84,15 @@ func TestRenderUnitText_RealVTPlasmaIsTheDefault(t *testing.T) {
 		"__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
 		"__GLX_VENDOR_LIBRARY_NAME=nvidia",
 		"chvt 7",
-		"startplasma-wayland",
+		"kwin_wayland --drm --socket wayland-0 --no-lockscreen",
 		"clouddeploy-force-kwin-mode.sh",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered unit missing %q in:\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "Environment=WAYLAND_DISPLAY=wayland-0") {
+		t.Errorf("rendered unit must not set WAYLAND_DISPLAY before launching KWin:\n%s", out)
 	}
 	if strings.Contains(out, "{{") || strings.Contains(out, "}}") {
 		t.Errorf("rendered unit still contains template placeholders:\n%s", out)
@@ -139,7 +147,7 @@ func TestExecStartFor_PicksRightBinary(t *testing.T) {
 		mustHave string
 	}{
 		{"realvt", "plasma", "startplasma-wayland"},
-		{"realvt", "kwin", "kwin_wayland --drm --no-lockscreen"},
+		{"realvt", "kwin", "kwin_wayland --drm --socket wayland-0 --no-lockscreen"},
 		{"user", "kwin", "dbus-run-session"},
 		{"user", "plasma", "dbus-run-session"},
 		{"weston", "weston", "weston --backend=drm-backend.so"},
@@ -166,9 +174,9 @@ func TestExecStartFor_PatchedRuntimeBinOverridesKwin(t *testing.T) {
 // happy path: full strict success criteria
 // -----------------------------------------------------------------------------
 
-func TestKWinSession_HappyPath_RealVTPlasma(t *testing.T) {
+func TestKWinSession_HappyPath_RealVTKWin(t *testing.T) {
 	deps := kwinDeps(t)
-	unitPath := filepath.Join(t.TempDir(), "plasma-realvt.service")
+	unitPath := filepath.Join(t.TempDir(), "kwin-realvt.service")
 
 	systemctlCalls := [][]string{}
 	ph := happyKwin(unitPath)
@@ -190,14 +198,17 @@ func TestKWinSession_HappyPath_RealVTPlasma(t *testing.T) {
 	if !strings.Contains(string(body), "TTYPath=/dev/tty7") {
 		t.Errorf("real-VT unit body missing TTYPath=/dev/tty7:\n%s", string(body))
 	}
-	if !strings.Contains(string(body), "startplasma-wayland") {
-		t.Errorf("real-VT unit body missing startplasma-wayland:\n%s", string(body))
+	if !strings.Contains(string(body), "kwin_wayland --drm --socket wayland-0 --no-lockscreen") {
+		t.Errorf("real-VT unit body missing direct KWin launch:\n%s", string(body))
+	}
+	if strings.Contains(string(body), "Environment=WAYLAND_DISPLAY=wayland-0") {
+		t.Errorf("real-VT unit must not set WAYLAND_DISPLAY before launching KWin:\n%s", string(body))
 	}
 
 	wantSteps := [][]string{
 		{"daemon-reload"},
-		{"enable", "plasma-realvt.service"},
-		{"start", "plasma-realvt.service"},
+		{"enable", "kwin-realvt.service"},
+		{"start", "--no-block", "kwin-realvt.service"},
 	}
 	if len(systemctlCalls) != len(wantSteps) {
 		t.Fatalf("systemctl calls: got %v want %v", systemctlCalls, wantSteps)
@@ -218,14 +229,14 @@ func TestKWinSession_HappyPath_RealVTPlasma(t *testing.T) {
 	if d["service_active_state"] != "active" {
 		t.Errorf("service_active_state: got %v want active", d["service_active_state"])
 	}
-	if d["service_name"] != "plasma-realvt.service" {
-		t.Errorf("service_name: got %v want plasma-realvt.service", d["service_name"])
+	if d["service_name"] != "kwin-realvt.service" {
+		t.Errorf("service_name: got %v want kwin-realvt.service", d["service_name"])
 	}
 	if d["backend"] != "realvt" {
 		t.Errorf("backend: got %v want realvt", d["backend"])
 	}
-	if d["compositor_mode"] != "plasma" {
-		t.Errorf("compositor_mode: got %v want plasma", d["compositor_mode"])
+	if d["compositor_mode"] != "kwin" {
+		t.Errorf("compositor_mode: got %v want kwin", d["compositor_mode"])
 	}
 	if d["vt"] != 7 {
 		t.Errorf("vt: got %v want 7", d["vt"])
@@ -238,6 +249,12 @@ func TestKWinSession_HappyPath_RealVTPlasma(t *testing.T) {
 	}
 	if d["kwin_pid"] != 42 {
 		t.Errorf("kwin_pid: got %v want 42", d["kwin_pid"])
+	}
+	if d["dbus_kwin_ok"] != true {
+		t.Errorf("dbus_kwin_ok: got %v want true", d["dbus_kwin_ok"])
+	}
+	if d["support_information_drm_backend"] != true {
+		t.Errorf("support_information_drm_backend: got %v want true", d["support_information_drm_backend"])
 	}
 }
 
