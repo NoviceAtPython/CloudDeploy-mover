@@ -18,6 +18,7 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
+	sunshinecodec "github.com/NoviceAtPython/CloudDeploy-mover/internal/sunshine"
 )
 
 const (
@@ -627,8 +628,15 @@ func renderSunshineConfig(cfg config.SunshineConfig, drm string, origins []strin
 	if capture == "" {
 		capture = "kms"
 	}
-	av1Mode := "2"
-	hevcMode := "0"
+	// AV1-first ordering and the Main10 mode bits come from
+	// SunshineConfig now (live-VM regression fix). Defaults are
+	// av1_mode=3 + hevc_mode=3 - HDR Main10 advertised on both
+	// branches so Moonlight has a real HDR path to negotiate. The
+	// profile validator already gates HDR profiles against modes
+	// below 3, so anything that reaches here is internally
+	// consistent.
+	av1Mode := fmt.Sprintf("%d", cfg.Av1ModeValue())
+	hevcMode := fmt.Sprintf("%d", cfg.HevcModeValue())
 	var b strings.Builder
 	b.WriteString("min_log_level = debug\n")
 	b.WriteString("capture = " + capture + "\n")
@@ -815,8 +823,18 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	cfg := deps.Profile.EffectiveSunshine()
 	uid := uidFromState(deps)
 	conf := sunshineConfigPath(deps)
-	unit := renderSunshineService(desk.User, uid, cfg.InstallBin, conf)
-	details := map[string]any{"compositor_service": "kwin-realvt.service", "sunshine_service": "sunshine-headless.service", "config": conf}
+	unit := renderSunshineService(desk.User, uid, cfg.InstallBin, conf, cfg)
+	details := map[string]any{
+		"compositor_service":        "kwin-realvt.service",
+		"sunshine_service":          "sunshine-headless.service",
+		"config":                    conf,
+		"hevc_mode":                 cfg.HevcModeValue(),
+		"av1_mode":                  cfg.Av1ModeValue(),
+		"advertises_hevc_main10":    cfg.AdvertisesHEVCMain10(),
+		"advertises_av1_main10":     cfg.AdvertisesAV1Main10(),
+		"force_av1_hdr10_env":       cfg.ForceAV1HDR10,
+		"synthesize_hdr10_metadata": cfg.SynthesizeHDR10Metadata,
+	}
 	if !deps.DryRun {
 		if err := os.WriteFile("/etc/systemd/system/sunshine-headless.service", []byte(unit), 0o644); err != nil {
 			return failPhase(deps, StreamingServicesName, details, "write sunshine-headless.service", err, true)
@@ -1030,6 +1048,41 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo unreachable", err, true)
 	}
 	details["serverinfo_bytes"] = len(serverInfo)
+	codecRaw, codecOK := sunshinecodec.ServerInfoInt(serverInfo, "ServerCodecModeSupport")
+	maxLumaHEVC, maxLumaOK := sunshinecodec.ServerInfoInt(serverInfo, "MaxLumaPixelsHEVC")
+	codecSupport := sunshinecodec.DecodeCodecModeSupport(codecRaw)
+	details["serverinfo_codec_mode_support"] = codecRaw
+	details["serverinfo_codec_mode_support_present"] = codecOK
+	details["serverinfo_codec_flags"] = codecSupport.Names()
+	details["serverinfo_hevc_main10"] = codecOK && codecSupport.HEVCMain10
+	details["serverinfo_av1_main10"] = codecOK && codecSupport.AV1Main10
+	details["serverinfo_max_luma_pixels_hevc"] = maxLumaHEVC
+	details["serverinfo_max_luma_pixels_hevc_present"] = maxLumaOK
+	if deps.Profile != nil && deps.Profile.Display.HDR {
+		if !codecOK {
+			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo missing codec support", fmt.Errorf("ServerCodecModeSupport missing from /serverinfo"), true)
+		}
+		// AV1 Main10 is the PRIMARY HDR path on v3 (AV1-first). If
+		// it's absent from /serverinfo the Sunshine encoder probe
+		// rejected AV1 -- the same upstream bug that left Moonlight
+		// falling back to H.264 + p010 on the live VM. The deploy
+		// fails here so the operator gets a clear codec-advertise
+		// regression instead of an obscure "h264_nvenc dynamic range
+		// not supported" at session-negotiation time.
+		if !codecSupport.AV1Main10 {
+			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks AV1 Main10", fmt.Errorf("AV1 Main10 missing from /serverinfo: ServerCodecModeSupport=%d (%s). Confirm sunshine.av1_mode=3 in the rendered sunshine.conf and that the encoder probe found NVENC AV1 10-bit", codecRaw, codecSupport.String()), true)
+		}
+		// HEVC Main10 is the FALLBACK HDR path Moonlight uses when
+		// the client doesn't advertise AV1. Missing it isn't fatal
+		// to AV1 streaming but it leaves clients without AV1
+		// stranded; record it as required for full HDR parity.
+		if !codecSupport.HEVCMain10 {
+			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks HEVC Main10", fmt.Errorf("HEVC Main10 missing from /serverinfo: ServerCodecModeSupport=%d (%s). Confirm sunshine.hevc_mode=3 in the rendered sunshine.conf and that the encoder probe found NVENC HEVC 10-bit", codecRaw, codecSupport.String()), true)
+		}
+		if !maxLumaOK || maxLumaHEVC <= 0 {
+			return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo lacks HEVC luma capacity", fmt.Errorf("MaxLumaPixelsHEVC=%d present=%v", maxLumaHEVC, maxLumaOK), true)
+		}
+	}
 	webStatus, webErr := webUIStatusFn(ctx, deps, "https://127.0.0.1:47990")
 	details["web_ui_http_status"] = webStatus
 	details["web_ui_reachable"] = webStatusSuccess(webStatus)
@@ -1149,9 +1202,29 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
-func renderSunshineService(user, uid, bin, conf string) string {
+func renderSunshineService(user, uid, bin, conf string, cfg config.SunshineConfig) string {
 	if bin == "" {
 		bin = "/usr/local/bin/sunshine-clouddeploy"
+	}
+	// Gate the HDR-force env vars on the profile.
+	//
+	// Live-VM bug: v3 unconditionally injected
+	//   SUNSHINE_FORCE_AV1_HDR10=1
+	//   SUNSHINE_SYNTHESIZE_HDR10_METADATA=1
+	// even when the session ultimately negotiated H.264 - h264_nvenc
+	// then refused the p010 / 10-bit / Rec.2020 colorspace the
+	// force-HDR env vars demanded ("dynamic range not supported").
+	// Now we render those lines only when the profile asks for them;
+	// the SunshineConfig validator already requires both fields to
+	// be true for HDR profiles AND requires hevc_mode>=3 +
+	// av1_mode>=3, so reaching `force_av1_hdr10=true` implies
+	// Moonlight will be offered HDR Main10 on at least one branch.
+	hdrEnvBlock := ""
+	if cfg.ForceAV1HDR10 {
+		hdrEnvBlock += "Environment=SUNSHINE_FORCE_AV1_HDR10=1\n"
+	}
+	if cfg.SynthesizeHDR10Metadata {
+		hdrEnvBlock += "Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1\n"
 	}
 	return fmt.Sprintf(`[Unit]
 Description=CloudDeploy Sunshine Wayland/KMS/NVENC
@@ -1177,9 +1250,7 @@ Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
 Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
-Environment=SUNSHINE_FORCE_AV1_HDR10=1
-Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1
-ExecStart=%s %s
+%sExecStart=%s %s
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
@@ -1187,7 +1258,7 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-`, user, user, user, user, user, user, uid, uid, bin, conf)
+`, user, user, user, user, user, user, uid, uid, hdrEnvBlock, bin, conf)
 }
 
 func writeResetStreamingHelper(deps *Deps, bin, conf string) error {

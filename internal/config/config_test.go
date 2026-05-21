@@ -531,6 +531,14 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 		{"empty driver_major", func(p *Profile) { p.NVIDIA.DriverMajor = "" }, "driver_major"},
 		{"bad cuda mode", func(p *Profile) { p.CUDA.Mode = "yes-please" }, "cuda.mode"},
 		{"bad sunshine source", func(p *Profile) { p.Sunshine.Source = "snap" }, "sunshine.source"},
+		{"bad sunshine hevc_mode", func(p *Profile) {
+			bad := 4
+			p.Sunshine.HevcMode = &bad
+		}, "sunshine.hevc_mode"},
+		{"bad sunshine av1_mode", func(p *Profile) {
+			bad := -1
+			p.Sunshine.Av1Mode = &bad
+		}, "sunshine.av1_mode"},
 		{"fork without repo", func(p *Profile) { p.Sunshine.ForkRepo = "" }, "sunshine.fork_repo"},
 		{"hdr without fork commit", func(p *Profile) {
 			p.Display.HDR = true
@@ -540,6 +548,16 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Display.HDR = true
 			p.Sunshine.ForceAV1HDR10 = false
 		}, "force_av1_hdr10"},
+		{"hdr with av1_mode below Main10", func(p *Profile) {
+			p.Display.HDR = true
+			two := 2
+			p.Sunshine.Av1Mode = &two
+		}, "sunshine.av1_mode"},
+		{"hdr with hevc_mode below Main10", func(p *Profile) {
+			p.Display.HDR = true
+			two := 2
+			p.Sunshine.HevcMode = &two
+		}, "sunshine.hevc_mode"},
 		{"bad cuda method", func(p *Profile) { p.CUDA.Method = "snap" }, "cuda.method"},
 		{"bad cuda selection_policy", func(p *Profile) { p.CUDA.SelectionPolicy = "yolo" }, "cuda.selection_policy"},
 		{"bad cuda expected_major", func(p *Profile) { p.CUDA.ExpectedMajor = "13.0" }, "cuda.expected_major"},

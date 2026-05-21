@@ -276,6 +276,27 @@ type CUDAConfig struct {
 }
 
 // SunshineConfig captures the Sunshine fork pin + HDR knobs.
+//
+// Codec advertisement (hevc_mode + av1_mode) is the load-bearing
+// piece for HDR-Main10 streaming. Sunshine's docs / source:
+//
+//	hevc_mode = 0    auto-advertise based on encoder probe (UNSAFE
+//	                 for HDR: the live-VM probe left active_hevc_mode
+//	                 below 3, so Moonlight never saw HEVC Main10 and
+//	                 fell back to H.264 with HDR/10-bit still forced
+//	                 -> h264_nvenc rejected the negotiation).
+//	hevc_mode = 1    HEVC disabled.
+//	hevc_mode = 2    HEVC Main only (8-bit).
+//	hevc_mode = 3    HEVC Main + Main10 (HDR-capable).
+//
+//	av1_mode = 0     auto-advertise based on encoder probe.
+//	av1_mode = 1     AV1 disabled.
+//	av1_mode = 2     AV1 Main only (8-bit).
+//	av1_mode = 3     AV1 Main + Main10 (HDR-capable).
+//
+// HDR profiles MUST pin av1_mode=3 (AV1-first for any client that
+// supports it) AND hevc_mode=3 (HEVC Main10 fallback). The validator
+// rejects force_av1_hdr10=true with av1_mode<3.
 type SunshineConfig struct {
 	Source                  string   `yaml:"source"`
 	ForkRepo                string   `yaml:"fork_repo"`
@@ -283,6 +304,8 @@ type SunshineConfig struct {
 	ForkCommit              string   `yaml:"fork_commit"`
 	Encoder                 string   `yaml:"encoder"`
 	Capture                 string   `yaml:"capture"`
+	HevcMode                *int     `yaml:"hevc_mode"`
+	Av1Mode                 *int     `yaml:"av1_mode"`
 	ForceAV1HDR10           bool     `yaml:"force_av1_hdr10"`
 	SynthesizeHDR10Metadata bool     `yaml:"synthesize_hdr10_metadata"`
 	BuildDir                string   `yaml:"build_dir"`
@@ -299,6 +322,39 @@ type SunshineConfig struct {
 	DoxygenSHA256           string   `yaml:"doxygen_sha256"`
 	DoxygenInstallDir       string   `yaml:"doxygen_install_dir"`
 }
+
+// DefaultHevcMode + DefaultAv1Mode are the safe HDR-Main10 defaults
+// applied when the profile omits the keys. v3's old "0" auto-probe
+// default is the bug we're closing; an absent key now means "give
+// us the modes that advertise HDR Main10 to Moonlight".
+const (
+	DefaultHevcMode = 3
+	DefaultAv1Mode  = 3
+)
+
+// HevcModeValue / Av1ModeValue resolve the *int fields against the
+// HDR-Main10 defaults. Profiles can still pin a different value
+// (e.g. an 8-bit-only diagnostic profile) by setting hevc_mode: 2 /
+// av1_mode: 2 explicitly.
+func (s SunshineConfig) HevcModeValue() int {
+	if s.HevcMode == nil {
+		return DefaultHevcMode
+	}
+	return *s.HevcMode
+}
+
+func (s SunshineConfig) Av1ModeValue() int {
+	if s.Av1Mode == nil {
+		return DefaultAv1Mode
+	}
+	return *s.Av1Mode
+}
+
+// AdvertisesHEVCMain10 / AdvertisesAV1Main10 report whether the
+// resolved mode bit is high enough for Sunshine to advertise the
+// Main10 capability to Moonlight. Used by validation + doctor.
+func (s SunshineConfig) AdvertisesHEVCMain10() bool { return s.HevcModeValue() >= 3 }
+func (s SunshineConfig) AdvertisesAV1Main10() bool  { return s.Av1ModeValue() >= 3 }
 
 const DefaultSunshineBuildDir = "/opt/sunshine-src"
 const DefaultSunshineInstallBin = "/usr/local/bin/sunshine-clouddeploy"
@@ -842,11 +898,36 @@ func ValidateProfile(p *Profile) error {
 		if !p.Sunshine.SynthesizeHDR10Metadata {
 			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.synthesize_hdr10_metadata=true", p.Profile)
 		}
+		// Codec advertisement gate. Live-VM bug: with hevc_mode=0 +
+		// av1_mode=2 the Sunshine probe left active_hevc_mode below 3
+		// and active_av1_mode below 3, so Moonlight saw no HDR
+		// Main10 capability and fell back to H.264 - while the force
+		// HDR env vars kept demanding p010 10-bit, which h264_nvenc
+		// rejects. Refuse the deploy here rather than later, with a
+		// specific error that names both knobs.
+		if !p.Sunshine.AdvertisesAV1Main10() {
+			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.av1_mode>=3 (AV1 Main10); got %d. Live-VM regression: av1_mode<3 leaves ServerCodecModeSupport without the AV1 Main10 bit and Moonlight falls back to H.264 + p010 which h264_nvenc refuses.",
+				p.Profile, p.Sunshine.Av1ModeValue())
+		}
+		if !p.Sunshine.AdvertisesHEVCMain10() {
+			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.hevc_mode>=3 (HEVC Main10); got %d. AV1 is the preferred path, but HEVC Main10 is the safe fallback - hevc_mode<3 leaves both branches unable to honor HDR.",
+				p.Profile, p.Sunshine.HevcModeValue())
+		}
 		// KMS+NVENC HDR streaming does not require CUDA for the streaming
 		// path; the toolkit is optional. We allow cuda.mode = none /
 		// optional / required so an HDR profile can also test the CUDA
 		// install end-to-end (e.g. hdr-4k120-cuda). No further HDR-CUDA
 		// constraint here.
+	}
+	// Range check the codec modes for ALL profiles (HDR or not). Sunshine
+	// silently treats out-of-range as 0 (auto-probe), which is the bug we
+	// just closed for HDR; same applies to SDR profiles that want
+	// 8-bit-only.
+	if hm := p.Sunshine.HevcModeValue(); hm < 0 || hm > 3 {
+		return fmt.Errorf("config: profile %q: sunshine.hevc_mode must be 0..3, got %d", p.Profile, hm)
+	}
+	if am := p.Sunshine.Av1ModeValue(); am < 0 || am > 3 {
+		return fmt.Errorf("config: profile %q: sunshine.av1_mode must be 0..3, got %d", p.Profile, am)
 	}
 	return nil
 }

@@ -48,6 +48,8 @@ sunshine:
   fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
   encoder: nvenc
   capture: kms
+  hevc_mode: 3
+  av1_mode: 3
   # The two knobs that flip Moonlight's HDR overlay on:
   force_av1_hdr10: true
   synthesize_hdr10_metadata: true

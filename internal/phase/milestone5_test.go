@@ -26,6 +26,8 @@ func milestone5Deps(t *testing.T) *Deps {
 	return deps
 }
 
+const goodHDRServerInfo = `<root status_code="200"><ServerCodecModeSupport>197377</ServerCodecModeSupport><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC></root>`
+
 func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 	body := renderSunshineConfig(config.SunshineConfig{
 		Encoder:                 "nvenc",
@@ -49,12 +51,38 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		"encoder = nvenc",
 		"adapter_name = /dev/dri/card1",
 		"stream_audio = disabled",
-		"av1_mode = 2",
+		// HDR-Main10 defaults: av1_mode=3 (AV1 Main + Main10),
+		// hevc_mode=3 (HEVC Main + Main10). Live-VM regression:
+		// av1_mode=2 + hevc_mode=0 left Moonlight without an HDR
+		// branch and it fell back to H.264 + p010 which h264_nvenc
+		// refuses. These defaults are pinned for HDR profiles by
+		// the SunshineConfig validator.
+		"av1_mode = 3",
+		"hevc_mode = 3",
 		"csrf_allowed_origins = https://localhost:47990",
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("sunshine.conf missing %q:\n%s", want, body)
 		}
+	}
+	if strings.Contains(body, "av1_mode = 2") {
+		t.Errorf("sunshine.conf still uses the buggy av1_mode=2 default:\n%s", body)
+	}
+	if strings.Contains(body, "hevc_mode = 0") {
+		t.Errorf("sunshine.conf still uses the buggy hevc_mode=0 auto-probe default:\n%s", body)
+	}
+}
+
+func TestRenderSunshineConfig_HonorsExplicitProfileCodecModes(t *testing.T) {
+	one := 1
+	two := 2
+	cfg := config.SunshineConfig{Encoder: "nvenc", Capture: "kms", HevcMode: &two, Av1Mode: &one}
+	body := renderSunshineConfig(cfg, "/dev/dri/card1", nil)
+	if !strings.Contains(body, "hevc_mode = 2") {
+		t.Errorf("explicit hevc_mode=2 not rendered:\n%s", body)
+	}
+	if !strings.Contains(body, "av1_mode = 1") {
+		t.Errorf("explicit av1_mode=1 not rendered:\n%s", body)
 	}
 }
 
@@ -78,7 +106,10 @@ func TestTailscaleSkipsWithoutAuthKey(t *testing.T) {
 }
 
 func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
-	unit := renderSunshineService("cloudgamer", "1001", "/usr/local/bin/sunshine-clouddeploy", "/home/cloudgamer/.config/sunshine/sunshine.conf")
+	unit := renderSunshineService("cloudgamer", "1001", "/usr/local/bin/sunshine-clouddeploy", "/home/cloudgamer/.config/sunshine/sunshine.conf", config.SunshineConfig{
+		ForceAV1HDR10:           true,
+		SynthesizeHDR10Metadata: true,
+	})
 	for _, want := range []string{
 		"Wants=network-online.target kwin-realvt.service",
 		"After=network-online.target kwin-realvt.service",
@@ -97,6 +128,15 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service", "DeviceAllow=/dev/uinput", "DevicePolicy="} {
 		if strings.Contains(unit, bad) {
 			t.Errorf("sunshine service should not contain %q:\n%s", bad, unit)
+		}
+	}
+}
+
+func TestStreamingServicesOmitsHDRForceEnvWhenProfileDisablesIt(t *testing.T) {
+	unit := renderSunshineService("cloudgamer", "1001", "/usr/local/bin/sunshine-clouddeploy", "/home/cloudgamer/.config/sunshine/sunshine.conf", config.SunshineConfig{})
+	for _, bad := range []string{"SUNSHINE_FORCE_AV1_HDR10=1", "SUNSHINE_SYNTHESIZE_HDR10_METADATA=1"} {
+		if strings.Contains(unit, bad) {
+			t.Fatalf("sunshine service should not force HDR env %q when profile disables it:\n%s", bad, unit)
 		}
 	}
 }
@@ -135,7 +175,7 @@ func TestStreamValidatePendingUntilMoonlightProducesKMSMarkers(t *testing.T) {
 	ph := StreamValidate{
 		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 127.0.0.1:47989", nil },
-		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return "<root></root>", nil },
+		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return goodHDRServerInfo, nil },
 		JournalFn:       func(context.Context, *Deps) (string, error) { return "Configuration UI available", nil },
 		WebUIStatusFn:   func(context.Context, *Deps, string) (int, error) { return 307, nil },
 	}
@@ -159,7 +199,7 @@ func TestStreamValidateRetriesServerInfoUntilReady(t *testing.T) {
 			if attempts < 3 {
 				return "", errors.New("connection refused")
 			}
-			return "<root status_code=\"200\"></root>", nil
+			return goodHDRServerInfo, nil
 		},
 		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
 		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
@@ -174,6 +214,115 @@ func TestStreamValidateRetriesServerInfoUntilReady(t *testing.T) {
 	}
 	if got := deps.State.Get(StreamValidateName).Details["serverinfo_attempts"]; got != 3 {
 		t.Fatalf("serverinfo_attempts: got %v want 3", got)
+	}
+}
+
+func TestStreamValidateFailsHDRProfileWhenServerInfoLacksHEVCMain10(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	// Bits: H264 + HEVC + AV1 Main8 + AV1 Main10 (= 1 + 0x100 +
+	// 0x10000 + 0x20000 = 197377). NO HEVC Main10 (0x200) - so the
+	// AV1 gate passes and we land on the HEVC Main10 gate, which is
+	// the regression this test pins.
+	const codecBits = 197377
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>0</MaxLumaPixelsHEVC></root>`, codecBits), nil
+		},
+		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected missing HEVC Main10 advertisement to fail")
+	}
+	if !strings.Contains(err.Error(), "HEVC Main10") {
+		t.Fatalf("error should mention HEVC Main10: %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["serverinfo_hevc_main10"] != false {
+		t.Fatalf("serverinfo_hevc_main10 detail: got %v want false", details["serverinfo_hevc_main10"])
+	}
+}
+
+// TestStreamValidateFailsHDRProfileWhenServerInfoLacksAV1Main10 pins
+// the live-VM root cause: hevc_mode=0 + av1_mode=2 left
+// ServerCodecModeSupport without AV1 Main10, Moonlight fell back to
+// H.264, and the unconditional HDR force env still demanded p010
+// which h264_nvenc rejected.
+//
+// AV1 Main10 is the PRIMARY HDR path on v3 (AV1-first). The new gate
+// fails the deploy here, BEFORE any Moonlight client tries to
+// negotiate, so the operator sees a clear "AV1 Main10 missing from
+// /serverinfo" regression instead of an obscure "h264_nvenc dynamic
+// range not supported" later.
+func TestStreamValidateFailsHDRProfileWhenServerInfoLacksAV1Main10(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	// Bits: H264 + HEVC + HEVC Main10 + AV1 Main8 (= 1 + 0x100 +
+	// 0x200 + 0x10000 = 66305). NO AV1 Main10 (0x20000).
+	const codecBits = 66305
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC></root>`, codecBits), nil
+		},
+		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected missing AV1 Main10 advertisement to fail an HDR profile")
+	}
+	if !strings.Contains(err.Error(), "AV1 Main10") {
+		t.Fatalf("error should mention AV1 Main10: %v", err)
+	}
+	if !strings.Contains(err.Error(), "av1_mode=3") {
+		t.Fatalf("error should hint at sunshine.av1_mode=3 fix: %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["serverinfo_av1_main10"] != false {
+		t.Fatalf("serverinfo_av1_main10 detail: got %v want false", details["serverinfo_av1_main10"])
+	}
+}
+
+// TestStreamValidateHDRProfilePassesWithBothMain10Bits is the happy-
+// path counterpart: a Sunshine that advertises both AV1 Main10 +
+// HEVC Main10 + nonzero MaxLumaPixelsHEVC reaches the
+// pending_moonlight_connect terminal state (waiting on a real client
+// to confirm end-to-end). Locks the bit-mask math we just added.
+func TestStreamValidateHDRProfilePassesBothMain10Bits(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	// Full HDR Main10 ad: H264 + HEVC + HEVC Main10 + AV1 Main8 +
+	// AV1 Main10 = 1 + 0x100 + 0x200 + 0x10000 + 0x20000 = 197889.
+	const codecBits = 197889
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			return fmt.Sprintf(`<root status_code="200"><ServerCodecModeSupport>%d</ServerCodecModeSupport><MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC></root>`, codecBits), nil
+		},
+		JournalFn: func(context.Context, *Deps) (string, error) {
+			return "Sunshine starting\nConfiguration UI available", nil
+		},
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := deps.State.Get(StreamValidateName).Status; got != state.StatusPendingMoonlightConnect {
+		t.Fatalf("status: got %q want pending_moonlight_connect", got)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["serverinfo_av1_main10"] != true {
+		t.Fatalf("serverinfo_av1_main10 detail: got %v want true", details["serverinfo_av1_main10"])
+	}
+	if details["serverinfo_hevc_main10"] != true {
+		t.Fatalf("serverinfo_hevc_main10 detail: got %v want true", details["serverinfo_hevc_main10"])
 	}
 }
 
@@ -280,7 +429,7 @@ func TestStreamValidateFailsInvalidH264HDRSession(t *testing.T) {
 	ph := StreamValidate{
 		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
-		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return "<root status_code=\"200\"></root>", nil },
+		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return goodHDRServerInfo, nil },
 		JournalFn: func(context.Context, *Deps) (string, error) {
 			return `
 STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30

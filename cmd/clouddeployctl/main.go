@@ -37,6 +37,7 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/reboot"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
+	sunshinecodec "github.com/NoviceAtPython/CloudDeploy-mover/internal/sunshine"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/ubuntu"
 )
 
@@ -1422,7 +1423,16 @@ func newDoctorCodecsCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			cfg := config.SunshineConfig{}
+			if deps.Profile != nil {
+				cfg = deps.Profile.EffectiveSunshine()
+			} else {
+				cfg = (&config.Profile{}).EffectiveSunshine()
+			}
 			fmt.Println("doctor codecs:")
+			fmt.Printf("  config hevc_mode       : %d\n", cfg.HevcModeValue())
+			fmt.Printf("  config av1_mode        : %d\n", cfg.Av1ModeValue())
+			fmt.Printf("  config force HDR env   : %v\n", cfg.ForceAV1HDR10)
 			gpu := deps.Runner.Exec(ctx, runner.CommandSpec{
 				Argv:    []string{"nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"},
 				LogFile: "-",
@@ -1435,7 +1445,24 @@ func newDoctorCodecsCmd() *cobra.Command {
 				Timeout: 10 * time.Second,
 			})
 			fmt.Printf("  serverinfo reachable   : %v\n", serverInfo.Err == nil)
-			fmt.Printf("  ServerCodecModeSupport : %s\n", serverInfoValue(serverInfo.Stdout, "ServerCodecModeSupport"))
+			codecRaw, codecOK := sunshinecodec.ServerInfoInt(serverInfo.Stdout, "ServerCodecModeSupport")
+			codecSupport := sunshinecodec.DecodeCodecModeSupport(codecRaw)
+			maxLuma, maxLumaOK := sunshinecodec.ServerInfoInt(serverInfo.Stdout, "MaxLumaPixelsHEVC")
+			codecValue := sunshinecodec.ServerInfoValue(serverInfo.Stdout, "ServerCodecModeSupport")
+			if codecValue == "" {
+				codecValue = "(missing)"
+			}
+			fmt.Printf("  ServerCodecModeSupport : %s\n", codecValue)
+			if codecOK {
+				fmt.Printf("  decoded codec flags    : %s\n", codecSupport.String())
+				fmt.Printf("  advertises HEVC Main10 : %v\n", codecSupport.HEVCMain10)
+				fmt.Printf("  advertises AV1 Main10  : %v\n", codecSupport.AV1Main10)
+			}
+			if maxLumaOK {
+				fmt.Printf("  MaxLumaPixelsHEVC      : %d\n", maxLuma)
+			} else {
+				fmt.Println("  MaxLumaPixelsHEVC      : (missing)")
+			}
 			journal := deps.Runner.Exec(ctx, runner.CommandSpec{
 				Argv:    []string{"journalctl", "-u", "sunshine-headless.service", "-n", "800", "--no-pager"},
 				LogFile: "-",
@@ -1446,6 +1473,8 @@ func newDoctorCodecsCmd() *cobra.Command {
 			fmt.Printf("  HEVC NVENC seen        : %v\n", strings.Contains(logs, "hevc_nvenc"))
 			fmt.Printf("  AV1 NVENC seen         : %v\n", strings.Contains(logs, "av1_nvenc"))
 			fmt.Printf("  AV1 unsupported marker : %v\n", strings.Contains(logs, "does not support AV1"))
+			fmt.Printf("  active_hevc_mode line  : %s\n", lastMatchingLine(logs, "active_hevc_mode"))
+			fmt.Printf("  active_av1_mode line   : %s\n", lastMatchingLine(logs, "active_av1_mode"))
 			fmt.Printf("  HEVC HDR Main10 marker : %v\n", strings.Contains(logs, "Color coding: HDR") && strings.Contains(logs, "Color depth: 10-bit"))
 			return nil
 		},
