@@ -17,6 +17,7 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/apt"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
 const (
@@ -47,6 +48,7 @@ type SunshineBuild struct {
 	BuildDeps     []string
 	DoxygenFn     func(context.Context, *Deps, config.SunshineConfig) (doxygenInfo, error)
 	CUDAToolkitFn func(context.Context, *Deps, config.SunshineConfig) cudaToolchain
+	SetcapFn      func(context.Context, *Deps, string) error
 }
 
 func (SunshineBuild) Name() string { return SunshineBuildName }
@@ -168,14 +170,22 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	if err := validateExecutable(cfg.InstallBin); err != nil {
 		return failPhase(deps, SunshineBuildName, details, "validate installed Sunshine binary", err, true)
 	}
-	for _, bin := range []string{cfg.InstallBin, "/usr/local/bin/sunshine"} {
-		if err := run(ctx, deps, "", []string{"setcap", "cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep", bin}, time.Minute, true); err != nil {
-			return failPhase(deps, SunshineBuildName, details, "set Sunshine capabilities", err, true)
-		}
+	setcapFn := p.SetcapFn
+	if setcapFn == nil {
+		setcapFn = applySunshineSetcap
 	}
-	if err := installSunshineAssets(ctx, deps, cfg.BuildDir); err != nil {
+	setcapTarget := cfg.InstallBin
+	if realTarget, err := filepath.EvalSymlinks(cfg.InstallBin); err == nil && strings.TrimSpace(realTarget) != "" {
+		setcapTarget = realTarget
+	}
+	attemptSunshineSetcap(ctx, deps, details, setcapTarget, setcapFn, log)
+	assets, err := installSunshineAssets(ctx, deps, cfg.BuildDir)
+	if err != nil {
 		return failPhase(deps, SunshineBuildName, details, "install Sunshine runtime assets", err, true)
 	}
+	details["assets_apps_json"] = assets.AppsJSON
+	details["assets_web_index"] = assets.WebIndex
+	details["web_asset_mode"] = assets.WebAssetMode
 	ver, _ := output(ctx, deps, "", []string{cfg.InstallBin, "--version"}, 20*time.Second, false)
 	details["version"] = strings.TrimSpace(ver)
 	details["install_method"] = "fork"
@@ -188,22 +198,65 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
-func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) error {
+func applySunshineSetcap(ctx context.Context, deps *Deps, target string) error {
+	return run(ctx, deps, "", []string{"setcap", "cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep", target}, time.Minute, true)
+}
+
+func attemptSunshineSetcap(ctx context.Context, deps *Deps, details map[string]any, target string, fn func(context.Context, *Deps, string) error, log *slog.Logger) {
+	details["setcap_attempted"] = true
+	details["setcap_target"] = target
+	if err := fn(ctx, deps, target); err != nil {
+		// The systemd service carries AmbientCapabilities and
+		// CapabilityBoundingSet. Live VM regression: setcap failed
+		// with "Invalid file '/usr/sbin/setcap' for capability
+		// operation" on an otherwise working install. Keep the
+		// build moving and let streaming-services/stream-validate
+		// prove runtime capture with service-level caps.
+		details["setcap_success"] = false
+		details["setcap_error"] = err.Error()
+		details["setcap_nonfatal"] = true
+		if log != nil {
+			log.Warn("phase sunshine-build: setcap failed nonfatally; relying on service-level capabilities", "target", target, "err", err)
+		}
+		return
+	}
+	details["setcap_success"] = true
+	details["setcap_nonfatal"] = false
+}
+
+type sunshineAssetInfo struct {
+	AppsJSON      bool
+	WebIndex      bool
+	WebAssetMode  string
+	FilesystemWeb string
+}
+
+func installSunshineAssets(ctx context.Context, deps *Deps, buildDir string) (sunshineAssetInfo, error) {
+	info := sunshineAssetInfo{WebAssetMode: "unknown"}
 	src := filepath.Join(buildDir, "build", "assets")
 	if err := run(ctx, deps, "", []string{"install", "-d", "-m", "0755", "/usr/local/assets"}, time.Minute, true); err != nil {
-		return err
+		return info, err
 	}
 	if err := run(ctx, deps, "", []string{"bash", "-lc", "cp -a " + shellQuote(src) + "/. /usr/local/assets/"}, 5*time.Minute, true); err != nil {
-		return err
+		return info, err
 	}
 	_ = run(ctx, deps, "", []string{"bash", "-lc", "if [ -d /usr/share/sunshine/web ]; then mkdir -p /usr/local/assets/web && cp -a /usr/share/sunshine/web/. /usr/local/assets/web/; fi"}, 2*time.Minute, true)
 	if _, err := os.Stat("/usr/local/assets/apps.json"); err != nil {
-		return fmt.Errorf("/usr/local/assets/apps.json missing after asset install")
+		return info, fmt.Errorf("/usr/local/assets/apps.json missing after asset install")
 	}
-	if _, err := os.Stat("/usr/local/assets/web/index.html"); err != nil {
-		return fmt.Errorf("/usr/local/assets/web/index.html missing after asset install")
+	info.AppsJSON = true
+	if _, err := os.Stat("/usr/local/assets/web/index.html"); err == nil {
+		info.WebIndex = true
+		info.WebAssetMode = "filesystem"
+		info.FilesystemWeb = "/usr/local/assets/web/index.html"
+	} else {
+		// Some Sunshine fork builds serve the UI from embedded or
+		// differently laid-out assets. Do not fail the build here;
+		// stream_validate performs an actual HTTPS Web UI probe and
+		// records whether the UI responds.
+		info.WebAssetMode = "embedded-or-unknown"
 	}
-	return nil
+	return info, nil
 }
 
 type doxygenInfo struct {
@@ -484,30 +537,47 @@ func renderSunshineConfig(cfg config.SunshineConfig, drm string, origins []strin
 	return b.String()
 }
 
-type Tailscale struct{}
+type Tailscale struct {
+	IPFn func(context.Context, *Deps) (string, error)
+}
 
 func (Tailscale) Name() string { return TailscaleName }
 
 func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 	log := logger(deps)
-	if shouldSkip(deps.State, TailscaleName) {
-		log.Info("phase tailscale: already done; skipping")
-		return nil
+	cfg := deps.Profile.EffectiveTailscale()
+	key := strings.TrimSpace(os.Getenv(cfg.AuthKeyEnv))
+	if prev := deps.State.Get(TailscaleName); prev != nil {
+		switch prev.Status {
+		case state.StatusDone:
+			log.Info("phase tailscale: already done; skipping")
+			return nil
+		case state.StatusSkipped:
+			if !cfg.EnabledValue() || key == "" {
+				log.Info("phase tailscale: already skipped; no auth key available")
+				return nil
+			}
+			log.Info("phase tailscale: previous skip recovered because auth key is now present")
+		}
 	}
 	deps.State.MarkRunning(TailscaleName)
 	_ = deps.PersistState()
-	cfg := deps.Profile.EffectiveTailscale()
-	details := map[string]any{"enabled": cfg.EnabledValue(), "authkey_env": cfg.AuthKeyEnv}
+	details := map[string]any{
+		"enabled":             cfg.EnabledValue(),
+		"authkey_env":         cfg.AuthKeyEnv,
+		"authkey_env_present": key != "",
+		"secrets_env_present": pathExists("/etc/clouddeploy/secrets.env"),
+		"secrets_env_loaded":  key != "",
+	}
 	if !cfg.EnabledValue() {
 		deps.State.MarkSkipped(TailscaleName, "tailscale.enabled=false")
 		deps.State.Get(TailscaleName).Details = details
 		_ = deps.PersistState()
 		return nil
 	}
-	key := strings.TrimSpace(os.Getenv(cfg.AuthKeyEnv))
 	if key == "" {
 		details["authkey_present"] = false
-		deps.State.MarkSkipped(TailscaleName, "no Tailscale auth key in environment; continuing without Tailscale")
+		deps.State.MarkSkipped(TailscaleName, cfg.AuthKeyEnv+" missing")
 		deps.State.Get(TailscaleName).Details = details
 		_ = deps.PersistState()
 		return nil
@@ -551,9 +621,16 @@ func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 	}
 	status, _ := output(ctx, deps, "", []string{"tailscale", "status"}, 15*time.Second, false)
 	details["tailscale_status_excerpt"] = lastLines(status, 8)
-	ip, _ := output(ctx, deps, "", []string{"tailscale", "ip", "-4"}, 15*time.Second, false)
+	ipFn := p.IPFn
+	customIPFn := ipFn != nil
+	if ipFn == nil {
+		ipFn = func(ctx context.Context, deps *Deps) (string, error) {
+			return output(ctx, deps, "", []string{"tailscale", "ip", "-4"}, 15*time.Second, false)
+		}
+	}
+	ip, _ := ipFn(ctx, deps)
 	ip = strings.TrimSpace(strings.Split(strings.TrimSpace(ip), "\n")[0])
-	if deps.DryRun && ip == "" {
+	if deps.DryRun && ip == "" && !customIPFn {
 		ip = "100.64.0.1"
 	}
 	details["tailscale_ip"] = ip
@@ -562,6 +639,7 @@ func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 	}
 	if ip != "" {
 		updateSunshineCSRF(ctx, deps, ip)
+		details["sunshine_try_restart_after_csrf"] = run(ctx, deps, "", []string{"systemctl", "try-restart", "sunshine-headless.service"}, time.Minute, true) == nil
 	}
 	deps.State.MarkDone(TailscaleName, details)
 	_ = deps.PersistState()
@@ -644,6 +722,7 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 			return failPhase(deps, StreamingServicesName, details, "KWin not ready", err, true)
 		}
 		_ = run(ctx, deps, "", []string{forceKwinModeScriptPath}, 90*time.Second, true)
+		ensureUinput(ctx, deps, desk.User, details)
 		credsSet, credsUser, credsErr := setSunshineCredentials(ctx, deps, desk.User, cfg.InstallBin)
 		details["sunshine_credentials_set"] = credsSet
 		if credsUser != "" {
@@ -661,11 +740,27 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
+func ensureUinput(ctx context.Context, deps *Deps, user string, details map[string]any) {
+	_ = run(ctx, deps, "", []string{"modprobe", "uinput"}, time.Minute, true)
+	rule := `KERNEL=="uinput", MODE="0660", GROUP="input"` + "\n"
+	if !deps.DryRun {
+		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-uinput.rules", []byte(rule), 0o644)
+	}
+	_ = run(ctx, deps, "", []string{"udevadm", "control", "--reload-rules"}, time.Minute, true)
+	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uinput"}, time.Minute, true)
+	details["uinput_exists"] = pathExists("/dev/uinput")
+	details["uinput_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"}, 15*time.Second, true) == nil
+	details["uinput_rule"] = "/etc/udev/rules.d/70-clouddeploy-uinput.rules"
+}
+
 type StreamValidate struct {
 	ServiceActiveFn func(context.Context, *Deps) error
 	ServerInfoFn    func(context.Context, *Deps, string) (string, error)
+	WebUIStatusFn   func(context.Context, *Deps, string) (int, error)
 	JournalFn       func(context.Context, *Deps) (string, error)
 	ListenersFn     func(context.Context, *Deps) (string, error)
+	RetryWindow     time.Duration
+	RetryInterval   time.Duration
 }
 
 func (StreamValidate) Name() string { return StreamValidateName }
@@ -696,11 +791,13 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 			return output(ctx, deps, "", []string{"curl", "-fsS", "--max-time", "5", url}, 10*time.Second, false)
 		}
 	}
+	webUIStatusFn := p.WebUIStatusFn
+	if webUIStatusFn == nil {
+		webUIStatusFn = webUIHTTPStatus
+	}
 	journalFn := p.JournalFn
 	if journalFn == nil {
-		journalFn = func(ctx context.Context, deps *Deps) (string, error) {
-			return output(ctx, deps, "", []string{"journalctl", "-u", "sunshine-headless.service", "-n", "500", "--no-pager"}, 15*time.Second, false)
-		}
+		journalFn = sunshineJournalSinceStart
 	}
 	listenersFn := p.ListenersFn
 	if listenersFn == nil {
@@ -713,11 +810,35 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	}
 	listeners, _ := listenersFn(ctx, deps)
 	details["listeners"] = strings.TrimSpace(listeners)
-	serverInfo, err := serverInfoFn(ctx, deps, "http://127.0.0.1:47989/serverinfo")
+	retryWindow := p.RetryWindow
+	if retryWindow <= 0 {
+		retryWindow = 60 * time.Second
+	}
+	retryInterval := p.RetryInterval
+	if retryInterval <= 0 {
+		retryInterval = 2 * time.Second
+	}
+	serverInfo, err := waitForServerInfo(ctx, deps, serverInfoFn, serviceActive, listenersFn, journalFn, "http://127.0.0.1:47989/serverinfo", details, retryWindow, retryInterval)
 	if err != nil {
 		return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo unreachable", err, true)
 	}
 	details["serverinfo_bytes"] = len(serverInfo)
+	webStatus, webErr := webUIStatusFn(ctx, deps, "https://127.0.0.1:47990")
+	details["web_ui_http_status"] = webStatus
+	details["web_ui_reachable"] = webStatusSuccess(webStatus)
+	if webErr != nil {
+		details["web_ui_error"] = webErr.Error()
+	}
+	if webStatusSuccess(webStatus) {
+		buildPhase := deps.State.Get(SunshineBuildName)
+		if buildPhase != nil && buildPhase.Details != nil {
+			if b, ok := buildPhase.Details["assets_web_index"].(bool); ok && !b {
+				details["web_asset_mode"] = "embedded"
+			}
+		} else {
+			details["web_asset_mode"] = "embedded"
+		}
+	}
 	if ip := tailscaleIPFromState(deps); ip != "" {
 		ts, terr := serverInfoFn(ctx, deps, "http://"+ip+":47989/serverinfo")
 		details["tailscale_serverinfo_ok"] = terr == nil
@@ -734,6 +855,13 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	details["selected_encoder_line"] = ev.SelectedEncoderLine
 	details["hdr_line"] = ev.HDRLine
 	details["cuda_interop_warning"] = ev.CUDAInteropWarning
+	details["av1_available"] = ev.AV1
+	details["hevc_hdr_available"] = ev.HEVC && ev.HDR && ev.ColorDepth10
+	if ev.HEVC && ev.HDR && ev.ColorDepth10 {
+		details["selected_hdr_codec"] = "hevc"
+	} else if ev.AV1 && ev.HDR && ev.ColorDepth10 {
+		details["selected_hdr_codec"] = "av1"
+	}
 	if ev.Fatal {
 		return failPhase(deps, StreamValidateName, details, "fatal Sunshine encoder/display log marker", fmt.Errorf("Sunshine fatal marker in journal"), true)
 	}
@@ -823,6 +951,7 @@ SupplementaryGroups=video render input audio
 AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE
 CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE
 NoNewPrivileges=false
+DeviceAllow=/dev/uinput rw
 WorkingDirectory=/home/%s
 Environment=HOME=/home/%s
 Environment=USER=%s
@@ -887,6 +1016,93 @@ WantedBy=timers.target
 		return err
 	}
 	return os.WriteFile("/etc/systemd/system/clouddeploy-watch-streaming.timer", []byte(timer), 0o644)
+}
+
+func waitForServerInfo(
+	ctx context.Context,
+	deps *Deps,
+	serverInfoFn func(context.Context, *Deps, string) (string, error),
+	serviceActiveFn func(context.Context, *Deps) error,
+	listenersFn func(context.Context, *Deps) (string, error),
+	journalFn func(context.Context, *Deps) (string, error),
+	url string,
+	details map[string]any,
+	window time.Duration,
+	interval time.Duration,
+) (string, error) {
+	if window <= 0 {
+		window = 60 * time.Second
+	}
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	deadline := time.Now().Add(window)
+	attempts := 0
+	var lastErr error
+	for {
+		attempts++
+		body, err := serverInfoFn(ctx, deps, url)
+		if err == nil {
+			details["serverinfo_attempts"] = attempts
+			details["serverinfo_retry_window_ms"] = window.Milliseconds()
+			return body, nil
+		}
+		lastErr = err
+		details["serverinfo_last_error"] = err.Error()
+		if serviceActiveFn != nil {
+			details["sunshine_active_during_retry"] = serviceActiveFn(ctx, deps) == nil
+		}
+		if listenersFn != nil {
+			if listeners, lerr := listenersFn(ctx, deps); lerr == nil {
+				details["listeners_during_retry"] = strings.TrimSpace(listeners)
+			}
+		}
+		if journalFn != nil {
+			if logs, jerr := journalFn(ctx, deps); jerr == nil {
+				details["journal_tail_during_retry"] = lastLines(logs, 50)
+			}
+		}
+		if time.Now().Add(interval).After(deadline) {
+			break
+		}
+		select {
+		case <-ctx.Done():
+			details["serverinfo_attempts"] = attempts
+			return "", ctx.Err()
+		case <-time.After(interval):
+		}
+	}
+	details["serverinfo_attempts"] = attempts
+	return "", fmt.Errorf("%s not reachable after %s: %w", url, window, lastErr)
+}
+
+func webUIHTTPStatus(ctx context.Context, deps *Deps, url string) (int, error) {
+	out, err := output(ctx, deps, "", []string{"curl", "-k", "-sS", "-o", "/dev/null", "-w", "%{http_code}", "--max-time", "5", url}, 10*time.Second, false)
+	if err != nil {
+		return 0, err
+	}
+	code, _ := strconv.Atoi(strings.TrimSpace(out))
+	return code, nil
+}
+
+func webStatusSuccess(code int) bool {
+	switch code {
+	case 200, 301, 302, 307, 401, 403:
+		return true
+	default:
+		return false
+	}
+}
+
+func sunshineJournalSinceStart(ctx context.Context, deps *Deps) (string, error) {
+	ts, _ := output(ctx, deps, "", []string{"systemctl", "show", "sunshine-headless.service", "-p", "ActiveEnterTimestamp", "--value"}, 10*time.Second, false)
+	ts = strings.TrimSpace(ts)
+	if ts != "" && !strings.EqualFold(ts, "n/a") {
+		if logs, err := output(ctx, deps, "", []string{"journalctl", "-u", "sunshine-headless.service", "--since", ts, "-n", "800", "--no-pager"}, 15*time.Second, false); err == nil {
+			return logs, nil
+		}
+	}
+	return output(ctx, deps, "", []string{"journalctl", "-u", "sunshine-headless.service", "-n", "500", "--no-pager"}, 15*time.Second, false)
 }
 
 type sunshineStreamEvidence struct {
@@ -994,11 +1210,7 @@ func setSunshineCredentials(ctx context.Context, deps *Deps, user, bin string) (
 		bin = "/usr/local/bin/sunshine-clouddeploy"
 	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv: []string{
-			"runuser", "-u", user, "--", "env",
-			"HOME=/home/" + user,
-			bin, "--creds", sunUser, pass,
-		},
+		Argv:       sunshineCredsArgs(user, bin, sunUser, pass),
 		Sudo:       true,
 		Timeout:    time.Minute,
 		DryRun:     deps.DryRun,
@@ -1008,7 +1220,28 @@ func setSunshineCredentials(ctx context.Context, deps *Deps, user, bin string) (
 	if res.Err != nil {
 		return false, sunUser, fmt.Errorf("sunshine --creds failed: %w stderr=%q", res.Err, lastLines(res.Stderr, 4))
 	}
+	if !deps.DryRun && !sunshineCredentialsEvidence("/home/"+user) {
+		return false, sunUser, fmt.Errorf("sunshine --creds exited successfully but no sunshine_state.json or credentials files were found")
+	}
 	return true, sunUser, nil
+}
+
+func sunshineCredsArgs(user, bin, sunUser, pass string) []string {
+	return []string{
+		"runuser", "-u", user, "--", "env",
+		"HOME=/home/" + user,
+		bin, "--creds", sunUser, pass,
+	}
+}
+
+func sunshineCredentialsEvidence(home string) bool {
+	base := filepath.Join(home, ".config", "sunshine")
+	if pathExists(filepath.Join(base, "sunshine_state.json")) {
+		return true
+	}
+	creds := filepath.Join(base, "credentials")
+	entries, err := os.ReadDir(creds)
+	return err == nil && len(entries) > 0
 }
 
 func ensureKWinReady(ctx context.Context, deps *Deps, user, uid string) error {
@@ -1084,6 +1317,14 @@ func sunshineConfigPath(deps *Deps) string {
 		return strings.TrimSpace(cfg.ConfigPath)
 	}
 	return "/home/" + desk.User + "/" + defaultSunshineConfRel
+}
+
+func pathExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func updateSunshineCSRF(ctx context.Context, deps *Deps, ip string) {

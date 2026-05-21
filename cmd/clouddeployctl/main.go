@@ -93,7 +93,8 @@ docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
 Milestone 5 (in progress):
   doctor apt | nvidia | cuda | system | kwin |
-         kwin-patch | sunshine | tools | network | lock read-only checks
+         kwin-patch | drm-display | sunshine |
+         tools | network | lock                         read-only checks
   phase apt-health | ubuntu-upgrade | base-packages |
         nvidia-driver | cuda | edid |
         headless-user | desktop-packages |
@@ -606,6 +607,7 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorSystemCmd())
 	doctor.AddCommand(newDoctorKwinCmd())
 	doctor.AddCommand(newDoctorKwinPatchCmd())
+	doctor.AddCommand(newDoctorDRMDisplayCmd())
 	doctor.AddCommand(newDoctorSunshineCmd())
 	doctor.AddCommand(newDoctorToolsCmd())
 	doctor.AddCommand(newDoctorNetworkCmd())
@@ -1132,6 +1134,49 @@ func newDoctorKwinPatchCmd() *cobra.Command {
 	}
 }
 
+func newDoctorDRMDisplayCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "drm-display",
+		Short: "Report KScreen/DRM display validation evidence (read-only)",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			fmt.Println("doctor drm-display:")
+			if deps.Profile != nil {
+				fmt.Printf("  forced connector       : %s\n", evOrUnknown(deps.Profile.Display.ForcedConnector))
+				w, h := phase.ParseResolution(deps.Profile.Display.Resolution)
+				fmt.Printf("  expected mode          : %dx%d@%d\n", w, h, deps.Profile.Display.Refresh)
+				fmt.Printf("  hdr requested          : %v\n", deps.Profile.Display.HDR)
+			}
+			ph := deps.State.Get(phase.DRMDisplayValidateName)
+			if ph == nil {
+				fmt.Println("  state                  : (phase missing)")
+				return nil
+			}
+			fmt.Printf("  state status           : %s\n", ph.Status)
+			if ph.Reason != "" {
+				fmt.Printf("  state reason           : %s\n", ph.Reason)
+			}
+			for _, k := range []string{
+				"enabled", "selected_mode", "hdr_enabled", "wcg_enabled",
+				"kscreen_connector_names", "kscreen_raw_mentions_connector",
+				"kscreen_raw_excerpt", "kscreen_stripped_excerpt",
+			} {
+				if v, ok := ph.Details[k]; ok {
+					fmt.Printf("  %-24s: %v\n", k, v)
+				}
+			}
+			if ph.LastError != "" {
+				fmt.Printf("  last_error             : %s\n", ph.LastError)
+			}
+			fmt.Println("  manual command         : sudo -u <user> env XDG_RUNTIME_DIR=/run/user/<uid> WAYLAND_DISPLAY=wayland-0 DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/<uid>/bus QT_QPA_PLATFORM=wayland NO_COLOR=1 TERM=dumb CLICOLOR=0 kscreen-doctor -o")
+			return nil
+		},
+	}
+}
+
 func heldPackages(installed []string, holdOutput string) []string {
 	want := map[string]bool{}
 	for _, pkg := range installed {
@@ -1189,6 +1234,17 @@ func newDoctorSunshineCmd() *cobra.Command {
 				credsDir := filepath.Join(filepath.Dir(confPath), "credentials")
 				fmt.Printf("  credentials dir exists : %v\n", fileExists(credsDir))
 			}
+			user := "cloudgamer"
+			if deps.Profile != nil {
+				user = deps.Profile.EffectiveDesktop().User
+			}
+			fmt.Printf("  /dev/uinput exists     : %v\n", fileExists("/dev/uinput"))
+			uinput := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"},
+				LogFile: "-",
+				Timeout: 5 * time.Second,
+			})
+			fmt.Printf("  /dev/uinput writable   : %v\n", uinput.Err == nil)
 			if fileExists(cfg.InstallBin) {
 				res := deps.Runner.Exec(ctx, runner.CommandSpec{
 					Argv:    []string{"getcap", cfg.InstallBin},
@@ -1214,9 +1270,12 @@ func newDoctorSunshineCmd() *cobra.Command {
 				fmt.Printf("  service has force HDR  : %v\n", strings.Contains(unit.Stdout, "SUNSHINE_FORCE_AV1_HDR10=1"))
 				fmt.Printf("  service uses kwin-realvt: %v\n", strings.Contains(unit.Stdout, "kwin-realvt.service"))
 				fmt.Printf("  service has CAP_SYS_ADMIN: %v\n", strings.Contains(unit.Stdout, "AmbientCapabilities=CAP_SYS_ADMIN"))
+				fmt.Printf("  service DeviceAllow uinput: %v\n", strings.Contains(unit.Stdout, "DeviceAllow=/dev/uinput rw"))
 			} else {
 				fmt.Println("  service                : sunshine-headless.service not installed")
 			}
+			fmt.Printf("  localhost serverinfo   : %s\n", curlHTTPStatus(ctx, deps, "http://127.0.0.1:47989/serverinfo"))
+			fmt.Printf("  localhost Web UI       : %s\n", curlHTTPStatus(ctx, deps, "https://127.0.0.1:47990"))
 			journal := deps.Runner.Exec(ctx, runner.CommandSpec{
 				Argv:    []string{"journalctl", "-u", "sunshine-headless.service", "-n", "300", "--no-pager"},
 				LogFile: "-",

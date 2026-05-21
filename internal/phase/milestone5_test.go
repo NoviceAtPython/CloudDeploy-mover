@@ -3,9 +3,11 @@ package phase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
@@ -67,8 +69,11 @@ func TestTailscaleSkipsWithoutAuthKey(t *testing.T) {
 	if ph.Status != state.StatusSkipped {
 		t.Fatalf("status: got %q want skipped", ph.Status)
 	}
-	if !strings.Contains(ph.Reason, "no Tailscale auth key") {
+	if !strings.Contains(ph.Reason, "TAILSCALE_AUTHKEY missing") {
 		t.Fatalf("reason should mention missing auth key: %q", ph.Reason)
+	}
+	if ph.Details["authkey_env_present"] != false {
+		t.Fatalf("authkey_env_present: got %v want false", ph.Details["authkey_env_present"])
 	}
 }
 
@@ -82,6 +87,7 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 		"AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE",
 		"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE",
 		"NoNewPrivileges=false",
+		"DeviceAllow=/dev/uinput rw",
 		"Environment=SUNSHINE_FORCE_AV1_HDR10=1",
 		"Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1",
 	} {
@@ -106,6 +112,11 @@ func TestStreamValidateFailsClearlyWhenServerInfoUnreachable(t *testing.T) {
 			return "", errors.New("connection refused")
 		},
 		JournalFn: func(context.Context, *Deps) (string, error) { return "", nil },
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) {
+			return 0, errors.New("not listening")
+		},
+		RetryWindow:   5 * time.Millisecond,
+		RetryInterval: time.Millisecond,
 	}
 	err := ph.Run(context.Background(), deps)
 	if err == nil {
@@ -127,12 +138,43 @@ func TestStreamValidatePendingUntilMoonlightProducesKMSMarkers(t *testing.T) {
 		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 127.0.0.1:47989", nil },
 		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return "<root></root>", nil },
 		JournalFn:       func(context.Context, *Deps) (string, error) { return "Configuration UI available", nil },
+		WebUIStatusFn:   func(context.Context, *Deps, string) (int, error) { return 307, nil },
 	}
 	if err := ph.Run(context.Background(), deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
 	if got := deps.State.Get(StreamValidateName).Status; got != state.StatusPendingMoonlightConnect {
 		t.Fatalf("status: got %q want pending_moonlight_connect", got)
+	}
+}
+
+func TestStreamValidateRetriesServerInfoUntilReady(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	attempts := 0
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn: func(context.Context, *Deps, string) (string, error) {
+			attempts++
+			if attempts < 3 {
+				return "", errors.New("connection refused")
+			}
+			return "<root status_code=\"200\"></root>", nil
+		},
+		JournalFn:     func(context.Context, *Deps) (string, error) { return "Sunshine starting", nil },
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+		RetryWindow:   100 * time.Millisecond,
+		RetryInterval: time.Millisecond,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if attempts != 3 {
+		t.Fatalf("attempts: got %d want 3", attempts)
+	}
+	if got := deps.State.Get(StreamValidateName).Details["serverinfo_attempts"]; got != 3 {
+		t.Fatalf("serverinfo_attempts: got %v want 3", got)
 	}
 }
 
@@ -167,6 +209,21 @@ func TestSunshineCMakeArgsDisableCUDAWhenMissingByDefault(t *testing.T) {
 	}
 }
 
+func TestAttemptSunshineSetcapFailureIsNonfatal(t *testing.T) {
+	deps := milestone5Deps(t)
+	details := map[string]any{}
+	attemptSunshineSetcap(context.Background(), deps, details, "/usr/local/bin/sunshine-clouddeploy",
+		func(context.Context, *Deps, string) error {
+			return errors.New("Invalid file '/usr/sbin/setcap' for capability operation")
+		}, nil)
+	if details["setcap_success"] != false || details["setcap_nonfatal"] != true {
+		t.Fatalf("setcap failure should be recorded as nonfatal: %#v", details)
+	}
+	if got := fmt.Sprint(details["setcap_error"]); !strings.Contains(got, "Invalid file") {
+		t.Fatalf("setcap_error should preserve failure detail: %#v", details)
+	}
+}
+
 func TestVersionAtLeastDoxygenThreshold(t *testing.T) {
 	if versionAtLeast("1.9.8", "1.10.0") {
 		t.Fatalf("Doxygen 1.9.8 must be treated as too old for current Sunshine")
@@ -197,6 +254,30 @@ Attempting to use NVENC without CUDA support. Reverting back to GPU -> RAM -> GP
 	}
 	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, "/dev/dri/card1", "DP-1", "3840", "2160"); err != nil {
 		t.Fatalf("selected capture should validate: %v", err)
+	}
+}
+
+func TestWebStatusSuccessAcceptsSunshineWelcomeRedirect(t *testing.T) {
+	for _, code := range []int{200, 302, 307, 401, 403} {
+		if !webStatusSuccess(code) {
+			t.Fatalf("HTTP %d should count as reachable Web UI", code)
+		}
+	}
+	if webStatusSuccess(0) || webStatusSuccess(500) {
+		t.Fatalf("HTTP 0/500 should not count as reachable Web UI")
+	}
+}
+
+func TestSunshineCredsArgsDoNotExposePasswordExceptFinalArgForRedaction(t *testing.T) {
+	args := sunshineCredsArgs("cloudgamer", "/usr/local/bin/sunshine-clouddeploy", "admin", "secret")
+	joined := strings.Join(args, " ")
+	for _, want := range []string{"runuser -u cloudgamer", "HOME=/home/cloudgamer", "/usr/local/bin/sunshine-clouddeploy --creds admin secret"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("credentials command missing %q: %v", want, args)
+		}
+	}
+	if args[len(args)-1] != "secret" {
+		t.Fatalf("password must remain final arg so RedactArgs[-1] hides it: %v", args)
 	}
 }
 
@@ -270,6 +351,26 @@ func TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey(t *testing.T) {
 		if s, ok := v.(string); ok && strings.Contains(s, fixtureKey) {
 			t.Errorf("state.Details[%q] leaked the auth key value", k)
 		}
+	}
+}
+
+func TestTailscaleWithAuthKeyButNoIPDoesNotMarkDone(t *testing.T) {
+	deps := milestone5Deps(t)
+	t.Setenv("TAILSCALE_AUTHKEY", "fixture-authkey-fixture")
+	deps.DryRun = true
+
+	err := (Tailscale{
+		IPFn: func(context.Context, *Deps) (string, error) { return "", nil },
+	}).Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected missing tailscale ip to fail")
+	}
+	ph := deps.State.Get(TailscaleName)
+	if ph.Status == state.StatusDone {
+		t.Fatalf("tailscale must not mark done when tailscale ip -4 is empty")
+	}
+	if !strings.Contains(err.Error(), "tailscale ip missing") {
+		t.Fatalf("error should mention missing ip: %v", err)
 	}
 }
 
