@@ -1,15 +1,12 @@
 // Command clouddeployctl is the v3 CloudDeploy orchestrator entry point.
 //
-// State at Milestone 4 (in progress): doctor (apt/nvidia/cuda/system) is
+// State at Milestone 5 (in progress): doctor (apt/nvidia/cuda/system) is
 // real and read-only; apply / resume implement apt-health -> ubuntu-
 // upgrade -> base-packages -> nvidia-driver -> cuda -> edid ->
 // headless-user -> desktop-packages -> desktop-runtime -> kwin-patch
-// -> kwin-session -> drm-display-validate. KWin real-VT (direct
-// kwin_wayland) is the validated Milestone-4 default (live-VM proof
-// 2026-05-21 of DP-1 3840x2160@120 + private HDR + Wide Color Gamut).
-// Sunshine / Tailscale / PipeWire / HDR stream validators are NOT yet
-// implemented, so apply exits after the implemented phases with a
-// clear partial-apply banner.
+// -> kwin-session -> drm-display-validate -> Sunshine/Tailscale/
+// PipeWire/service/stream phases. KWin real-VT (direct kwin_wayland)
+// is the validated compositor default.
 //
 // See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability audit,
 // docs/V3-DEPLOYMENT-READINESS.md for the rollout plan and
@@ -69,6 +66,8 @@ func newRoot() *cobra.Command {
 	root.PersistentFlags().Bool("dry-run", false, "do not make destructive changes; print what would happen")
 	root.PersistentFlags().Bool("verbose", false, "verbose logging")
 	root.PersistentFlags().Bool("allow-unsupported", false, "allow applying on explicitly unsupported Ubuntu versions")
+	root.PersistentFlags().Bool("auto-reboot", false, "override deploy.auto_reboot=true for this run")
+	root.PersistentFlags().Bool("unattended", false, "unattended autopilot mode; implies --auto-reboot and noninteractive deploy behavior")
 
 	root.AddCommand(newApplyCmd())
 	root.AddCommand(newResumeCmd())
@@ -77,6 +76,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newPhaseCmd())
 	root.AddCommand(newStateCmd())
 	root.AddCommand(newCollectLogsCmd())
+	root.AddCommand(newMonitorCmd())
 
 	return root
 }
@@ -90,26 +90,21 @@ State is persisted in /var/lib/clouddeploy/state.json. Logs go under
 docs/V3-ROADMAP.md for milestone status, and
 docs/V3-DEPLOYMENT-READINESS.md for the current readiness audit.
 
-Milestone 4 (in progress):
+Milestone 5 (in progress):
   doctor apt | nvidia | cuda | system | kwin | lock     read-only checks
   phase apt-health | ubuntu-upgrade | base-packages |
         nvidia-driver | cuda | edid |
         headless-user | desktop-packages |
         desktop-runtime | kwin-patch |
-        kwin-session | drm-display-validate             implemented
+        kwin-session | drm-display-validate |
+        sunshine-build | sunshine-config |
+        tailscale | pipewire-audio |
+        streaming-services | stream-validate |
+        optional-apps                                     implemented
   apply                                                runs the implemented
-                                                       phases above (in
-                                                       that order) then
-                                                       exits with a
-                                                       partial-apply
-                                                       banner
+                                                       phases above
   resume                                               continues after
-                                                       a reboot
-  phase sunshine-build | services                       NOT implemented;
-                                                       use the v2
-                                                       CloudDeploy-
-                                                       wayland.sh entry
-                                                       for now.`
+                                                       a reboot`
 
 // -----------------------------------------------------------------------------
 // helpers shared across commands
@@ -125,6 +120,13 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 	configDir, _ := cmd.Flags().GetString("config-dir")
 	dryRun, _ := cmd.Flags().GetBool("dry-run")
 	verbose, _ := cmd.Flags().GetBool("verbose")
+	autoRebootFlag, _ := cmd.Flags().GetBool("auto-reboot")
+	unattendedFlag, _ := cmd.Flags().GetBool("unattended")
+	autoReboot := autoRebootFlag || envBool("CLOUDDEPLOY_AUTO_REBOOT")
+	unattended := unattendedFlag || envBool("CLOUDDEPLOY_UNATTENDED")
+	if unattended {
+		autoReboot = true
+	}
 
 	level := slog.LevelInfo
 	if verbose {
@@ -150,6 +152,15 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 					"profile", profileName, "err", err)
 			}
 			profile = p
+		}
+	}
+	if profile != nil {
+		if autoReboot {
+			profile.Deploy.AutoReboot = true
+		}
+		if unattended {
+			profile.Deploy.Unattended = true
+			profile.Deploy.AutoReboot = true
 		}
 	}
 
@@ -212,13 +223,16 @@ func loadDeps(cmd *cobra.Command, profileRequired bool) (*phase.Deps, *state.Loc
 	}
 
 	deps := &phase.Deps{
-		Runner:    r,
-		APT:       tx,
-		State:     st,
-		Profile:   profile,
-		Logger:    logger,
-		DryRun:    dryRun,
-		StatePath: statePath,
+		Runner:     r,
+		APT:        tx,
+		State:      st,
+		Profile:    profile,
+		Logger:     logger,
+		DryRun:     dryRun,
+		AutoReboot: autoReboot,
+		Unattended: unattended,
+		StatePath:  statePath,
+		ConfigDir:  configDir,
 	}
 	return deps, lock, nil
 }
@@ -287,38 +301,33 @@ func recoverInterruptedPhasesOnStartup(deps *phase.Deps, profileName string) err
 
 const partialApplyBanner = `
 ================================================================================
-  Milestone 4 partial apply complete (v3 is NOT yet v2-equivalent).
+  Milestone 5 apply reached the end of the implemented v3 pipeline.
 
   Implemented:   apt-health, ubuntu-upgrade, base-packages, nvidia-driver,
                  cuda, edid, headless-user, desktop-packages, desktop-runtime,
-                 kwin-patch, kwin-session, drm-display-validate
-  NOT yet:       Sunshine fork build, Tailscale install, PipeWire virtual sink,
-                 full Sunshine/Plasma systemd unit chain, HDR DRM validation,
-                 HDR stream validation
+                 kwin-patch, kwin-session, drm-display-validate,
+                 sunshine-build, sunshine-config, tailscale, pipewire-audio,
+                 streaming-services, stream-validate, optional-apps
 
-  Note: ubuntu-upgrade or the EDID/GRUB phase may write changes that
-        request a reboot. apply will install the continuation service
-        and exit with code 2 in that case; resume picks up afterward.
+  Optional apps are nonfatal and run last. stream-validate may leave the
+  state at pending_moonlight_connect when Sunshine is reachable but no
+  Moonlight client has produced KMS/NVENC journal markers yet.
 
-  For a full deploy that reaches "AV1 10-bit HDR" in Moonlight today,
-  use the v2 entrypoint:
-
-      sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
-
-  v3 will own the remaining phases in subsequent Milestone 4 sub-cuts.
-  See docs/V2-V3-PARITY.md for the capability audit and
-  docs/V3-ROADMAP.md for milestone-by-milestone status.
+  Use clouddeployctl monitor for live status and continuation logs.
 ================================================================================
 `
 
 func newApplyCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "apply",
-		Short: "Run the implemented phases (Milestone 4 partial)",
-		Long: `Run ubuntu-upgrade, base-packages, nvidia-driver, cuda, and edid
-in order, then exit with a clear partial-apply banner. Each phase is
-idempotent: re-running apply on the same VM skips phases already
-marked done.
+		Short: "Run the v3 deploy phases through Sunshine stream validation",
+		Long: `Run the v3 deploy pipeline in order: apt-health, ubuntu-upgrade,
+base-packages, nvidia-driver, cuda, edid, headless-user,
+desktop-packages, desktop-runtime, kwin-patch, kwin-session,
+drm-display-validate, Sunshine build/config, Tailscale, PipeWire,
+streaming services, stream validation, and optional apps. Each phase is
+idempotent: re-running apply on the same VM skips phases already marked
+done.
 
 ubuntu-upgrade is the first phase because dist-upgrade rewrites the
 apt world; it only acts when profile.ubuntu_version differs from the
@@ -331,8 +340,8 @@ reboot the continuation service invokes 'clouddeployctl resume' which
 picks up where apply left off.
 
 Note: deploy.auto_reboot defaults to false unless explicitly set to true
-in the active profile. When false, the operator must manually run
-'sudo reboot'.`,
+in the active profile or via --auto-reboot / CLOUDDEPLOY_AUTO_REBOOT=1.
+--unattended / CLOUDDEPLOY_UNATTENDED=1 implies automatic reboot.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 
@@ -405,7 +414,7 @@ in the active profile. When false, the operator must manually run
 				os.Exit(2)
 			}
 			if err == nil {
-				os.Exit(10)
+				return nil
 			}
 			return err
 		},
@@ -428,6 +437,9 @@ in the active profile. When false, the operator must manually run
 //  6. edid: stamps a kernel cmdline edid override if the profile asks.
 func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) error {
 	phases := applyPhases()
+	if isResume {
+		waitForResumeBootReadiness(ctx, deps)
+	}
 
 	// Live-VM regression fix: previously we disabled the continuation
 	// systemd unit at the START of resume. That unit was the very
@@ -464,6 +476,35 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 	return nil
 }
 
+func waitForResumeBootReadiness(ctx context.Context, deps *phase.Deps) {
+	if deps == nil || deps.Runner == nil {
+		return
+	}
+	fmt.Println("resume: waiting briefly for boot-time package managers/cloud-init to settle...")
+	deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"bash", "-lc", "command -v cloud-init >/dev/null 2>&1 && timeout 120 cloud-init status --wait || true"},
+		Sudo:    true,
+		LogFile: "-",
+		Timeout: 130 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	if deps.Unattended {
+		deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv: []string{"bash", "-lc", "systemctl stop apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service 2>/dev/null || true"},
+			Sudo: true, LogFile: "-", Timeout: 30 * time.Second, DryRun: deps.DryRun,
+		})
+	}
+	if deps.APT != nil {
+		deadline := time.Now().Add(3 * time.Minute)
+		for time.Now().Before(deadline) {
+			if holders := deps.APT.LockHolders(ctx); len(holders) == 0 {
+				return
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}
+}
+
 func applyPhases() []phase.Phase {
 	return []phase.Phase{
 		phase.AptHealth{},
@@ -482,6 +523,13 @@ func applyPhases() []phase.Phase {
 		phase.KWinPatch{},
 		phase.KWinSession{},
 		phase.DRMDisplayValidate{},
+		phase.SunshineBuild{},
+		phase.SunshineConfigPhase{},
+		phase.Tailscale{},
+		phase.PipeWireAudio{},
+		phase.StreamingServices{},
+		phase.StreamValidate{},
+		phase.OptionalApps{},
 	}
 }
 
@@ -534,7 +582,7 @@ func newResumeCmd() *cobra.Command {
 				os.Exit(2)
 			}
 			if err == nil {
-				os.Exit(10)
+				return nil
 			}
 			return err
 		},
@@ -1104,13 +1152,56 @@ func newDoctorSunshineCmd() *cobra.Command {
 		Use:   "sunshine",
 		Short: "Report Sunshine fork build/install state (read-only)",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("doctor sunshine: NOT IMPLEMENTED in Milestone 3 partial.")
-			fmt.Println("Will check (Milestone 4):")
-			fmt.Println("  - /usr/local/bin/sunshine-clouddeploy presence")
-			fmt.Println("  - /usr/local/bin/sunshine shadow presence")
-			fmt.Println("  - getcap on both binaries (cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep)")
-			fmt.Println("  - /opt/sunshine-src HEAD vs profile-pinned fork_commit")
-			fmt.Println("  - SUNSHINE_FORCE_AV1_HDR10 + SUNSHINE_SYNTHESIZE_HDR10_METADATA env in sunshine-headless.service")
+			ctx := context.Background()
+			deps, _, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			cfg := config.SunshineConfig{}
+			if deps.Profile != nil {
+				cfg = deps.Profile.EffectiveSunshine()
+			} else {
+				cfg = (&config.Profile{}).EffectiveSunshine()
+			}
+			fmt.Println("doctor sunshine:")
+			fmt.Printf("  source                 : %s\n", cfg.Source)
+			fmt.Printf("  fork repo              : %s\n", evOrUnknown(cfg.ForkRepo))
+			fmt.Printf("  fork branch            : %s\n", evOrUnknown(cfg.ForkBranch))
+			fmt.Printf("  fork commit            : %s\n", evOrUnknown(cfg.ForkCommit))
+			fmt.Printf("  build dir              : %s\n", cfg.BuildDir)
+			fmt.Printf("  install bin            : %s\n", cfg.InstallBin)
+			fmt.Printf("  config path            : %s\n", evOrUnknown(cfg.ConfigPath))
+			fmt.Printf("  install bin exists     : %v\n", fileExists(cfg.InstallBin))
+			fmt.Printf("  /usr/local/bin/sunshine: %v\n", fileExists("/usr/local/bin/sunshine"))
+			fmt.Printf("  assets apps.json       : %v\n", fileExists("/usr/local/assets/apps.json"))
+			fmt.Printf("  assets web/index.html  : %v\n", fileExists("/usr/local/assets/web/index.html"))
+			if fileExists(cfg.InstallBin) {
+				res := deps.Runner.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"getcap", cfg.InstallBin},
+					LogFile: "-",
+					Timeout: 10 * time.Second,
+				})
+				fmt.Printf("  capabilities           : %s\n", strings.TrimSpace(res.Stdout))
+			}
+			if fileExists(filepath.Join(cfg.BuildDir, ".git")) {
+				head := deps.Runner.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"git", "-C", cfg.BuildDir, "rev-parse", "HEAD"},
+					LogFile: "-",
+					Timeout: 10 * time.Second,
+				})
+				fmt.Printf("  build dir HEAD         : %s\n", strings.TrimSpace(head.Stdout))
+			}
+			unit := deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"systemctl", "cat", "sunshine-headless.service"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			if unit.Err == nil {
+				fmt.Printf("  service has force HDR  : %v\n", strings.Contains(unit.Stdout, "SUNSHINE_FORCE_AV1_HDR10=1"))
+				fmt.Printf("  service uses kwin-realvt: %v\n", strings.Contains(unit.Stdout, "kwin-realvt.service"))
+			} else {
+				fmt.Println("  service                : sunshine-headless.service not installed")
+			}
 			return nil
 		},
 	}
@@ -1126,8 +1217,8 @@ func newValidateCmd() *cobra.Command {
 		Use:   "hdr-stream",
 		Short: "Confirm Sunshine emitted the HDR control packet to Moonlight",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			fmt.Println("validate hdr-stream: NOT IMPLEMENTED (Milestone 4).")
-			fmt.Println("v2 helper: /usr/local/sbin/clouddeploy-validate-hdr-stream.")
+			fmt.Println("validate hdr-stream: use 'clouddeployctl phase stream-validate' for the v3 Sunshine substrate check.")
+			fmt.Println("Deep Moonlight HDR packet validation is still journal-marker based and may require an active Moonlight stream attempt.")
 			return nil
 		},
 	})
@@ -1153,18 +1244,13 @@ func newPhaseCmd() *cobra.Command {
 	p.AddCommand(newPhaseImplCmd("kwin-patch", phase.KWinPatch{}))
 	p.AddCommand(newPhaseImplCmd("kwin-session", phase.KWinSession{}))
 	p.AddCommand(newPhaseImplCmd("drm-display-validate", phase.DRMDisplayValidate{}))
-	// Still not implemented: Sunshine fork build and the
-	// Sunshine/Plasma systemd unit chain.
-	for _, name := range []string{"sunshine-build", "services"} {
-		n := name
-		p.AddCommand(&cobra.Command{
-			Use:   n,
-			Short: fmt.Sprintf("Run the %s phase (NOT IMPLEMENTED)", n),
-			RunE: func(cmd *cobra.Command, args []string) error {
-				return fmt.Errorf("phase %s: NOT IMPLEMENTED yet (Milestone 4B/5). The desktop substrate and KWin patch phase (apt-health -> drm-display-validate) are real; Sunshine build / runtime services come next", n)
-			},
-		})
-	}
+	p.AddCommand(newPhaseImplCmd("sunshine-build", phase.SunshineBuild{}))
+	p.AddCommand(newPhaseImplCmd("sunshine-config", phase.SunshineConfigPhase{}))
+	p.AddCommand(newPhaseImplCmd("tailscale", phase.Tailscale{}))
+	p.AddCommand(newPhaseImplCmd("pipewire-audio", phase.PipeWireAudio{}))
+	p.AddCommand(newPhaseImplCmd("streaming-services", phase.StreamingServices{}))
+	p.AddCommand(newPhaseImplCmd("stream-validate", phase.StreamValidate{}))
+	p.AddCommand(newPhaseImplCmd("optional-apps", phase.OptionalApps{}))
 	return p
 }
 
@@ -1204,12 +1290,47 @@ func handleRebootRequired(ctx context.Context, deps *phase.Deps) error {
 	}
 
 	profileName := ""
+	maxAutoReboots := 8
+	autoReboot := deps.AutoReboot
+	unattended := deps.Unattended
+	configDir := deps.ConfigDir
 	if deps.Profile != nil {
 		profileName = deps.Profile.Profile
+		if deps.Profile.Deploy.MaxAutoReboots > 0 {
+			maxAutoReboots = deps.Profile.Deploy.MaxAutoReboots
+		}
+		if deps.Profile.Deploy.AutoReboot {
+			autoReboot = true
+		}
+		if deps.Profile.Deploy.Unattended {
+			unattended = true
+			autoReboot = true
+		}
+	}
+	if unattended {
+		autoReboot = true
+	}
+	if deps.State != nil {
+		target := deps.State.ResumeTarget
+		deps.State.RecordRebootRequest(target, maxAutoReboots)
+		if deps.State.RebootCount > maxAutoReboots {
+			return fmt.Errorf("auto-reboot loop protection: reboot_count=%d exceeds max_auto_reboots=%d (last phase=%s)",
+				deps.State.RebootCount, maxAutoReboots, deps.State.LastRebootPhase)
+		}
+		if deps.State.SamePhaseRebootCount > 2 {
+			return fmt.Errorf("auto-reboot loop protection: phase %s requested reboot %d times in a row",
+				deps.State.LastRebootPhase, deps.State.SamePhaseRebootCount)
+		}
+		if err := deps.PersistState(); err != nil {
+			return fmt.Errorf("persist reboot counters: %w", err)
+		}
 	}
 	args := reboot.Args{
-		Profile:   profileName,
-		StatePath: deps.StatePath,
+		Profile:    profileName,
+		StatePath:  deps.StatePath,
+		ConfigDir:  configDir,
+		AutoReboot: autoReboot,
+		Unattended: unattended,
 	}
 
 	fmt.Println("Installing continuation service...")
@@ -1217,8 +1338,8 @@ func handleRebootRequired(ctx context.Context, deps *phase.Deps) error {
 		return fmt.Errorf("install continuation unit: %w", err)
 	}
 
-	if deps.Profile != nil && deps.Profile.Deploy.AutoReboot {
-		fmt.Println("deploy.auto_reboot=true: Scheduling reboot now...")
+	if autoReboot {
+		fmt.Println("auto-reboot enabled: Scheduling reboot now...")
 		if err := svc.Reboot(ctx); err != nil {
 			return fmt.Errorf("auto-reboot failed: %w", err)
 		}
@@ -1277,6 +1398,51 @@ func newStateCmd() *cobra.Command {
 	return s
 }
 
+func newMonitorCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "monitor",
+		Short: "Print live CloudDeploy status, lock, process and continuation-log tail",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			statePath, _ := cmd.Flags().GetString("state-path")
+			lockPath, _ := cmd.Flags().GetString("lock-path")
+			fmt.Printf("clouddeploy monitor @ %s\n\n", time.Now().Format(time.RFC3339))
+			if st, err := state.Load(statePath); err == nil {
+				fmt.Printf("profile=%s reboot_needed=%v resume_target=%s reboot_count=%d same_phase_reboots=%d\n",
+					st.Profile, st.RebootNeeded, evOrUnknown(st.ResumeTarget), st.RebootCount, st.SamePhaseRebootCount)
+				names := make([]string, 0, len(st.Phases))
+				for name := range st.Phases {
+					names = append(names, name)
+				}
+				sort.Strings(names)
+				for _, name := range names {
+					ph := st.Phases[name]
+					fmt.Printf("  %-24s %-24s %s\n", name, ph.Status, ph.Reason)
+				}
+			} else {
+				fmt.Printf("state: cannot read %s: %v\n", statePath, err)
+			}
+			fmt.Println()
+			info := state.Inspect(lockPath)
+			fmt.Printf("lock: exists=%v pid=%d alive=%v path=%s\n\n", info.Exists, info.PID, info.HolderLive, info.Path)
+			r := runner.New()
+			for _, item := range []struct {
+				title string
+				argv  []string
+			}{
+				{"active deploy processes", []string{"bash", "-lc", "ps -eo pid,ppid,etime,args | grep -E 'clouddeployctl|apt-get|dpkg|cmake|ninja' | grep -v grep || true"}},
+				{"continue.log tail", []string{"bash", "-lc", "tail -n 80 /var/log/clouddeploy/continue.log 2>/dev/null || true"}},
+				{"apt/dpkg tail", []string{"bash", "-lc", "tail -n 80 /var/log/apt/term.log 2>/dev/null || true; tail -n 80 /var/log/dpkg.log 2>/dev/null || true"}},
+			} {
+				fmt.Printf("=== %s ===\n", item.title)
+				res := r.Exec(ctx, runner.CommandSpec{Argv: item.argv, LogFile: "-", Timeout: 15 * time.Second})
+				fmt.Println(strings.TrimRight(res.Stdout, "\n"))
+			}
+			return nil
+		},
+	}
+}
+
 // -----------------------------------------------------------------------------
 // small helpers
 // -----------------------------------------------------------------------------
@@ -1288,12 +1454,29 @@ func evOrUnknown(s string) string {
 	return s
 }
 
+func fileExists(path string) bool {
+	if strings.TrimSpace(path) == "" {
+		return false
+	}
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func profileName(cmd *cobra.Command) string {
 	p, _ := cmd.Flags().GetString("profile")
 	if p == "" {
 		return "hdr-4k120"
 	}
 	return p
+}
+
+func envBool(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func lookExecutable(name string) (string, error) {

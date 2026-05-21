@@ -74,13 +74,17 @@ type Phase struct {
 
 // State is the on-disk schema.
 type State struct {
-	Version      int               `json:"version"`
-	Profile      string            `json:"profile,omitempty"`
-	StartedAt    *time.Time        `json:"started_at,omitempty"`
-	FinishedAt   *time.Time        `json:"finished_at,omitempty"`
-	Phases       map[string]*Phase `json:"phases"`
-	RebootNeeded bool              `json:"reboot_needed,omitempty"`
-	ResumeTarget string            `json:"resume_target,omitempty"`
+	Version              int               `json:"version"`
+	Profile              string            `json:"profile,omitempty"`
+	StartedAt            *time.Time        `json:"started_at,omitempty"`
+	FinishedAt           *time.Time        `json:"finished_at,omitempty"`
+	Phases               map[string]*Phase `json:"phases"`
+	RebootNeeded         bool              `json:"reboot_needed,omitempty"`
+	ResumeTarget         string            `json:"resume_target,omitempty"`
+	RebootCount          int               `json:"reboot_count,omitempty"`
+	LastRebootPhase      string            `json:"last_reboot_phase,omitempty"`
+	SamePhaseRebootCount int               `json:"same_phase_reboot_count,omitempty"`
+	MaxAutoReboots       int               `json:"max_auto_reboots,omitempty"`
 	// StartupRecovery is set when loadDeps observed it had to clean
 	// up stale on-disk state (a dead-PID lock file, an
 	// interrupted-running phase). Diagnostic only; never gates
@@ -354,6 +358,25 @@ func (s *State) Reset(name string) bool {
 func (s *State) SetRebootNeeded(needed bool, target string) {
 	s.RebootNeeded = needed
 	s.ResumeTarget = target
+}
+
+// RecordRebootRequest increments reboot-loop counters for unattended
+// deploys. It is called immediately before installing the continuation
+// service so the state survives the reboot.
+func (s *State) RecordRebootRequest(target string, maxAutoReboots int) {
+	if s == nil {
+		return
+	}
+	if maxAutoReboots > 0 {
+		s.MaxAutoReboots = maxAutoReboots
+	}
+	s.RebootCount++
+	if target != "" && target == s.LastRebootPhase {
+		s.SamePhaseRebootCount++
+	} else {
+		s.LastRebootPhase = target
+		s.SamePhaseRebootCount = 1
+	}
 }
 
 // ClearRebootNeeded is the post-reboot side: resume calls this after

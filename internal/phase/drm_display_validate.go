@@ -36,6 +36,8 @@ type KScreenConnector struct {
 	// Modes is every mode kscreen-doctor enumerated under this
 	// connector, in the same order it printed them.
 	Modes []string
+	HDR   bool
+	WCG   bool
 }
 
 // FindConnector returns the connector matching name (case-sensitive),
@@ -71,6 +73,8 @@ var kscreenEnabledRE = regexp.MustCompile(`^\s*(enabled|disabled)\s*$`)
 // The leading "!" marks the currently active mode in some
 // kscreen-doctor builds; we parse both formats.
 var kscreenModesLineRE = regexp.MustCompile(`^\s*Modes:\s+(.*)$`)
+var kscreenHDRRE = regexp.MustCompile(`^\s*HDR:\s+(enabled|disabled)\s*$`)
+var kscreenWCGRE = regexp.MustCompile(`^\s*Wide Color Gamut:\s+(enabled|disabled)\s*$`)
 
 // ParseKScreenDoctor parses the textual output of `kscreen-doctor -o`.
 // The parser is intentionally permissive: kscreen-doctor's output
@@ -104,6 +108,14 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 			cur.Modes, cur.CurrentMode = parseKScreenModesField(m[1])
 			continue
 		}
+		if m := kscreenHDRRE.FindStringSubmatch(line); m != nil {
+			cur.HDR = m[1] == "enabled"
+			continue
+		}
+		if m := kscreenWCGRE.FindStringSubmatch(line); m != nil {
+			cur.WCG = m[1] == "enabled"
+			continue
+		}
 	}
 	flush()
 	return out
@@ -113,6 +125,17 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 // ([3840x2160@120, 1920x1080@60], "3840x2160@120") where the second
 // return is the entry marked with "!" (the currently selected mode).
 func parseKScreenModesField(field string) (modes []string, current string) {
+	liveRE := regexp.MustCompile(`\b[0-9]+:([0-9]+x[0-9]+@[0-9.]+)([!*]?)`)
+	for _, m := range liveRE.FindAllStringSubmatch(field, -1) {
+		mode := m[1]
+		modes = append(modes, mode)
+		if strings.Contains(m[2], "*") {
+			current = mode
+		}
+	}
+	if len(modes) > 0 {
+		return modes, current
+	}
 	for _, raw := range strings.Split(field, ",") {
 		s := strings.TrimSpace(raw)
 		if s == "" {
@@ -128,9 +151,12 @@ func parseKScreenModesField(field string) (modes []string, current string) {
 		if len(parts) >= 2 {
 			modeStr = parts[1]
 		}
-		if strings.HasSuffix(head, "!") {
+		if strings.HasSuffix(head, "!") || strings.HasSuffix(head, "*") || strings.HasSuffix(modeStr, "*") {
+			modeStr = strings.TrimSuffix(modeStr, "*")
+			modeStr = strings.TrimSuffix(modeStr, "!")
 			current = modeStr
 		}
+		modeStr = strings.TrimSuffix(strings.TrimSuffix(modeStr, "*"), "!")
 		modes = append(modes, modeStr)
 	}
 	return modes, current
@@ -295,6 +321,8 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	details["enabled"] = conn.Enabled
 	details["selected_mode"] = conn.CurrentMode
 	details["modes"] = conn.Modes
+	details["hdr_enabled"] = conn.HDR
+	details["wcg_enabled"] = conn.WCG
 	if !conn.Enabled {
 		err := fmt.Errorf("connector %q exists but is disabled in kscreen-doctor output", connector)
 		details["err"] = err.Error()
@@ -310,6 +338,17 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		deps.State.Get(DRMDisplayValidateName).Details = details
 		_ = deps.PersistState()
 		return fmt.Errorf("phase drm-display-validate: %w", err)
+	}
+	if deps.Profile != nil && deps.Profile.Display.HDR {
+		if !conn.HDR || !conn.WCG {
+			err := fmt.Errorf("HDR profile requires kscreen-doctor to report HDR enabled and Wide Color Gamut enabled on %q (hdr=%v wcg=%v)",
+				connector, conn.HDR, conn.WCG)
+			details["err"] = err.Error()
+			deps.State.MarkFailed(DRMDisplayValidateName, "HDR/WCG not enabled", err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
+		}
 	}
 
 	deps.State.MarkDone(DRMDisplayValidateName, details)
@@ -364,7 +403,11 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 		if m := FormatMode(w, h, deps.Profile.Display.Refresh); m != "" {
 			mode = m
 		}
-		return fmt.Sprintf("Output: 1 %s\n        enabled\n        Modes: 1!  %s\n", conn, mode), nil
+		extra := ""
+		if deps.Profile != nil && deps.Profile.Display.HDR {
+			extra = "        HDR: enabled\n        Wide Color Gamut: enabled\n"
+		}
+		return fmt.Sprintf("Output: 1 %s\n        enabled\n        Modes: 1:%s*\n%s", conn, mode, extra), nil
 	}
 	// Live VM regression: kscreen-doctor defaulted to Qt xcb without
 	// an explicit QT_QPA_PLATFORM=wayland, which then crashed because

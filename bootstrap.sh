@@ -61,6 +61,8 @@ die() { printf '[bootstrap] FATAL: %s\n' "$*" >&2; exit 1; }
 [[ ${EUID} -eq 0 ]] || die "Run with sudo (need root for apt + writing under /opt)."
 
 PROFILE="${PROFILE:-hdr-4k120}"
+CLOUDDEPLOY_UNATTENDED="${CLOUDDEPLOY_UNATTENDED:-0}"
+CLOUDDEPLOY_AUTO_REBOOT="${CLOUDDEPLOY_AUTO_REBOOT:-0}"
 CLOUDDEPLOY_REPO_DIR="${CLOUDDEPLOY_REPO_DIR:-/opt/clouddeploy-mover}"
 CLOUDDEPLOY_REPO_URL="${CLOUDDEPLOY_REPO_URL:-https://github.com/NoviceAtPython/CloudDeploy-mover.git}"
 CLOUDDEPLOY_BRANCH="${CLOUDDEPLOY_BRANCH:-v3}"
@@ -267,12 +269,14 @@ run_apply() {
         return 0
     fi
     log "============================================================"
-    log "v3 Milestone 4 partial apply"
+    log "v3 Milestone 5 apply"
     log ""
     log "Implemented phases (run in this order):"
     log "  apt-health, ubuntu-upgrade, base-packages, nvidia-driver,"
     log "  cuda, edid, headless-user, desktop-packages, desktop-runtime,"
-    log "  kwin-session, drm-display-validate"
+    log "  kwin-session, drm-display-validate, sunshine-build,"
+    log "  sunshine-config, tailscale, pipewire-audio, streaming-services,"
+    log "  stream-validate, optional-apps"
     log ""
     log "If the active profile has profile.deploy.auto_upgrade_ubuntu=true"
     log "AND the host VERSION_ID differs from profile.ubuntu_version,"
@@ -281,13 +285,8 @@ run_apply() {
     log "a new kernel + userspace and requires a reboot before the rest"
     log "of the phases run. With profile.deploy.auto_reboot=false (the"
     log "default), this script exits 2 and the operator must reboot +"
-    log "rerun: 'sudo clouddeployctl resume'."
-    log ""
-    log "NOT yet implemented (still v2-only):"
-    log "  Sunshine fork build, Tailscale, PipeWire virtual sink,"
-    log "  full Sunshine/Plasma systemd unit chain,"
-    log "  HDR DRM validation, HDR stream validation."
-    log "(patched-KWin NVIDIA private HDR build is real: phase kwin-patch.)"
+    log "rerun: 'sudo clouddeployctl resume'. Set CLOUDDEPLOY_UNATTENDED=1"
+    log "or CLOUDDEPLOY_AUTO_REBOOT=1 for autopilot continuation."
     log ""
     log "For a deploy that reaches Moonlight AV1 10-bit HDR today,"
     log "keep using the v2 entrypoint:"
@@ -296,10 +295,16 @@ run_apply() {
     log "See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability"
     log "audit and docs/V3-ROADMAP.md for milestone status."
     log "============================================================"
-    log "Invoking clouddeployctl apply --profile ${PROFILE}"
+    local apply_args=(apply --profile "${PROFILE}" --config-dir "${CLOUDDEPLOY_REPO_DIR}/config")
+    if [[ "${CLOUDDEPLOY_UNATTENDED}" == "1" ]]; then
+        apply_args+=(--unattended --auto-reboot)
+    elif [[ "${CLOUDDEPLOY_AUTO_REBOOT}" == "1" ]]; then
+        apply_args+=(--auto-reboot)
+    fi
+    log "Invoking clouddeployctl ${apply_args[*]}"
     
     set +e
-    /usr/local/bin/clouddeployctl apply --profile "${PROFILE}"
+    /usr/local/bin/clouddeployctl "${apply_args[@]}"
     local apply_ec=$?
     set -e
     
@@ -309,12 +314,12 @@ run_apply() {
             ;;
         2)
             log "Apply requires a reboot to continue."
-            log "Please reboot and run 'sudo clouddeployctl resume'."
+            if [[ "${CLOUDDEPLOY_UNATTENDED}" == "1" || "${CLOUDDEPLOY_AUTO_REBOOT}" == "1" ]]; then
+                log "Auto-reboot was requested; the continuation service should resume after reboot."
+            else
+                log "Please reboot and run 'sudo clouddeployctl resume'."
+            fi
             exit 2
-            ;;
-        10)
-            log "Partial apply complete. Unimplemented phases skipped."
-            exit 10
             ;;
         *)
             die "Apply failed with exit code ${apply_ec}."

@@ -41,6 +41,34 @@ func TestParseKScreenDoctor_MinimalDP1HappyPath(t *testing.T) {
 	}
 }
 
+func TestParseKScreenDoctor_LivePlasma645Modes(t *testing.T) {
+	out := ParseKScreenDoctor(`Output: 1 DP-1
+        enabled
+        Modes:  1:3840x2160@60!  2:3840x2160@120*  3:3840x2160@60
+        HDR: enabled
+        Wide Color Gamut: enabled
+`)
+	c := out.FindConnector("DP-1")
+	if c == nil {
+		t.Fatalf("DP-1 not parsed: %#v", out.Connectors)
+	}
+	if got, want := c.CurrentMode, "3840x2160@120"; got != want {
+		t.Fatalf("current mode: got %q want %q", got, want)
+	}
+	if !c.HDR || !c.WCG {
+		t.Fatalf("HDR/WCG: got hdr=%v wcg=%v want both true", c.HDR, c.WCG)
+	}
+	wantModes := []string{"3840x2160@60", "3840x2160@120", "3840x2160@60"}
+	if len(c.Modes) != len(wantModes) {
+		t.Fatalf("modes: got %v want %v", c.Modes, wantModes)
+	}
+	for i, want := range wantModes {
+		if c.Modes[i] != want {
+			t.Errorf("mode[%d]: got %q want %q", i, c.Modes[i], want)
+		}
+	}
+}
+
 func TestParseKScreenDoctor_MultipleConnectors(t *testing.T) {
 	out := ParseKScreenDoctor(`Output: 1 DP-1
         enabled
@@ -111,6 +139,8 @@ func TestDRMDisplayValidate_HappyPath(t *testing.T) {
 			return `Output: 1 DP-1
         enabled
         Modes: 1!  3840x2160@120, 2  1920x1080@60
+        HDR: enabled
+        Wide Color Gamut: enabled
 `, nil
 		},
 	}
@@ -183,6 +213,8 @@ func TestDRMDisplayValidate_ExpectedModeMissingFailsFatal(t *testing.T) {
 			return `Output: 1 DP-1
         enabled
         Modes: 1!  1920x1080@60
+        HDR: enabled
+        Wide Color Gamut: enabled
 `, nil
 		},
 	}
@@ -192,6 +224,25 @@ func TestDRMDisplayValidate_ExpectedModeMissingFailsFatal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "expected mode") {
 		t.Errorf("error should mention expected mode: %v", err)
+	}
+}
+
+func TestDRMDisplayValidate_HDRMissingFailsFatal(t *testing.T) {
+	deps := drmDeps(t)
+	ph := DRMDisplayValidate{
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        enabled
+        Modes: 1!  3840x2160@120
+`, nil
+		},
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal when HDR/WCG are missing for HDR profile")
+	}
+	if !strings.Contains(err.Error(), "HDR profile") {
+		t.Errorf("error should mention HDR profile: %v", err)
 	}
 }
 

@@ -28,15 +28,17 @@ import (
 // Profile is the high-level operator intent loaded from
 // config/profiles/<name>.yaml.
 type Profile struct {
-	Profile       string         `yaml:"profile"`
-	UbuntuVersion string         `yaml:"ubuntu_version"`
-	Display       DisplayConfig  `yaml:"display"`
-	NVIDIA        NVIDIAConfig   `yaml:"nvidia"`
-	CUDA          CUDAConfig     `yaml:"cuda"`
-	Sunshine      SunshineConfig `yaml:"sunshine"`
-	KWin          KWinConfig     `yaml:"kwin"`
-	Desktop       DesktopConfig  `yaml:"desktop"`
-	Deploy        DeployConfig   `yaml:"deploy"`
+	Profile       string          `yaml:"profile"`
+	UbuntuVersion string          `yaml:"ubuntu_version"`
+	Display       DisplayConfig   `yaml:"display"`
+	NVIDIA        NVIDIAConfig    `yaml:"nvidia"`
+	CUDA          CUDAConfig      `yaml:"cuda"`
+	Sunshine      SunshineConfig  `yaml:"sunshine"`
+	KWin          KWinConfig      `yaml:"kwin"`
+	Desktop       DesktopConfig   `yaml:"desktop"`
+	Tailscale     TailscaleConfig `yaml:"tailscale"`
+	Audio         AudioConfig     `yaml:"audio"`
+	Deploy        DeployConfig    `yaml:"deploy"`
 }
 
 // DeployConfig is operator-knob territory: how the deploy itself
@@ -110,6 +112,18 @@ type DeployConfig struct {
 	// show surface this so an operator can see what the profile
 	// asked for.
 	PreferLTS bool `yaml:"prefer_lts"`
+
+	// Unattended lets apply/resume run the deploy as a true autopilot:
+	// noninteractive package installs, automatic reboot scheduling,
+	// and continuation-service resume without operator prompts.
+	Unattended bool `yaml:"unattended"`
+
+	// MaxAutoReboots caps unattended reboot loops. Zero means the
+	// documented default (8).
+	MaxAutoReboots int `yaml:"max_auto_reboots"`
+
+	// OptionalApps enables the final nonfatal game/app install phase.
+	OptionalApps bool `yaml:"optional_apps"`
 }
 
 // DisplayConfig is the target output mode + HDR flag.
@@ -271,6 +285,100 @@ type SunshineConfig struct {
 	Capture                 string `yaml:"capture"`
 	ForceAV1HDR10           bool   `yaml:"force_av1_hdr10"`
 	SynthesizeHDR10Metadata bool   `yaml:"synthesize_hdr10_metadata"`
+	BuildDir                string `yaml:"build_dir"`
+	InstallBin              string `yaml:"install_bin"`
+	ConfigPath              string `yaml:"config_path"`
+	BuildJobs               int    `yaml:"build_jobs"`
+	RequireCUDA             bool   `yaml:"require_cuda"`
+}
+
+const DefaultSunshineBuildDir = "/opt/sunshine-src"
+const DefaultSunshineInstallBin = "/usr/local/bin/sunshine-clouddeploy"
+const DefaultSunshineConfigName = "sunshine.conf"
+const DefaultSunshineBuildJobs = 2
+
+func (p *Profile) EffectiveSunshine() SunshineConfig {
+	out := SunshineConfig{}
+	if p != nil {
+		out = p.Sunshine
+	}
+	if strings.TrimSpace(out.Source) == "" {
+		out.Source = "fork"
+	}
+	if strings.TrimSpace(out.Encoder) == "" {
+		out.Encoder = "nvenc"
+	}
+	if strings.TrimSpace(out.Capture) == "" {
+		out.Capture = "kms"
+	}
+	if strings.TrimSpace(out.BuildDir) == "" {
+		out.BuildDir = DefaultSunshineBuildDir
+	}
+	if strings.TrimSpace(out.InstallBin) == "" {
+		out.InstallBin = DefaultSunshineInstallBin
+	}
+	if out.BuildJobs <= 0 {
+		out.BuildJobs = DefaultSunshineBuildJobs
+	}
+	return out
+}
+
+// TailscaleConfig controls the optional network overlay phase.
+type TailscaleConfig struct {
+	Enabled    *bool  `yaml:"enabled"`
+	AuthKeyEnv string `yaml:"authkey_env"`
+	SSH        bool   `yaml:"ssh"`
+}
+
+func (p *Profile) EffectiveTailscale() TailscaleConfig {
+	out := TailscaleConfig{}
+	if p != nil {
+		out = p.Tailscale
+	}
+	if out.Enabled == nil {
+		v := true
+		out.Enabled = &v
+	}
+	if strings.TrimSpace(out.AuthKeyEnv) == "" {
+		out.AuthKeyEnv = "TAILSCALE_AUTHKEY"
+	}
+	out.SSH = true
+	return out
+}
+
+func (t TailscaleConfig) EnabledValue() bool {
+	if t.Enabled == nil {
+		return true
+	}
+	return *t.Enabled
+}
+
+// AudioConfig controls the PipeWire virtual audio substrate.
+type AudioConfig struct {
+	Enabled     *bool  `yaml:"enabled"`
+	VirtualSink string `yaml:"virtual_sink"`
+}
+
+func (p *Profile) EffectiveAudio() AudioConfig {
+	out := AudioConfig{}
+	if p != nil {
+		out = p.Audio
+	}
+	if out.Enabled == nil {
+		v := true
+		out.Enabled = &v
+	}
+	if strings.TrimSpace(out.VirtualSink) == "" {
+		out.VirtualSink = "clouddeploy-sink"
+	}
+	return out
+}
+
+func (a AudioConfig) EnabledValue() bool {
+	if a.Enabled == nil {
+		return true
+	}
+	return *a.Enabled
 }
 
 // KWinConfig governs patched-KWin install + private HDR.
@@ -671,10 +779,10 @@ func ValidateProfile(p *Profile) error {
 		return fmt.Errorf("config: profile %q: kwin.install_mode must be one of packages/prefix, got %q", p.Profile, p.KWin.InstallMode)
 	}
 	switch strings.ToLower(strings.TrimSpace(p.Sunshine.Source)) {
-	case "fork", "deb":
+	case "", "fork", "deb":
 		// ok
 	default:
-		return fmt.Errorf("config: profile %q: sunshine.source must be fork or deb, got %q", p.Profile, p.Sunshine.Source)
+		return fmt.Errorf("config: profile %q: sunshine.source must be empty/fork/deb, got %q", p.Profile, p.Sunshine.Source)
 	}
 	if p.Sunshine.Source == "fork" {
 		if strings.TrimSpace(p.Sunshine.ForkRepo) == "" {
@@ -683,6 +791,12 @@ func ValidateProfile(p *Profile) error {
 		if strings.TrimSpace(p.Sunshine.ForkBranch) == "" {
 			return fmt.Errorf("config: profile %q: sunshine.fork_branch required for source=fork", p.Profile)
 		}
+	}
+	if p.Sunshine.BuildJobs < 0 {
+		return fmt.Errorf("config: profile %q: sunshine.build_jobs must be >= 0", p.Profile)
+	}
+	if p.Deploy.MaxAutoReboots < 0 {
+		return fmt.Errorf("config: profile %q: deploy.max_auto_reboots must be >= 0", p.Profile)
 	}
 	if p.Display.HDR {
 		if p.Sunshine.ForkCommit == "" {

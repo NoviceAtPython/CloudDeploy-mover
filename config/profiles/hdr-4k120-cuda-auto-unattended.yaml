@@ -1,0 +1,77 @@
+# Autopilot variant of hdr-4k120-cuda-auto.
+#
+# Use for paid fresh-VM runs where clouddeployctl should install the
+# continuation service and reboot/resume without manual SSH steps.
+
+profile: hdr-4k120-cuda-auto-unattended
+ubuntu_version: ""
+
+display:
+  resolution: 3840x2160
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "580"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: required
+  method: apt
+  selection_policy: latest-compatible
+  prefer_major: "13"
+  prefer_newest: true
+  min_major: "12"
+  allow_cross_distro_cuda_repo: true
+  cuda_repo_distro_candidates:
+    - auto-host
+    - ubuntu2404
+  allow_ubuntu_archive_fallback: true
+  compile_smoke_test: true
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+  build_jobs: 2
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+desktop:
+  session_backend: realvt
+  compositor_mode: kwin
+  enable_linger: true
+
+tailscale:
+  enabled: true
+  authkey_env: TAILSCALE_AUTHKEY
+  ssh: true
+
+audio:
+  enabled: true
+  virtual_sink: clouddeploy-sink
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: true
+  unattended: true
+  max_auto_reboots: 8
+  optional_apps: false
+
+  ubuntu_selection_policy: latest-compatible
+  ubuntu_candidates:
+    - "26.04"
+    - "25.10"
+    - "24.04"
+  prefer_lts: false

@@ -51,12 +51,12 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `doctor cuda` | **Real**. Reads profile, prints mode + nvcc presence + Sunshine CUDA-module verdict + runfile retry policy. |
 | `doctor apt` | **Real**. policy-rc.d state + lock holders + `dpkg --audit`. |
 | `doctor system` | **Real + gate**. OS release / kernel / state file / phase summary. Refuses unsupported Ubuntu versions unless `--allow-unsupported`. |
-| `doctor kwin` | Stub. Milestone 4. |
-| `doctor sunshine` | Stub. Milestone 4. |
-| `validate hdr-stream` | Stub. Milestone 4. |
+| `doctor kwin` | **Real (Milestone 4A).** |
+| `doctor sunshine` | **Real (Milestone 5).** Reports fork/build binary, runtime assets, caps, build HEAD, and Sunshine service hints. |
+| `validate hdr-stream` | **Pointer (Milestone 5).** Directs operators to `phase stream-validate`; deep Moonlight HDR packet validation still depends on an active stream attempt. |
 | `state show` | **Real**. |
 | `state reset --phase X` | **Real**. |
-| `apply` | **Partial (Milestone 4A/4B landed).** Runs `apt-health → ubuntu-upgrade → base-packages → nvidia-driver → cuda → edid (opt-in) → headless-user → desktop-packages → desktop-runtime → kwin-patch → kwin-session → drm-display-validate`. Exits 10 with banner; or 2 when reboot is pending (and triggers `systemctl reboot` when `--auto-reboot` is set / profile has `auto_reboot: true` (defaults to manual reboot)). Refuses unsupported Ubuntu versions unless `--allow-unsupported`, but if the host is on a v3-supported release AND `profile.deploy.auto_upgrade_ubuntu=true` AND the profile targets a different supported version, defers the exact-match gate to the ubuntu-upgrade phase. |
+| `apply` | **Milestone 5 attempt.** Runs `apt-health → ubuntu-upgrade → base-packages → nvidia-driver → cuda → edid → headless-user → desktop-packages → desktop-runtime → kwin-patch → kwin-session → drm-display-validate → sunshine-build → sunshine-config → tailscale → pipewire-audio → streaming-services → stream-validate → optional-apps`. Reboots via continuation service when needed; `--unattended` / `--auto-reboot` can drive the run with no manual reboot/resume steps. |
 | `phase ubuntu-upgrade` | **Real (this commit).** v3 port of v2's `maybe_upgrade_ubuntu` + `direct_apt_codename_upgrade`. 24.04 → 25.10 path works; anti-reboot-loop guard via `state.Details["pre_version"]`. do-release-upgrade path is stubbed with a clear error (set `deploy.direct_apt_codename_upgrade=force` to skip it). |
 | `resume` | **Real**. Reads state, clears RebootNeeded, rewrites stale `running` phases to `pending` after acquiring the process lock, replays implemented phases, and disables the continuation service when no further reboot is queued. |
 | `phase base-packages` | **Real**. |
@@ -67,7 +67,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `phase desktop-runtime` | **Real (Milestone 4A).** Verifies preconditions: `/dev/dri/card*` + `/dev/dri/renderD*` exist; `/sys/module/nvidia_drm/parameters/modeset == "Y"`; `/proc/cmdline` contains `nvidia-drm.modeset=1`, `nvidia-drm.fbdev=1`, `video=<connector>:e`, and `drm.edid_firmware=<connector>:edid/<file>`; the headless user is in BOTH `video` and `render`. Any failure -> fatal before kwin-session. State.Details: `dri_cards`, `render_nodes`, `nvidia_drm_modeset`, `cmdline`, `cmdline_missing`, `cmdline_ok`, `user_groups_now`, `user_device_access_ok`. |
 | `phase kwin-patch` | **Real (Milestone 4B).** If `kwin.patched_hdr=false`, marks skipped. If enabled, validates `patches/kwin-clouddeploy-nvidia-private-hdr.patch` against the active Ubuntu `kwin` source, builds patched KWin binary packages with `dpkg-buildpackage`, installs/holds them, and writes `/var/lib/clouddeploy/kwin-patch.json` with patch/source/install metadata. Fails closed for HDR profiles unless `allow_packaged_fallback=true` and `require_patch=false`. |
 | `phase kwin-session` | **Real (Milestone 4A/4B).** Renders + installs the selected real-VT KWin/Plasma service, `systemctl daemon-reload + enable + start`, waits for `/run/user/<uid>/wayland-0` to appear and remain stable, requires `systemctl is-active` + MainPID, and scans recent journal lines for KWin DRM/logind fatal signatures. When `kwin.patched_hdr=true` and `kwin_patch` is done, injects `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1` and `KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1` into the service environment. |
-| `phase drm-display-validate` | **Real (Milestone 4A).** Runs `kscreen-doctor -o` as the headless user with the right Wayland/XDG/D-Bus env. Parses the output, asserts the profile's forced connector exists + is enabled + advertises the configured mode (`<W>x<H>@<refresh>`). Fails fatal otherwise. HDR-side validation is recorded if visible but does NOT hard-fail (Milestone 4B). State.Details: `connector`, `enabled`, `selected_mode`, `expected_mode`, `modes`, `wayland_socket_ok`, `kscreen_doctor_ok`. |
+| `phase drm-display-validate` | **Real (Milestone 5).** Runs `kscreen-doctor -o` as the headless user with the right Wayland/XDG/D-Bus env. Parses KScreen 6.4.x mode syntax, asserts the forced connector exists + is enabled + advertises/selects the configured mode (`<W>x<H>@<refresh>`). For HDR profiles, hard-fails unless KScreen reports `HDR: enabled` and `Wide Color Gamut: enabled`. State.Details: `connector`, `enabled`, `selected_mode`, `expected_mode`, `modes`, `hdr_enabled`, `wcg_enabled`. |
 | `doctor kwin` | **Real (Milestone 4A).** Reports selected compositor backend, service name/path, systemd state, `/run/user/<uid>` and socket state, loginctl/user groups, DRI nodes, journal tail, and recovery commands. |
 | `doctor kwin-patch` | **Real (Milestone 4B).** Reports patched-HDR profile settings, patch path/hash, marker metadata, installed packages, held packages, fallback reason, and the next command to rerun validation/build. |
 | `phase apt-health` | **Real.** Runs FIRST in the apply chain. (1) preserves emergency sudo by writing `/etc/sudoers.d/90-clouddeploy-<SUDO_USER>` (validated with `visudo -cf`, installed via temp+atomic rename, mode 0440) so a clobbered `/etc/sudoers` mid-upgrade does not lock the operator out; (2) runs `dpkg --audit`, and on the `/var/lib/dpkg/updates/<N>` parse-error signature quarantines the journal files into `/var/lib/clouddeploy/backups/dpkg-updates-<ts>/` before running `dpkg --configure -a` + `apt-get -f install`; (3) detects mid-upgrade state (host VERSION_ID disagrees with the codename in `ubuntu.sources`) and records `mid_upgrade: true` + a `mid_upgrade_reason` in state.Details. Any unrecoverable repair failure fails the phase **before** ubuntu-upgrade touches sources. |
@@ -75,8 +75,13 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `doctor lock` | **Real (this commit).** Read-only probe of `/var/lib/clouddeploy/state.lock`: reports the holder PID, whether it's still alive, and recovery instructions for stale locks. Use after a "lock is held by another clouddeployctl process" error. |
 | `phase edid` | **Real (opt-in).** Invokes `helpers/write-edids.py`, writes `/lib/firmware/edid/<name>.bin`, drops a `/etc/default/grub.d/99-clouddeploy.cfg`, runs `update-initramfs -u` + `update-grub`, sets `RebootNeeded`. Only runs when `display.forced_connector` is set in the profile. |
 | `phase kwin-patch` | **Real.** Patch validation + source package build/install + marker/idempotency. |
-| `phase sunshine-build` | Stub. Milestone 4. |
-| `phase services` | Stub. Milestone 4. |
+| `phase sunshine-build` | **Real (Milestone 5).** Installs build deps, clones/checks out the pinned Sunshine fork commit, builds the `sunshine` target, installs `/usr/local/bin/sunshine-clouddeploy`, sets capabilities, and installs runtime assets under `/usr/local/assets`. |
+| `phase sunshine-config` | **Real (Milestone 5).** Generates KMS/NVENC `sunshine.conf` without known-invalid keys and with local/Tailscale CSRF allowlist support. |
+| `phase tailscale` | **Real (Milestone 5, optional).** Installs/starts Tailscale and runs `tailscale up --authkey ... --ssh` only when an auth key is present. |
+| `phase pipewire-audio` | **Real (Milestone 5).** Installs PipeWire/WirePlumber/Pulse tools and validates user-session audio visibility. |
+| `phase streaming-services` | **Real (Milestone 5).** Installs `sunshine-headless.service`, reset helper, and watchdog timer; uses direct `kwin-realvt.service` as compositor dependency. |
+| `phase stream-validate` | **Real (Milestone 5).** Requires Sunshine active and `/serverinfo` reachable, records listener/log markers, and enters `pending_moonlight_connect` until a Moonlight stream attempt produces KMS/NVENC markers. |
+| `phase optional-apps` | **Real (Milestone 5, nonfatal).** Optional profile-gated app installer that runs last. |
 | `collect-logs` | **Real**. Bundles `/var/log/clouddeploy/`, `state.json`, `systemctl status` of relevant units, `journalctl` snippets, `dmesg` NVIDIA lines, `dpkg.log` / `apt/history.log` tails into `/tmp/clouddeploy-logs-<ts>.tar.gz`. Secret redaction applies to env. |
 
 `internal/` packages grouped by readiness:
@@ -89,7 +94,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `internal/nvidia` | **Real**. Selector + classification + dirty-state cleanup planner + post-install validators. |
 | `internal/cuda` | **Real**. Policy + RetryDecider + package-candidate discovery. |
 | `internal/config` | **Real**. Profile + GPU + validation. |
-| `internal/phase` | **Real for base-packages / nvidia-driver / cuda / edid / headless-user / desktop-packages / desktop-runtime / kwin-patch / kwin-session / drm-display-validate.** |
+| `internal/phase` | **Real for the Milestone 5 apply chain through `optional_apps`.** |
 | `internal/reboot` | **Real (minimal).** Continuation systemd unit + Install/Schedule/Disable. |
 | `internal/ubuntu` | **Real.** `/etc/os-release` reader + supported-version gate. |
 | `internal/edid` | **Real (helper-script wrapper).** Calls `helpers/write-edids.py` + drops EDID + edits grub. |
@@ -99,7 +104,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `internal/systemd` | Stub. Milestone 4 (runtime services beyond the continuation unit). |
 | `internal/validate` | Stub. Milestone 4. |
 
-## 2. Phases still missing from a full hdr-4k120 deploy
+## 2. Fresh-VM phases now in the Milestone 5 attempt
 
 | Phase | Owner | Notes |
 | --- | --- | --- |
@@ -109,14 +114,14 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `cuda` | **v3 real** | mode=none default. |
 | `edid` | **v3 real (opt-in)** | Reboot-aware. |
 | `kwin_patch` | **v3 real** | Validates patch, builds/install patched KWin source packages, holds installed packages, writes marker. |
-| `sunshine_build` | Milestone 4 | Pin commit `464bccf1`, dual-install, setcap, config. |
-| `sunshine_config` | Milestone 4 | sunshine.conf without invalid keys + CSRF allowlist. |
-| `systemd_units` | Milestone 4 | kwin-realvt + plasma-shell-realvt + sunshine-headless (with `SUNSHINE_FORCE_AV1_HDR10=1` + `SUNSHINE_SYNTHESIZE_HDR10_METADATA=1`). |
-| `service_start` | Milestone 4 | Enable + start the unit chain. |
-| `hdr_drm_validation` | Milestone 4 | `scripts/validate-hdr-drm-state.py` wrapped. |
-| `hdr_stream_validation` | Milestone 4 | Journal grep for `Sent HDR mode control packet to Moonlight: enabled=1`. |
-| `tailscale_setup` | Milestone 4 | `tailscale up` with `TAILSCALE_AUTHKEY` from env or root-only env-file. |
-| `moonlight_pairing` | Milestone 4 | Sunshine PIN-pairing helper + CSRF allowlist verification. |
+| `sunshine_build` | **v3 real (Milestone 5)** | Pin commit `464bccf1`, build fork, install `/usr/local/bin/sunshine-clouddeploy`, set caps, install assets. |
+| `sunshine_config` | **v3 real (Milestone 5)** | KMS/NVENC config without known-invalid keys + CSRF allowlist. |
+| `tailscale` | **v3 real (Milestone 5, optional)** | `tailscale up` only when `TAILSCALE_AUTHKEY` is present. |
+| `pipewire_audio` | **v3 real (Milestone 5)** | PipeWire/WirePlumber install + user-session audio visibility check. |
+| `streaming_services` | **v3 real (Milestone 5)** | direct `kwin-realvt.service` + `sunshine-headless.service` + reset/watchdog helpers. |
+| `stream_validate` | **v3 real (Milestone 5)** | Sunshine active + `/serverinfo` reachable; KMS/NVENC journal markers become done after a Moonlight stream attempt. |
+| `optional_apps` | **v3 real (Milestone 5, nonfatal)** | Profile-gated, last phase. |
+| `moonlight_pairing` | Remaining manual/helper gap | No state-file pairing injection; PIN/API helper still separate from the apply chain. |
 
 ## 3. Remaining blockers to no-contact deploy
 
@@ -143,17 +148,16 @@ In rough order of how the deploy hits them:
    the operator's network and the deploy "succeeds" but no client
    can actually connect.
 
-## 4. Exit codes (Milestone 3.5)
+## 4. Exit codes
 
 `clouddeployctl apply` and `resume` now use distinct exit codes so
 `bootstrap.sh` and external CI / automation can branch correctly:
 
 | Code | Meaning |
 | --- | --- |
-| `0` | All implemented phases done; no reboot pending. (Not "full deploy" — see the partial-apply banner.) |
+| `0` | All phases in the selected profile completed or intentionally skipped; no reboot pending. |
 | `1` | Real failure. Apply aborted; state records `failed_fatal` / `LastError` for the failing phase. |
 | `2` | Reboot scheduled or required. State has `RebootNeeded=true` and `ResumeTarget=<phase>`. Continuation service is enabled. With `--auto-reboot` / `profile.deploy.auto_reboot: true`, `systemctl reboot` has been invoked. |
-| `10` | Partial-apply banner printed: implemented phases completed cleanly, but Sunshine/services/HDR-validation phases are not yet implemented. The deploy is intentionally incomplete. |
 | `64` | Refused to run: unsupported Ubuntu version (use `--allow-unsupported` to override). |
 
 `bootstrap.sh` reads the exit code and prints a one-line summary so
@@ -255,13 +259,16 @@ Expected behaviour:
    updates initramfs + grub, sets RebootNeeded → apply exits 2 a
    third time. After reboot, resume confirms EDID is reflected on
    `DP-1` and disables the continuation unit.
-9. Final exit code is **10** (partial-apply banner) — KWin / Sunshine
-   / Tailscale / PipeWire / services / HDR validation are not
-   implemented; **this is NOT a full streaming deploy**. For Moonlight
-   `AV1 10-bit HDR` today, use the v2 entrypoint.
+9. Milestone 5 continues into patched KWin real-VT validation,
+   Sunshine fork build/config, optional Tailscale, PipeWire, runtime
+   services, and stream validation. `stream_validate` may report
+   `pending_moonlight_connect` until a Moonlight client attempt creates
+   the KMS/NVENC journal markers.
 
-After the rest of Milestone 4 lands, the goal is final exit code **0**
-with Moonlight overlay reading `AV1 10-bit HDR`.
+The next paid fresh-VM run is expected to prove whether this Milestone 5
+pipeline can reach Moonlight overlay `AV1 10-bit HDR` without manual
+reboot/resume steps. Until that run passes, v2 remains the production
+fallback.
 
 If you need to send the run somewhere for inspection:
 

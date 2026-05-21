@@ -135,11 +135,16 @@ phase base-packages    # implemented
 phase nvidia-driver    # implemented
 phase cuda             # implemented
 phase edid             # implemented
-                       # ↓ remaining P1 phases not yet ported
 phase kwin-patch       # implemented
-phase sunshine-build   # NOT IMPLEMENTED
-phase services         # NOT IMPLEMENTED
-phase validate         # NOT IMPLEMENTED
+phase kwin-session      # implemented, direct KWin real-VT
+phase drm-display-validate # implemented, HDR/WCG hard gate for HDR profiles
+phase sunshine-build    # implemented, pinned fork build/install
+phase sunshine-config   # implemented
+phase tailscale         # implemented, optional by auth key
+phase pipewire-audio    # implemented
+phase streaming-services # implemented, kwin-realvt + sunshine-headless
+phase stream-validate   # implemented, waits for Moonlight KMS/NVENC markers
+phase optional-apps     # implemented, nonfatal and last
 ```
 
 ## Acceptance criteria for "v3 = v2"
@@ -154,8 +159,9 @@ v3 cannot claim parity until:
 4. v2 stays untouched and remains a 1-line fallback for the cases
    v3 hasn't covered yet.
 
-This commit closes the **kwin-patch** row: v3 can now validate,
-build/install, hold, and marker the CloudDeploy private-HDR KWin patch
-before launching the real-VT session. Sunshine build, runtime services,
-PipeWire/Tailscale, and HDR/stream validation remain open. See
-[V3-ROADMAP.md](V3-ROADMAP.md) for the milestone-by-milestone plan.
+This commit moves v3 into a Milestone 5 fresh-VM attempt: patched KWin,
+direct KWin real-VT, Sunshine fork build/config, Tailscale, PipeWire,
+runtime services, and stream substrate validation are all in the apply
+chain. v2 remains the production fallback until a paid fresh-VM run
+proves the full Moonlight path end-to-end. See [V3-ROADMAP.md](V3-ROADMAP.md)
+for the milestone-by-milestone plan.

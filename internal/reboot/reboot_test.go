@@ -21,7 +21,7 @@ func TestRenderUnit_ContainsKeys(t *testing.T) {
 		"Type=oneshot",
 		"TimeoutStartSec=infinity",
 		"EnvironmentFile=-/etc/clouddeploy/continue.env",
-		"ExecStart=/usr/local/bin/clouddeployctl resume --profile hdr-4k120 --state-path /var/lib/clouddeploy/state.json",
+		"ExecStart=/usr/local/bin/clouddeployctl resume --profile hdr-4k120 --config-dir /opt/clouddeploy-mover/config --state-path /var/lib/clouddeploy/state.json",
 		"WantedBy=multi-user.target",
 	}
 	for _, w := range want {
@@ -43,6 +43,9 @@ func TestRenderUnit_HonorsCustomPaths(t *testing.T) {
 	if !strings.Contains(body, "--profile sdr-safe") {
 		t.Errorf("custom profile not used:\n%s", body)
 	}
+	if !strings.Contains(body, "--config-dir /opt/clouddeploy-mover/config") {
+		t.Errorf("default config-dir not rendered:\n%s", body)
+	}
 }
 
 func TestRenderEnvFile(t *testing.T) {
@@ -52,6 +55,9 @@ func TestRenderEnvFile(t *testing.T) {
 	}
 	if !strings.Contains(body, "CLOUDDEPLOY_STATE_PATH=/var/lib/clouddeploy/state.json") {
 		t.Errorf("env file missing state-path: %s", body)
+	}
+	if !strings.Contains(body, "CLOUDDEPLOY_CONFIG_DIR=/opt/clouddeploy-mover/config") {
+		t.Errorf("env file missing config-dir: %s", body)
 	}
 }
 

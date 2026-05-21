@@ -393,7 +393,12 @@ clouddeployctl phase nvidia-driver
 clouddeployctl phase cuda
 clouddeployctl phase kwin-patch
 clouddeployctl phase sunshine-build
-clouddeployctl phase services
+clouddeployctl phase sunshine-config
+clouddeployctl phase tailscale
+clouddeployctl phase pipewire-audio
+clouddeployctl phase streaming-services
+clouddeployctl phase stream-validate
+clouddeployctl phase optional-apps
 clouddeployctl state show
 clouddeployctl state reset --phase nvidia_driver  # opt-in destructive
 ```

@@ -53,6 +53,8 @@ const DefaultEnvFile = "/etc/clouddeploy/continue.env"
 // installs the binary here.
 const DefaultBinary = "/usr/local/bin/clouddeployctl"
 
+const DefaultConfigDir = "/opt/clouddeploy-mover/config"
+
 // Service is the configurable surface. Construct one per CLI
 // invocation; safe to leave fields zero-valued for the defaults.
 type Service struct {
@@ -65,8 +67,11 @@ type Service struct {
 
 // Args is the data the unit template consumes.
 type Args struct {
-	Profile   string
-	StatePath string
+	Profile    string
+	StatePath  string
+	ConfigDir  string
+	AutoReboot bool
+	Unattended bool
 }
 
 const unitTemplate = `[Unit]
@@ -79,9 +84,10 @@ ConditionPathExists={{ .StatePath }}
 Type=oneshot
 RemainAfterExit=no
 TimeoutStartSec=infinity
+Restart=no
 EnvironmentFile=-{{ .EnvFile }}
 ExecStartPre=/bin/mkdir -p /var/log/clouddeploy
-ExecStart={{ .Binary }} resume --profile {{ .Profile }} --state-path {{ .StatePath }}
+ExecStart={{ .Binary }} resume --profile {{ .Profile }} --config-dir {{ .ConfigDir }} --state-path {{ .StatePath }}{{ .AutoRebootFlag }}{{ .UnattendedFlag }}
 # Append to a dedicated host log so the operator can grep without
 # going through journalctl. systemd 240+ supports append: directly;
 # every Ubuntu we target ships 245+.
@@ -169,6 +175,9 @@ func RenderUnit(args Args, envFile, binary string) string {
 	if binary == "" {
 		binary = DefaultBinary
 	}
+	if args.ConfigDir == "" {
+		args.ConfigDir = DefaultConfigDir
+	}
 	// Manual substitution; avoids pulling in text/template just for
 	// 5 placeholders.
 	out := unitTemplate
@@ -176,13 +185,27 @@ func RenderUnit(args Args, envFile, binary string) string {
 	out = strings.ReplaceAll(out, "{{ .EnvFile }}", envFile)
 	out = strings.ReplaceAll(out, "{{ .Binary }}", binary)
 	out = strings.ReplaceAll(out, "{{ .Profile }}", args.Profile)
+	out = strings.ReplaceAll(out, "{{ .ConfigDir }}", args.ConfigDir)
+	autoFlag := ""
+	if args.AutoReboot {
+		autoFlag = " --auto-reboot"
+	}
+	unattendedFlag := ""
+	if args.Unattended {
+		unattendedFlag = " --unattended"
+	}
+	out = strings.ReplaceAll(out, "{{ .AutoRebootFlag }}", autoFlag)
+	out = strings.ReplaceAll(out, "{{ .UnattendedFlag }}", unattendedFlag)
 	return out
 }
 
 // RenderEnvFile returns the env-file content. Exported for tests.
 func RenderEnvFile(args Args) string {
-	return fmt.Sprintf("CLOUDDEPLOY_PROFILE=%s\nCLOUDDEPLOY_STATE_PATH=%s\n",
-		args.Profile, args.StatePath)
+	if args.ConfigDir == "" {
+		args.ConfigDir = DefaultConfigDir
+	}
+	return fmt.Sprintf("CLOUDDEPLOY_PROFILE=%s\nCLOUDDEPLOY_STATE_PATH=%s\nCLOUDDEPLOY_CONFIG_DIR=%s\nCLOUDDEPLOY_AUTO_REBOOT=%t\nCLOUDDEPLOY_UNATTENDED=%t\n",
+		args.Profile, args.StatePath, args.ConfigDir, args.AutoReboot, args.Unattended)
 }
 
 func (s *Service) writeUnit(args Args) error {

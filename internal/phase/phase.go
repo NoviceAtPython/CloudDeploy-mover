@@ -43,17 +43,20 @@ type Phase interface {
 
 // Deps is what every phase needs.
 type Deps struct {
-	Runner  *runner.Runner
-	APT     *apt.Transaction
-	State   *state.State
-	Profile *config.Profile
-	Logger  *slog.Logger
-	DryRun  bool
+	Runner     *runner.Runner
+	APT        *apt.Transaction
+	State      *state.State
+	Profile    *config.Profile
+	Logger     *slog.Logger
+	DryRun     bool
+	AutoReboot bool
+	Unattended bool
 
 	// StatePath is the on-disk location of state.json so phases can
 	// persist after each step rather than waiting for apply to save
 	// at the end.
 	StatePath string
+	ConfigDir string
 }
 
 // PersistState writes Deps.State to Deps.StatePath. Safe to call
