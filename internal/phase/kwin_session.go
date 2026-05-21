@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	kwinpkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/kwin"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 	statepkg "github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
@@ -493,12 +492,30 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	_ = deps.PersistState()
 
 	desk := deps.Profile.EffectiveDesktop()
+	// Resolve the DRM card BEFORE rendering the template. The
+	// profile's defaulted /dev/dri/card1 must not bypass the resolver
+	// just because EffectiveDesktop filled it in. We thread the raw
+	// `deps.Profile.Desktop.KwinDRMDevice` (pre-defaulting) through
+	// as an explicitness signal so the resolver can tell "operator
+	// explicitly pinned this" apart from "defaulted to card1".
+	drmRequested := desk.KwinDRMDevice
+	drmExplicit := false
+	if deps.Profile != nil {
+		drmExplicit = strings.TrimSpace(deps.Profile.Desktop.KwinDRMDevice) != ""
+	}
+	resolvedDRM, drmReason := p.resolveDRMDevice(drmRequested, drmExplicit, strings.TrimSpace(deps.Profile.Display.ForcedConnector))
 	details := map[string]any{
-		"user":                desk.User,
-		"backend":             desk.SessionBackend,
-		"compositor_mode":     desk.CompositorMode,
-		"vt":                  desk.KwinVT,
-		"selected_drm_device": desk.KwinDRMDevice,
+		"user":                      desk.User,
+		"backend":                   desk.SessionBackend,
+		"compositor_mode":           desk.CompositorMode,
+		"vt":                        desk.KwinVT,
+		"kwin_drm_device_requested": drmRequested,
+		"kwin_drm_device_explicit":  drmExplicit,
+		"kwin_drm_device_resolved":  resolvedDRM,
+		"kwin_drm_device_reason":    drmReason,
+		// `selected_drm_device` mirrors the resolved value so older
+		// dashboards / docs that read this key keep working.
+		"selected_drm_device": resolvedDRM,
 	}
 
 	uid := uidFromState(deps)
@@ -556,12 +573,18 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		KwinVT:         desk.KwinVT,
 		Description:    choice.BannerName,
 		CompositorMode: desk.CompositorMode,
-		KwinDRMDevice:  desk.KwinDRMDevice,
-		ExecStart:      execStartFor(choice, runtimeBin),
-		PrivateHDREnv:  privateHDREnv,
-		Connector:      connector,
-		Resolution:     resolution,
-		Refresh:        refresh,
+		// Rendered unit ALWAYS uses the resolved DRM device, not the
+		// raw profile field. Live VM regression: a host where
+		// /dev/dri/card1 didn't expose DP-1 got the default card1
+		// path baked into the unit and KWin then died with
+		// "No suitable DRM devices have been found". The resolver
+		// picks the card whose DP-1 sysfs node actually exists.
+		KwinDRMDevice: resolvedDRM,
+		ExecStart:     execStartFor(choice, runtimeBin),
+		PrivateHDREnv: privateHDREnv,
+		Connector:     connector,
+		Resolution:    resolution,
+		Refresh:       refresh,
 	}
 	unitBody := in.apply(tplBody)
 
@@ -915,9 +938,38 @@ func scanFatalSignatures(journalText string) []string {
 	return hits
 }
 
-func (p KWinSession) resolveDRMDevice(requested, forcedConnector string) (string, string) {
-	if requested != "" && requested != config.DefaultKwinDRMDevice {
-		return requested, "explicitly requested"
+// resolveDRMDevice picks the /dev/dri/card* node the compositor
+// should bind to.
+//
+// Inputs:
+//
+//   - requested:         what the profile (after EffectiveDesktop's
+//     defaulting) would render into the unit.
+//   - requestedExplicit: true only when the operator's YAML had a
+//     non-empty `desktop.kwin_drm_device` (the
+//     Run method threads the raw profile field
+//     through to distinguish "explicit card1"
+//     from "defaulted card1").
+//   - forcedConnector:   profile.display.forced_connector (e.g. DP-1).
+//
+// Resolution order:
+//
+//  1. If the operator explicitly pinned a path, honor it verbatim.
+//     The whole point of `desktop.kwin_drm_device:` is operator
+//     override; the resolver MUST NOT second-guess it.
+//  2. Otherwise, walk /sys/class/drm/card*: prefer the card whose
+//     forced_connector connector node exists.
+//  3. Otherwise, prefer the card whose device/vendor is NVIDIA
+//     (0x10de) - this is the v2-parity bias on hosts that expose a
+//     second non-NVIDIA card (e.g. NVIDIA + onboard AST).
+//  4. Otherwise, /dev/dri/card1 if it exists, else /dev/dri/card0.
+//
+// Returns (path, reason) so the phase can log + record both. The
+// reason is human-readable and shows up in state.Details under
+// kwin_drm_device_reason for `state show` / `doctor kwin`.
+func (p KWinSession) resolveDRMDevice(requested string, requestedExplicit bool, forcedConnector string) (string, string) {
+	if requestedExplicit && strings.TrimSpace(requested) != "" {
+		return requested, "explicitly requested via profile.desktop.kwin_drm_device"
 	}
 
 	sysfs := p.SysfsRoot

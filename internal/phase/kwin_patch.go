@@ -82,6 +82,25 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 	deps.State.MarkRunning(KWinPatchName)
 	_ = deps.PersistState()
 
+	// Packaged-mode short-circuit BEFORE any patch-file checks.
+	//
+	// Live-VM regression: a profile with `kwin.source_mode=packaged`
+	// + `allow_packaged_fallback=true` + `require_patch=false` (i.e.
+	// "use stock KWin, don't bother with the HDR patch on this box")
+	// was failing on patch-file-missing before ever reaching this
+	// gate, which is the opposite of what the operator asked for.
+	//
+	// Order is now:
+	//   1. source_mode=packaged -> patchFailure() (the helper converts
+	//      to MarkSkipped("packaged fallback allowed") when both
+	//      `allow_packaged_fallback=true` AND `require_patch=false`,
+	//      so the phase succeeds-by-skip in the safe case).
+	//   2. Otherwise, stat + hash the patch file as before.
+	if strings.EqualFold(cfg.SourceMode, "packaged") {
+		err := fmt.Errorf("kwin.source_mode=packaged cannot satisfy kwin.patched_hdr=true with require_patch=%v", cfg.RequirePatchEnabled())
+		return p.patchFailure(deps, details, err, "packaged KWin requested", cfg)
+	}
+
 	patchPath := resolveKWinPatchPath(cfg.Patch)
 	details["patch_path"] = patchPath
 	if _, err := os.Stat(patchPath); err != nil {
@@ -99,10 +118,6 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 		deps.State.MarkDone(KWinPatchName, details)
 		_ = deps.PersistState()
 		return nil
-	}
-	if strings.EqualFold(cfg.SourceMode, "packaged") {
-		err := fmt.Errorf("kwin.source_mode=packaged cannot satisfy kwin.patched_hdr=true with require_patch=%v", cfg.RequirePatchEnabled())
-		return p.patchFailure(deps, details, err, "packaged KWin requested", cfg)
 	}
 
 	debSrc, err := p.ensureDebSrcEnabled(ctx, deps)
