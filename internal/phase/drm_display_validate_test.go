@@ -69,6 +69,60 @@ func TestParseKScreenDoctor_LivePlasma645Modes(t *testing.T) {
 	}
 }
 
+// TestParseKScreenDoctor_StripsANSIEscapes is the live-VM regression
+// test. Plasma 6.4.x kscreen-doctor emits ANSI color escapes even on
+// a pipe; the parser must strip them before matching. With the bug
+// the test would fail with `saw []` even though "DP-1" + "HDR:
+// enabled" + "Wide Color Gamut: enabled" + 3840x2160@120 are all
+// present.
+func TestParseKScreenDoctor_StripsANSIEscapes(t *testing.T) {
+	raw := "\x1b[01;34mOutput:\x1b[0;0m 1 DP-1 hdmi enabled connected priority 1 1\n" +
+		"        Modes: \x1b[01;33m1:3840x2160@60!\x1b[0;0m \x1b[01;33m2:\x1b[01;32m3840x2160@120*\x1b[0;0m\n" +
+		"        \x1b[01;33mHDR:\x1b[0;0m enabled\n" +
+		"        \x1b[01;33mWide Color Gamut:\x1b[0;0m enabled\n"
+	out := ParseKScreenDoctor(raw)
+	if len(out.Connectors) != 1 {
+		t.Fatalf("got %d connectors, want 1: %#v", len(out.Connectors), out.Connectors)
+	}
+	c := out.Connectors[0]
+	if c.Name != "DP-1" {
+		t.Errorf("connector name: got %q want DP-1", c.Name)
+	}
+	if !c.Enabled {
+		t.Errorf("enabled (from inline Output:-header token): got false, want true")
+	}
+	if !c.HasMode("3840x2160@120") {
+		t.Errorf("modes must contain 3840x2160@120; got %v", c.Modes)
+	}
+	if c.CurrentMode != "3840x2160@120" {
+		t.Errorf("current mode: got %q want 3840x2160@120 (the '*' marker)", c.CurrentMode)
+	}
+	if !c.HDR {
+		t.Errorf("HDR: got false, want true")
+	}
+	if !c.WCG {
+		t.Errorf("WCG: got false, want true")
+	}
+}
+
+func TestStripANSI_CommonEscapes(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"plain", "plain"},
+		{"\x1b[01;34mOutput:\x1b[0;0m DP-1", "Output: DP-1"},
+		{"\x1b[0mreset only", "reset only"},
+		{"a\x1b[31mbb\x1b[0mc", "abbc"},
+		{"", ""},
+		// Sanity: no ESC in input => StripANSI is a no-op fast path.
+		{"no escapes at all", "no escapes at all"},
+	}
+	for _, c := range cases {
+		got := StripANSI(c.in)
+		if got != c.want {
+			t.Errorf("StripANSI(%q) = %q want %q", c.in, got, c.want)
+		}
+	}
+}
+
 func TestParseKScreenDoctor_MultipleConnectors(t *testing.T) {
 	out := ParseKScreenDoctor(`Output: 1 DP-1
         enabled

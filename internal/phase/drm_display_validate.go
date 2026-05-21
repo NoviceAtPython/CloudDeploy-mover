@@ -66,8 +66,15 @@ func (c KScreenConnector) HasMode(mode string) bool {
 // kscreen-doctor prints. The id is ignored.
 var kscreenOutputRE = regexp.MustCompile(`^Output:\s+\S+\s+(\S+)`)
 
-// kscreenEnabledRE matches "        enabled" / "        disabled".
+// kscreenEnabledRE matches "        enabled" / "        disabled" on
+// its own line (older kscreen-doctor output shape).
 var kscreenEnabledRE = regexp.MustCompile(`^\s*(enabled|disabled)\s*$`)
+
+// kscreenHeaderEnabledRE matches the inline "enabled" / "disabled"
+// token on the live-VM "Output: 1 DP-1 hdmi enabled connected ..."
+// header line that Plasma 6.4.x kscreen-doctor emits. The parser
+// inspects the rest of the same line when it sees an Output: header.
+var kscreenHeaderEnabledRE = regexp.MustCompile(`\b(enabled|disabled)\b`)
 
 // kscreenCurrentModeRE matches the "        Modes: 1!  3840x2160@120, ..." line.
 // The leading "!" marks the currently active mode in some
@@ -76,12 +83,36 @@ var kscreenModesLineRE = regexp.MustCompile(`^\s*Modes:\s+(.*)$`)
 var kscreenHDRRE = regexp.MustCompile(`^\s*HDR:\s+(enabled|disabled)\s*$`)
 var kscreenWCGRE = regexp.MustCompile(`^\s*Wide Color Gamut:\s+(enabled|disabled)\s*$`)
 
+// ansiEscapeRE matches CSI sequences (ESC [ ... letter) and the
+// shorter ESC ( ... single-char sequences kscreen-doctor emits when
+// it thinks the terminal supports color. Plasma 6.4.x emits these
+// even when stdout is a pipe, so the parser strips them before any
+// regex match runs. Live VM evidence:
+//
+//	"\x1b[01;34mOutput:\x1b[0;0m 1 DP-1 ..."
+//	"\x1b[01;34mModes:\x1b[0;0m 1:3840x2160@60! 2:\x1b[01;32m3840x2160@120*\x1b[0;0m"
+//	"\x1b[01;33mHDR:\x1b[0;0m enabled"
+//	"\x1b[01;33mWide Color Gamut:\x1b[0;0m enabled"
+var ansiEscapeRE = regexp.MustCompile(`\x1b\[[0-9;?]*[ -/]*[@-~]`)
+
+// StripANSI removes ANSI CSI sequences from `text`. Exported so
+// other phases (doctor kwin, force-kwin-mode helper diagnostics)
+// can sanitize captured tool output the same way.
+func StripANSI(text string) string {
+	if !strings.Contains(text, "\x1b") {
+		return text
+	}
+	return ansiEscapeRE.ReplaceAllString(text, "")
+}
+
 // ParseKScreenDoctor parses the textual output of `kscreen-doctor -o`.
 // The parser is intentionally permissive: kscreen-doctor's output
 // shape differs across Plasma 5/6 minor versions and we want the
 // phase to extract what it can rather than fail-hard on a layout
-// change.
+// change. ANSI color escapes (Plasma 6.4.x emits them even on a
+// pipe) are stripped before matching.
 func ParseKScreenDoctor(text string) KScreenDoctorOutput {
+	text = StripANSI(text)
 	var out KScreenDoctorOutput
 	var cur *KScreenConnector
 	flush := func() {
@@ -95,6 +126,16 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 		if m := kscreenOutputRE.FindStringSubmatch(line); m != nil {
 			flush()
 			cur = &KScreenConnector{Name: m[1]}
+			// Live VM (Plasma 6.4.x): the Output: header line also
+			// includes the connection state inline, e.g.
+			//   "Output: 1 DP-1 hdmi enabled connected priority 1 1"
+			// Parse it here so connectors lacking the standalone
+			// "        enabled" / "        disabled" successor line
+			// still have the right value. The standalone-line check
+			// below still wins if it ever runs (safer signal).
+			if hm := kscreenHeaderEnabledRE.FindStringSubmatch(line); hm != nil {
+				cur.Enabled = hm[1] == "enabled"
+			}
 			continue
 		}
 		if cur == nil {
@@ -312,11 +353,35 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	parsed := ParseKScreenDoctor(rawOut)
 	conn := parsed.FindConnector(connector)
 	if conn == nil {
-		err := fmt.Errorf("kscreen-doctor reports no connector named %q (saw %v)", connector, connectorNames(parsed))
-		details["err"] = err.Error()
+		// Live VM (2026-05-21): the parser would report
+		// `saw []` even when the raw kscreen output clearly
+		// contained DP-1 + HDR + WCG -- the culprit was ANSI
+		// color escapes. The parser now strips them, but if
+		// we ever land in a new parser-mismatch regression
+		// (newer kscreen output format), call it out as a
+		// PARSER bug rather than an absent-connector bug so
+		// the operator doesn't go looking for a missing
+		// monitor that's actually present.
+		stripped := StripANSI(rawOut)
+		mentionsConnector := strings.Contains(stripped, connector)
 		details["kscreen_connector_names"] = connectorNames(parsed)
 		details["kscreen_raw_excerpt"] = lastLines(rawOut, 20)
-		deps.State.MarkFailed(DRMDisplayValidateName, "connector missing in kscreen-doctor output", err, true)
+		details["kscreen_stripped_excerpt"] = lastLines(stripped, 20)
+		details["kscreen_raw_mentions_connector"] = mentionsConnector
+		var err error
+		if mentionsConnector {
+			err = fmt.Errorf(
+				"kscreen-doctor output contained %q but parser failed; possible format/color issue. "+
+					"Raw bytes=%d. supportInformation already confirmed DRM + connector earlier, "+
+					"so this is a parser regression, not an absent-monitor regression. "+
+					"Capture: sudo -u %s env XDG_RUNTIME_DIR=/run/user/%s WAYLAND_DISPLAY=wayland-0 NO_COLOR=1 TERM=dumb kscreen-doctor -o",
+				connector, len(rawOut), desk.User, uid)
+			deps.State.MarkFailed(DRMDisplayValidateName, "kscreen-doctor parser failed despite connector in raw output", err, true)
+		} else {
+			err = fmt.Errorf("kscreen-doctor reports no connector named %q (saw %v)", connector, connectorNames(parsed))
+			deps.State.MarkFailed(DRMDisplayValidateName, "connector missing in kscreen-doctor output", err, true)
+		}
+		details["err"] = err.Error()
 		deps.State.Get(DRMDisplayValidateName).Details = details
 		_ = deps.PersistState()
 		return fmt.Errorf("phase drm-display-validate: %w", err)
@@ -437,6 +502,17 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 			"XDG_SESSION_TYPE=wayland",
 			"XDG_SESSION_DESKTOP=KDE",
 			"KDE_FULL_SESSION=true",
+			// Belt-and-suspenders color disabling so kscreen-doctor
+			// doesn't ship ANSI escapes the parser then has to
+			// strip. NO_COLOR is the cross-tool standard
+			// (https://no-color.org); TERM=dumb covers tools that
+			// only check terminfo; CLICOLOR=0 covers the BSD/macOS
+			// convention some upstream code paths still honor.
+			// The parser also calls StripANSI() as a safety net,
+			// so missing one of these is still recoverable.
+			"NO_COLOR=1",
+			"TERM=dumb",
+			"CLICOLOR=0",
 			kscreen.Path, "-o",
 		},
 		Sudo:    true,
