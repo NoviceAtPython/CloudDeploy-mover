@@ -3,6 +3,7 @@ package phase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -350,16 +351,25 @@ func TestUbuntuUpgrade_BadDirectPolicy_FailsFatal(t *testing.T) {
 // helper-level tests using real temp dirs.
 // -----------------------------------------------------------------------------
 
-func TestDisableThirdPartyAptSources_MovesNvidiaAndCuda(t *testing.T) {
+// TestQuarantineNonOfficialAptSources_MovesAllThirdParty exercises
+// the broader allowlist sweep that landed after the live VM 2026-05-22
+// jammy -> noble hop left docker.list + tailscale.list active. Every
+// non-Ubuntu-archive file should move aside; ubuntu.sources +
+// ubuntu-archive-only files stay put.
+func TestQuarantineNonOfficialAptSources_MovesAllThirdParty(t *testing.T) {
 	dir := t.TempDir()
 	disabled := filepath.Join(dir, "disabled")
 
 	files := map[string]string{
-		"ubuntu.sources":           "URIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\n",
+		"ubuntu.sources":           "URIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\nComponents: main universe\n",
 		"cuda-keyring.list":        "deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64 /\n",
-		"graphics-drivers.list":    "deb http://ppa.launchpadcontent.net/graphics-drivers/ppa/ubuntu noble main\n",
-		"nvidia-container.sources": "URIs: https://nvidia.github.io/libnvidia-container/stable/ubuntu24.04/$(ARCH)\n",
-		"unrelated.list":           "deb http://example.com/repo noble main\n",
+		"graphics-drivers.list":    "deb http://ppa.launchpadcontent.net/graphics-drivers/ppa/ubuntu jammy main\n",
+		"nvidia-container.sources": "URIs: https://nvidia.github.io/libnvidia-container/stable/ubuntu24.04/$(ARCH)\nSuites: /\n",
+		// Live VM regression: docker.list + tailscale.list were left
+		// active after the codename rewrite. New sweep must move them.
+		"docker.list":           "deb [arch=amd64] https://download.docker.com/linux/ubuntu jammy stable\n",
+		"tailscale.list":        "deb [signed-by=/usr/share/keyrings/tailscale-archive-keyring.gpg] https://pkgs.tailscale.com/stable/ubuntu jammy main\n",
+		"my-ubuntu-mirror.list": "# operator's local mirror still hits archive.ubuntu.com\ndeb http://us.archive.ubuntu.com/ubuntu noble main universe\n",
 	}
 	for name, body := range files {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
@@ -368,26 +378,272 @@ func TestDisableThirdPartyAptSources_MovesNvidiaAndCuda(t *testing.T) {
 	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
-	if err := disableThirdPartyAptSources(dir, disabled, log); err != nil {
-		t.Fatalf("disableThirdPartyAptSources: %v", err)
+	moved, kept, err := quarantineNonOfficialAptSources(dir, disabled, log)
+	if err != nil {
+		t.Fatalf("quarantineNonOfficialAptSources: %v", err)
 	}
 
-	// ubuntu.sources MUST remain.
-	if _, err := os.Stat(filepath.Join(dir, "ubuntu.sources")); err != nil {
-		t.Errorf("ubuntu.sources should still be in place: %v", err)
+	// ubuntu.sources + the ubuntu-archive mirror list MUST remain.
+	for _, name := range []string{"ubuntu.sources", "my-ubuntu-mirror.list"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Errorf("%s should still be in place (ubuntu archive); err=%v", name, err)
+		}
 	}
-	// unrelated.list MUST remain.
-	if _, err := os.Stat(filepath.Join(dir, "unrelated.list")); err != nil {
-		t.Errorf("unrelated.list should still be in place: %v", err)
+	if len(kept) != 2 {
+		t.Errorf("expected 2 kept (ubuntu.sources + my-ubuntu-mirror.list); got %v", kept)
 	}
-	// NVIDIA / CUDA / graphics-drivers MUST have moved to disabled/.
-	for _, name := range []string{"cuda-keyring.list", "graphics-drivers.list", "nvidia-container.sources"} {
+	// All third-party sources MUST have moved to disabled/.
+	wantMoved := []string{
+		"cuda-keyring.list",
+		"graphics-drivers.list",
+		"nvidia-container.sources",
+		"docker.list",
+		"tailscale.list",
+	}
+	for _, name := range wantMoved {
 		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Errorf("%s should have been moved; stat err=%v", name, err)
+			t.Errorf("%s should have moved out of sources.list.d; stat err=%v", name, err)
 		}
 		if _, err := os.Stat(filepath.Join(disabled, name)); err != nil {
-			t.Errorf("%s should be in disabled/: %v", name, err)
+			t.Errorf("%s should be in disabled/; err=%v", name, err)
 		}
+	}
+	if len(moved) != len(wantMoved) {
+		t.Errorf("moved count: got %d (%v) want %d (%v)", len(moved), moved, len(wantMoved), wantMoved)
+	}
+}
+
+func TestQuarantineNonOfficialAptSources_LeavesDeb822UbuntuMirrorAlone(t *testing.T) {
+	dir := t.TempDir()
+	disabled := filepath.Join(dir, "disabled")
+	body := "Types: deb deb-src\nURIs: http://us.archive.ubuntu.com/ubuntu\nSuites: noble noble-updates noble-security\nComponents: main universe\n"
+	if err := os.WriteFile(filepath.Join(dir, "operator-mirror.sources"), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved, kept, err := quarantineNonOfficialAptSources(dir, disabled, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatalf("quarantineNonOfficialAptSources: %v", err)
+	}
+	if len(moved) != 0 {
+		t.Fatalf("operator's ubuntu-archive deb822 mirror should have stayed in place; got moved=%v", moved)
+	}
+	if len(kept) != 1 {
+		t.Fatalf("kept: got %v want 1 entry", kept)
+	}
+}
+
+func TestQuarantineNonOfficialAptSources_PostHopGrepFindsNoJammy(t *testing.T) {
+	// Live VM acceptance: after jammy -> noble, `grep -R jammy
+	// /etc/apt/sources.list.d` should return nothing active.
+	dir := t.TempDir()
+	disabled := filepath.Join(dir, "disabled")
+	files := map[string]string{
+		"ubuntu.sources": "URIs: http://archive.ubuntu.com/ubuntu/\nSuites: noble\n",
+		"docker.list":    "deb https://download.docker.com/linux/ubuntu jammy stable\n",
+		"tailscale.list": "deb https://pkgs.tailscale.com/stable/ubuntu jammy main\n",
+		"graphics.list":  "deb http://ppa.launchpadcontent.net/graphics-drivers/ppa/ubuntu jammy main\n",
+	}
+	for n, b := range files {
+		if err := os.WriteFile(filepath.Join(dir, n), []byte(b), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := quarantineNonOfficialAptSources(dir, disabled, slog.New(slog.NewTextHandler(os.Stderr, nil))); err != nil {
+		t.Fatalf("quarantine: %v", err)
+	}
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		b, _ := os.ReadFile(filepath.Join(dir, e.Name()))
+		if strings.Contains(string(b), "jammy") {
+			t.Fatalf("post-quarantine file %s still contains \"jammy\":\n%s", e.Name(), b)
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// grub-pc preseed + apt term.log parser + dpkg recovery
+// -----------------------------------------------------------------------------
+
+func TestParseAptFailedPackages_GrubPCPostinstFailure(t *testing.T) {
+	// Live VM 2026-05-22 apt term.log excerpt: grub-pc died first,
+	// then grub-gfxpayload-lists, grub-efi-amd64-signed, shim-signed
+	// followed because they depend on grub-pc being configured.
+	log := `Setting up grub-pc (2.12-1ubuntu7.3) ...
+Replacing config file /etc/default/grub with new version
+grub-pc: Running grub-install ...
+dpkg: error processing package grub-pc (--configure):
+ installed grub-pc package post-installation script subprocess returned error exit status 1
+dpkg: dependency problems prevent configuration of grub-gfxpayload-lists:
+ grub-gfxpayload-lists depends on grub-pc; however:
+  Package grub-pc is not configured yet.
+dpkg: error processing package grub-gfxpayload-lists (--configure):
+ dependency problems - leaving unconfigured
+Errors were encountered while processing:
+ grub-pc
+ grub-gfxpayload-lists
+ grub-efi-amd64-signed
+ shim-signed
+E: Sub-process /usr/bin/dpkg returned an error code (1)
+`
+	got := parseAptFailedPackages(log)
+	want := []string{"grub-pc", "grub-gfxpayload-lists", "grub-efi-amd64-signed", "shim-signed"}
+	if len(got) != len(want) {
+		t.Fatalf("parseAptFailedPackages: got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("parseAptFailedPackages[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseAptFailedPackages_EmptyOnSuccess(t *testing.T) {
+	for _, in := range []string{
+		"",
+		"Setting up grub-pc (2.12) ...\nReading package lists... Done\n",
+	} {
+		if got := parseAptFailedPackages(in); len(got) != 0 {
+			t.Errorf("parseAptFailedPackages(%q): got %v want empty", in, got)
+		}
+	}
+}
+
+func TestMentionsGrubOrShim(t *testing.T) {
+	for _, c := range []struct {
+		in   []string
+		want bool
+	}{
+		{[]string{"grub-pc"}, true},
+		{[]string{"grub-gfxpayload-lists"}, true},
+		{[]string{"shim-signed"}, true},
+		{[]string{"grub2-common"}, true},
+		{[]string{"unrelated", "linux-image-generic"}, false},
+		{[]string{}, false},
+	} {
+		if got := mentionsGrubOrShim(c.in); got != c.want {
+			t.Errorf("mentionsGrubOrShim(%v): got %v want %v", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveBootDiskFromOutputs_ParentNameIsPrimaryPath(t *testing.T) {
+	// findmnt says / is on /dev/vda2; lsblk -no PKNAME says vda.
+	got := resolveBootDiskFromOutputs("/dev/vda2", "vda", "/dev/sda")
+	if got != "/dev/vda" {
+		t.Fatalf("got %q want /dev/vda (parent should win)", got)
+	}
+}
+
+func TestResolveBootDiskFromOutputs_AcceptsAbsolutePKName(t *testing.T) {
+	// Some lsblk builds prefix PKNAME with /dev/. Defensive.
+	got := resolveBootDiskFromOutputs("/dev/nvme0n1p1", "/dev/nvme0n1", "/dev/sda")
+	if got != "/dev/nvme0n1" {
+		t.Fatalf("got %q want /dev/nvme0n1", got)
+	}
+}
+
+func TestResolveBootDiskFromOutputs_FallsBackToFirstDiskWhenPKNameEmpty(t *testing.T) {
+	// dm-mapper / LVM root: PKNAME is empty; fallback wins.
+	got := resolveBootDiskFromOutputs("/dev/dm-0", "", "/dev/nvme0n1")
+	if got != "/dev/nvme0n1" {
+		t.Fatalf("got %q want /dev/nvme0n1 (fallback to first disk)", got)
+	}
+}
+
+func TestResolveBootDiskFromOutputs_AcceptsRootSourceWhenItIsADisk(t *testing.T) {
+	// Some cloud VMs mount / straight off /dev/vda with no
+	// partition table.
+	got := resolveBootDiskFromOutputs("/dev/vda", "", "")
+	if got != "/dev/vda" {
+		t.Fatalf("got %q want /dev/vda (root source itself is the disk)", got)
+	}
+}
+
+func TestResolveBootDiskFromOutputs_ReturnsEmptyOnTotalFailure(t *testing.T) {
+	got := resolveBootDiskFromOutputs("", "", "")
+	if got != "" {
+		t.Fatalf("got %q want empty string (nothing resolvable)", got)
+	}
+}
+
+func TestParseDpkgAuditOutput_LiveVMShape(t *testing.T) {
+	out := `The following packages are in a mess due to serious problems during
+installation.  They must be reinstalled for them (and any packages
+that depend on them) to function properly:
+  grub-efi-amd64-signed
+  grub-gfxpayload-lists
+  shim-signed
+The following packages have been unpacked but not yet configured.
+They must be configured using dpkg --configure or the configure
+menu option in dselect for them to work:
+  grub-pc
+`
+	got := parseDpkgAuditOutput(out)
+	want := []string{"grub-efi-amd64-signed", "grub-gfxpayload-lists", "shim-signed", "grub-pc"}
+	if len(got) != len(want) {
+		t.Fatalf("got %v want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("[%d]: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
+
+func TestParseDpkgAuditOutput_EmptyOnClean(t *testing.T) {
+	for _, in := range []string{
+		"",
+		"   ",
+		"No installed packages have problems. Everything OK.\n",
+	} {
+		if got := parseDpkgAuditOutput(in); len(got) != 0 {
+			t.Errorf("parseDpkgAuditOutput(%q): got %v want empty", in, got)
+		}
+	}
+}
+
+func TestBIOSEFIPurgeCandidateIsConservative(t *testing.T) {
+	cases := []struct {
+		name string
+		pkgs []string
+		want bool
+	}{
+		{name: "efi only", pkgs: []string{"grub-efi-amd64-signed", "shim-signed"}, want: true},
+		{name: "grub pc still broken", pkgs: []string{"grub-pc", "grub-efi-amd64-signed", "shim-signed"}, want: false},
+		{name: "gfx payload still broken", pkgs: []string{"grub-gfxpayload-lists", "shim-signed"}, want: false},
+		{name: "unrelated", pkgs: []string{"linux-image-generic"}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := biosEFIPurgeCandidate(tc.pkgs); got != tc.want {
+				t.Fatalf("biosEFIPurgeCandidate(%v): got %v want %v", tc.pkgs, got, tc.want)
+			}
+		})
+	}
+}
+func TestReadLastLines_TailsLogFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "term.log")
+	var body string
+	for i := 1; i <= 500; i++ {
+		body += fmt.Sprintf("line %d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := readLastLines(path, 5)
+	want := "line 496\nline 497\nline 498\nline 499\nline 500"
+	if got != want {
+		t.Fatalf("readLastLines: got %q want %q", got, want)
+	}
+}
+
+func TestReadLastLines_MissingFileReturnsEmpty(t *testing.T) {
+	if got := readLastLines("/no/such/file/here.log", 10); got != "" {
+		t.Errorf("expected empty for missing file; got %q", got)
 	}
 }
 
@@ -406,6 +662,10 @@ func TestRewriteAptCodename_RewritesBothFiles(t *testing.T) {
 	if err := os.WriteFile(sourcesList, []byte("deb http://archive.ubuntu.com/ubuntu/ noble main\n"), 0o644); err != nil {
 		t.Fatalf("seed sources.list: %v", err)
 	}
+	mirrorList := filepath.Join(dir, "operator-mirror.list")
+	if err := os.WriteFile(mirrorList, []byte("deb http://us.archive.ubuntu.com/ubuntu noble main\n"), 0o644); err != nil {
+		t.Fatalf("seed operator mirror: %v", err)
+	}
 
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	if err := rewriteAptCodename(dir, sourcesList, "noble", "questing", log); err != nil {
@@ -419,6 +679,10 @@ func TestRewriteAptCodename_RewritesBothFiles(t *testing.T) {
 	b2, _ := os.ReadFile(sourcesList)
 	if !strings.Contains(string(b2), "questing") || strings.Contains(string(b2), "noble") {
 		t.Errorf("sources.list not rewritten: %q", string(b2))
+	}
+	b3, _ := os.ReadFile(mirrorList)
+	if !strings.Contains(string(b3), "questing") || strings.Contains(string(b3), "noble") {
+		t.Errorf("operator mirror list not rewritten: %q", string(b3))
 	}
 }
 
