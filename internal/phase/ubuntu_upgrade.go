@@ -338,12 +338,14 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 		prevStage = UbuntuUpgradeStage(s)
 	}
 	details := map[string]any{
-		"pre_version":      stringOrFromDetails(prev, "pre_version", currentVer),
-		"target_version":   plan.TargetVersion,
-		"current_codename": plan.CurrentCodename,
-		"target_codename":  plan.TargetCodename,
-		"action":           plan.Action.String(),
-		"stage":            string(UbuntuStageStarted),
+		"pre_version":          stringOrFromDetails(prev, "pre_version", currentVer),
+		"target_version":       plan.TargetVersion,
+		"final_target_version": plan.FinalTargetVersion,
+		"current_codename":     plan.CurrentCodename,
+		"target_codename":      plan.TargetCodename,
+		"action":               plan.Action.String(),
+		"stage":                string(UbuntuStageStarted),
+		"intermediate_hop":     plan.FinalTargetVersion != "" && plan.FinalTargetVersion != plan.TargetVersion,
 	}
 	for k, v := range resolverDetails {
 		details[k] = v

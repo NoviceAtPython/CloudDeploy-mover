@@ -94,3 +94,6 @@ jobs:
       - name: shellcheck bootstrap.sh
         # bootstrap.sh is the only v3 Bash. The v2 monolith is vendored.
         run: shellcheck bootstrap.sh
+
+      - name: bootstrap trap safety (no unbound askpass_dir on early exit)
+        run: bash scripts/test/bootstrap-trap-safety.sh

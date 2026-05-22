@@ -1,10 +1,16 @@
 // Package ubuntu reads /etc/os-release and answers
 // "is this Ubuntu version supported by the requested profile?".
 //
-// v3 is Ubuntu-only (see docs/UBUNTU-ONLY.md). The hdr-4k120 success
-// state was reached on Ubuntu 25.10; 24.04 LTS is supported with a
-// caveat (Plasma 6 path not validated). Anything older than 24.04 or
-// non-Ubuntu hits the gate.
+// v3 is Ubuntu-only (see docs/UBUNTU-ONLY.md). Supported starting
+// points: 22.04 LTS (jammy), 24.04 LTS (noble), 25.10 (questing).
+//
+// The HDR streaming stack (Plasma 6 + KWin 6.x + NVIDIA private HDR)
+// only ships on 24.04+. Profiles that target HDR will auto-upgrade
+// jammy hosts through the upgrade phase: 22.04 -> 24.04 first (LTS
+// hop), then 24.04 -> 25.10 (direct apt codename rewrite) if the
+// resolver picked a non-LTS final target.
+//
+// Anything older than 22.04 or non-Ubuntu hits the gate.
 package ubuntu
 
 import (
@@ -91,11 +97,23 @@ func Parse(text string) Release {
 // deliberate act: a release is supported only after CloudDeploy has
 // validated the full streaming stack on it.
 //
+// 22.04 is supported as a STARTING point only. The HDR streaming
+// stack (Plasma 6, KWin 6.x, NVIDIA private HDR) is not in the
+// jammy archive; deploys that target HDR on a jammy host route
+// through ubuntu-upgrade (22.04 -> 24.04 LTS hop, then 24.04 ->
+// 25.10 if the operator picked a non-LTS final target).
+//
+// 26.04 is a forward-looking placeholder: it's not yet released
+// (the GA target is April 2026); leaving the entry here means the
+// resolver can pick it as a candidate once the codename map fills
+// in. Same caveat as 25.10 -- not validated until a real run lands.
+//
 // Order: more-recent-first so iteration emits a stable list for
 // error messages. The map form is for quick lookup.
 var supportedVersions = map[string]string{
 	"25.10": "validated end-to-end for the hdr-4k120 success path",
 	"24.04": "supported (LTS); the Plasma 6 / patched-KWin / NVIDIA private HDR path was validated on 25.10",
+	"22.04": "supported (LTS) as a STARTING point only; the ubuntu-upgrade phase routes HDR profiles through 24.04 because Plasma 6 / KWin 6.x ship on 24.04+",
 }
 
 // IsSupportedVersion reports whether the given VERSION_ID is in the

@@ -51,8 +51,15 @@ func TestGate_SupportedVersions(t *testing.T) {
 	}{
 		{"25.10", true},
 		{"24.04", true},
-		{"22.04", false}, // unsupported
-		{"26.04", false}, // future
+		// 22.04 is supported as a STARTING point. The HDR stack
+		// lives on 24.04+, but the ubuntu-upgrade phase routes
+		// jammy hosts through 24.04 first; gating it as
+		// unsupported would refuse to even run on a 22.04 cloud VM.
+		{"22.04", true},
+		// Anything older than 22.04 stays gated until we validate.
+		{"20.04", false},
+		{"18.04", false},
+		{"26.04", false}, // future / not validated yet
 		{"", false},
 	}
 	for _, c := range cases {
@@ -60,6 +67,19 @@ func TestGate_SupportedVersions(t *testing.T) {
 		g := Gate(r, "")
 		if g.Supported != c.want {
 			t.Errorf("version %q: Supported got %v want %v (reason=%q)", c.version, g.Supported, c.want, g.Reason)
+		}
+	}
+}
+
+func TestGate_JammyReasonNamesTheUpgradeHop(t *testing.T) {
+	r := Release{ID: "ubuntu", VersionID: "22.04", Codename: "jammy"}
+	g := Gate(r, "")
+	if !g.Supported {
+		t.Fatalf("22.04 should now pass the v3 gate; got reason=%q", g.Reason)
+	}
+	for _, want := range []string{"STARTING", "24.04"} {
+		if !strings.Contains(g.Reason, want) {
+			t.Errorf("22.04 reason should mention %q so the operator understands the upgrade-hop path; got %q", want, g.Reason)
 		}
 	}
 }

@@ -58,6 +58,24 @@ set -euo pipefail
 log() { printf '[bootstrap] %s\n' "$*" >&2; }
 die() { printf '[bootstrap] FATAL: %s\n' "$*" >&2; exit 1; }
 
+# Globals referenced by the cleanup trap. Initialize BEFORE setting
+# the trap so an early failure path (e.g. apt-get update dying with
+# set -u still on) cannot crash the trap with "unbound variable".
+# Live VM 2026-05-22: the previous code created askpass_dir as a
+# function-local inside ensure_repo(); the trap fired AFTER that
+# function returned and `${askpass_dir}` (no default) hit set -u.
+askpass_dir=""
+
+cleanup_bootstrap() {
+    # Always use ${askpass_dir:-} so an unset / out-of-scope variable
+    # never makes the cleanup itself fail under set -u.
+    local dir="${askpass_dir:-}"
+    if [[ -n "${dir}" && -d "${dir}" ]]; then
+        rm -rf "${dir}" 2>/dev/null || true
+    fi
+}
+trap cleanup_bootstrap EXIT
+
 [[ ${EUID} -eq 0 ]] || die "Run with sudo (need root for apt + writing under /opt)."
 
 PROFILE="${PROFILE:-hdr-4k120}"
@@ -223,7 +241,15 @@ ensure_repo() {
     # in `git remote -v` output).
     local git_env=()
     if [[ -n "${GH_TOKEN:-}" ]]; then
-        local askpass_dir askpass
+        # IMPORTANT: askpass_dir is the GLOBAL declared at the top of
+        # this script (initial value ""). Do NOT redeclare it `local`
+        # here -- the cleanup trap fires on EXIT, which runs AFTER
+        # this function has returned. A function-local askpass_dir
+        # would be out of scope by then and `${askpass_dir}` (no
+        # default) inside the trap would crash with "unbound variable"
+        # under set -u. The cleanup_bootstrap function defensively
+        # uses ${askpass_dir:-} too.
+        local askpass
         askpass_dir="$(mktemp -d /tmp/clouddeploy-askpass.XXXXXX)"
         askpass="${askpass_dir}/askpass.sh"
         cat > "${askpass}" <<'CLOUDDEPLOY_GIT_ASKPASS'
@@ -236,8 +262,9 @@ esac
 CLOUDDEPLOY_GIT_ASKPASS
         chmod 0700 "${askpass}"
         git_env=(env "GH_TOKEN=${GH_TOKEN}" "GIT_ASKPASS=${askpass}" "GIT_TERMINAL_PROMPT=0")
-        # Best-effort cleanup. trap may already be set; we append.
-        trap 'rm -rf "${askpass_dir}" 2>/dev/null || true' EXIT
+        # Cleanup is handled by the top-level cleanup_bootstrap trap;
+        # do NOT install a second trap here (it would overwrite the
+        # global one).
     fi
 
     if [[ -d "${CLOUDDEPLOY_REPO_DIR}/.git" ]]; then

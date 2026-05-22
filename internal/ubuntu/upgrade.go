@@ -103,13 +103,25 @@ const (
 
 // UpgradePlan is the input + chosen action + reason.
 type UpgradePlan struct {
-	Action          UpgradeAction
-	CurrentVersion  string
-	TargetVersion   string
-	CurrentCodename string
-	TargetCodename  string
-	Reason          string
-	Err             error
+	Action UpgradeAction
+	// CurrentVersion is the host VERSION_ID before this hop runs.
+	CurrentVersion string
+	// TargetVersion is the version this single hop will reach. For a
+	// multi-step upgrade (e.g. 22.04 -> 25.10 routed via 24.04) this
+	// equals the INTERMEDIATE target (24.04), not the final one.
+	TargetVersion string
+	// FinalTargetVersion is the version the operator ultimately
+	// requested (profile.ubuntu_version or the resolver pick). When
+	// the planner chose an intermediate hop, the resume after this
+	// hop's reboot will re-plan with this same FinalTargetVersion;
+	// the planner picks "noop" once Current == Final.
+	//
+	// In a single-hop case FinalTargetVersion == TargetVersion.
+	FinalTargetVersion string
+	CurrentCodename    string
+	TargetCodename     string
+	Reason             string
+	Err                error
 }
 
 // PlanInputs is the data PlanUpgrade consumes.
@@ -150,38 +162,39 @@ var (
 //  7. Otherwise -> UpgradeDoReleaseUpgrade.
 func PlanUpgrade(in PlanInputs) UpgradePlan {
 	current := strings.TrimSpace(in.CurrentVersion)
-	target := strings.TrimSpace(in.TargetVersion)
+	finalTarget := strings.TrimSpace(in.TargetVersion)
 
 	plan := UpgradePlan{
-		CurrentVersion:  current,
-		TargetVersion:   target,
-		CurrentCodename: CodenameForVersion(current),
-		TargetCodename:  CodenameForVersion(target),
+		CurrentVersion:     current,
+		TargetVersion:      finalTarget,
+		FinalTargetVersion: finalTarget,
+		CurrentCodename:    CodenameForVersion(current),
+		TargetCodename:     CodenameForVersion(finalTarget),
 	}
 
-	if target == "" {
+	if finalTarget == "" {
 		plan.Action = UpgradeNotConfigured
 		plan.Reason = "profile.ubuntu_version is empty; ubuntu-upgrade phase is a no-op"
 		plan.Err = ErrNoTargetVersion
 		return plan
 	}
 
-	if current == target {
+	if current == finalTarget {
 		plan.Action = UpgradeNoop
-		plan.Reason = fmt.Sprintf("host already at target Ubuntu %s; no upgrade needed", target)
+		plan.Reason = fmt.Sprintf("host already at target Ubuntu %s; no upgrade needed", finalTarget)
 		return plan
 	}
 
 	if !in.AutoUpgrade {
 		plan.Action = UpgradeNotConfigured
-		plan.Reason = fmt.Sprintf("profile requires Ubuntu %s; host is on %s; enable deploy.auto_upgrade_ubuntu=true or use a %s image", target, current, target)
+		plan.Reason = fmt.Sprintf("profile requires Ubuntu %s; host is on %s; enable deploy.auto_upgrade_ubuntu=true or use a %s image", finalTarget, current, finalTarget)
 		plan.Err = ErrAutoUpgradeDisabled
 		return plan
 	}
 
-	if !IsLTS(target) && !in.AcceptNonLTS {
+	if !IsLTS(finalTarget) && !in.AcceptNonLTS {
 		plan.Action = UpgradeRefusedNonLTS
-		plan.Reason = fmt.Sprintf("target Ubuntu %s is non-LTS; set deploy.accept_non_lts=true to authorize the upgrade", target)
+		plan.Reason = fmt.Sprintf("target Ubuntu %s is non-LTS; set deploy.accept_non_lts=true to authorize the upgrade", finalTarget)
 		plan.Err = ErrNonLTSRefused
 		return plan
 	}
@@ -189,10 +202,26 @@ func PlanUpgrade(in PlanInputs) UpgradePlan {
 	if plan.CurrentCodename == "" || plan.TargetCodename == "" {
 		plan.Action = UpgradeRefusedUnknownHop
 		plan.Reason = fmt.Sprintf("unknown Ubuntu codename for %s (->%s) or %s (->%s); refusing to plan blind hop",
-			current, plan.CurrentCodename, target, plan.TargetCodename)
+			current, plan.CurrentCodename, finalTarget, plan.TargetCodename)
 		plan.Err = ErrUnknownHop
 		return plan
 	}
+
+	// Intermediate-hop routing. Some upgrades skip too many releases
+	// to be safe in a single apt-rewrite (e.g. jammy -> questing
+	// crosses noble, and several key packages renamed across that
+	// span). NextHopForUpgrade returns either finalTarget (single
+	// hop is fine) or the next LTS waypoint (e.g. 24.04 between
+	// 22.04 and 25.10). When the planner chose an intermediate, the
+	// resume after this hop's reboot re-runs ubuntu-upgrade and the
+	// next call lands at the correct second hop.
+	hopTarget := NextHopForUpgrade(current, finalTarget)
+	if hopTarget == "" {
+		hopTarget = finalTarget
+	}
+	plan.TargetVersion = hopTarget
+	plan.TargetCodename = CodenameForVersion(hopTarget)
+	intermediate := hopTarget != finalTarget
 
 	policy := in.DirectAptCodenameUpgrade
 	if policy == "" {
@@ -205,27 +234,105 @@ func PlanUpgrade(in PlanInputs) UpgradePlan {
 	case PolicyOff:
 		useDirect = false
 	case PolicyAuto:
-		useDirect = isKnownDirectHop(current, target)
+		useDirect = isKnownDirectHop(current, hopTarget)
 	}
 
 	if useDirect {
 		plan.Action = UpgradeDirectCodenameRewrite
-		plan.Reason = fmt.Sprintf("direct apt codename rewrite %s (%s) -> %s (%s); do-release-upgrade refuses this hop",
-			current, plan.CurrentCodename, target, plan.TargetCodename)
+		if intermediate {
+			plan.Reason = fmt.Sprintf("direct apt codename rewrite %s (%s) -> %s (%s) [intermediate hop toward final target %s]",
+				current, plan.CurrentCodename, hopTarget, plan.TargetCodename, finalTarget)
+		} else {
+			plan.Reason = fmt.Sprintf("direct apt codename rewrite %s (%s) -> %s (%s); do-release-upgrade refuses this hop",
+				current, plan.CurrentCodename, hopTarget, plan.TargetCodename)
+		}
 		return plan
 	}
 
 	plan.Action = UpgradeDoReleaseUpgrade
-	plan.Reason = fmt.Sprintf("do-release-upgrade %s (%s) -> %s (%s)", current, plan.CurrentCodename, target, plan.TargetCodename)
+	if intermediate {
+		plan.Reason = fmt.Sprintf("do-release-upgrade %s (%s) -> %s (%s) [intermediate hop toward final target %s]",
+			current, plan.CurrentCodename, hopTarget, plan.TargetCodename, finalTarget)
+	} else {
+		plan.Reason = fmt.Sprintf("do-release-upgrade %s (%s) -> %s (%s)", current, plan.CurrentCodename, hopTarget, plan.TargetCodename)
+	}
 	return plan
 }
 
-// isKnownDirectHop returns true for source -> target pairs where
-// `do-release-upgrade -d` is known to refuse and the operator MUST
-// rewrite apt sources directly. Currently only 24.04 -> 25.10. Add
-// more as new hops are validated.
+// isKnownDirectHop returns true for source -> target pairs where the
+// safest apt-mechanic is a direct codename rewrite + dist-upgrade.
+// We use direct rewrites for:
+//
+//   - 22.04 -> 24.04: jammy -> noble. do-release-upgrade handles this
+//     fine on a real machine, but it shells into a curses UI that
+//     does NOT cooperate with an unattended runner. The apt-rewrite
+//     mechanic is dependency-equivalent for an LTS-to-LTS hop and
+//     finishes cleanly via apt-get dist-upgrade.
+//   - 24.04 -> 25.10: noble -> questing. do-release-upgrade -d
+//     refuses this hop (noble does not yet know about questing in
+//     its meta-release file); direct rewrite is the only path.
+//   - 24.04 -> 26.04: noble -> resolute. LTS-to-LTS direct rewrite
+//     (do-release-upgrade only ships in a *.04 LTS for the next LTS
+//     after it ships, which we cannot rely on inside an unattended
+//     deploy).
+//
+// All other hops fall through to do-release-upgrade.
 func isKnownDirectHop(current, target string) bool {
-	return current == "24.04" && target == "25.10"
+	switch {
+	case current == "22.04" && target == "24.04":
+		return true
+	case current == "24.04" && target == "25.10":
+		return true
+	case current == "24.04" && target == "26.04":
+		return true
+	}
+	return false
+}
+
+// NextHopForUpgrade returns the next Ubuntu version to target when
+// the host is on `current` and the operator's FINAL target is
+// `finalTarget`. For single-step hops it returns finalTarget; for
+// multi-step upgrades it returns the LTS waypoint between them.
+//
+// Reasoning: jumping more than one major release in a single apt
+// codename rewrite is risky -- key packages have been renamed across
+// the span, qt5/qt6 transitions land in between, etc. The safer
+// pattern is to step through the most recent LTS first. The deploy's
+// reboot+resume loop naturally chains these: hop to the LTS, reboot,
+// resume re-evaluates, hops to the final target.
+//
+// Examples:
+//
+//	NextHopForUpgrade("22.04", "24.04") == "24.04"  // direct
+//	NextHopForUpgrade("22.04", "25.10") == "24.04"  // intermediate
+//	NextHopForUpgrade("22.04", "26.04") == "24.04"  // intermediate
+//	NextHopForUpgrade("24.04", "25.10") == "25.10"  // direct
+//	NextHopForUpgrade("24.04", "26.04") == "26.04"  // direct (LTS-to-LTS)
+//	NextHopForUpgrade("25.10", "26.04") == "26.04"  // direct
+//
+// "" is returned for unknown source/target, telling the caller to
+// fall back to the existing single-hop logic.
+func NextHopForUpgrade(current, finalTarget string) string {
+	if current == "" || finalTarget == "" {
+		return finalTarget
+	}
+	if current == finalTarget {
+		return finalTarget
+	}
+	if CodenameForVersion(current) == "" || CodenameForVersion(finalTarget) == "" {
+		return finalTarget
+	}
+	// Jammy starting point: route every non-trivial upgrade through
+	// 24.04 LTS first. Even jammy -> 24.10 (hypothetical) would
+	// re-evaluate after the reboot; the resolver would then either
+	// pick 25.10 or stay at 24.04, both of which are single hops.
+	if current == "22.04" && finalTarget != "24.04" {
+		return "24.04"
+	}
+	// Future-proofing: a 20.04 host (currently NOT in supported
+	// versions) would also need an intermediate hop, but we leave
+	// that to a future patch when we validate that path.
+	return finalTarget
 }
 
 // String makes UpgradeAction self-describing in logs / tests.
