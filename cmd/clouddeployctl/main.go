@@ -21,7 +21,6 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"time"
 
@@ -104,7 +103,7 @@ Milestone 5 (in progress):
         kwin-session | drm-display-validate |
         sunshine-build | sunshine-config |
         tailscale | pipewire-audio |
-        streaming-services | stream-validate |
+        gpu-capture-capability-probe | streaming-services | stream-validate |
         optional-apps                                     implemented
   apply                                                runs the implemented
                                                        phases above
@@ -312,7 +311,7 @@ const partialApplyBanner = `
                  cuda, edid, headless-user, desktop-packages, desktop-runtime,
                  kwin-patch, kwin-session, drm-display-validate,
                  sunshine-build, sunshine-config, tailscale, pipewire-audio,
-                 streaming-services, stream-validate, optional-apps
+                 gpu-capture-capability-probe, streaming-services, stream-validate, optional-apps
 
   Optional apps are nonfatal and run last. stream-validate may leave the
   state at pending_moonlight_connect when Sunshine is reachable but no
@@ -532,6 +531,7 @@ func applyPhases() []phase.Phase {
 		phase.SunshineConfigPhase{},
 		phase.Tailscale{},
 		phase.PipeWireAudio{},
+		phase.GPUCaptureCapabilityProbe{},
 		phase.StreamingServices{},
 		phase.StreamValidate{},
 		phase.OptionalApps{},
@@ -617,6 +617,10 @@ func newDoctorCmd() *cobra.Command {
 	doctor.AddCommand(newDoctorMoonlightCmd())
 	doctor.AddCommand(newDoctorToolsCmd())
 	doctor.AddCommand(newDoctorNetworkCmd())
+	doctor.AddCommand(newDoctorGPUCapabilitiesCmd())
+	doctor.AddCommand(newDoctorBackendSelectCmd())
+	doctor.AddCommand(newDoctorSunshineKMSEGLCmd())
+	doctor.AddCommand(newDoctorNvFBCCmd())
 	doctor.AddCommand(newDoctorLockCmd())
 	return doctor
 }
@@ -1259,7 +1263,7 @@ func newDoctorSunshineCmd() *cobra.Command {
 					drmDevice = strings.TrimSpace(v)
 				}
 			}
-			renderNode := doctorRenderNodeForCard(drmDevice)
+			renderNode := phase.RenderNodeForCard(drmDevice)
 			fmt.Printf("  selected DRM device    : %s\n", drmDevice)
 			if renderNode != "" {
 				fmt.Printf("  expected render node   : %s\n", renderNode)
@@ -1715,16 +1719,111 @@ func serverInfoValue(s, key string) string {
 	return "(missing)"
 }
 
-func doctorRenderNodeForCard(card string) string {
-	card = strings.TrimSpace(card)
-	if !strings.HasPrefix(card, "/dev/dri/card") {
-		return ""
+func newDoctorGPUCapabilitiesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "gpu-capabilities",
+		Short: "Show GPU capture capability matrix evidence",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := cmd.Context()
+			deps, lock, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			fmt.Println("doctor gpu-capabilities:")
+			printPhaseDetails(deps, phase.GPUCaptureCapabilityProbeName, []string{
+				"selected_backend", "selected_drm_device", "selected_render_node", "forced_connector",
+				"kms_display_capable", "egl_nvidia_runtime_ok", "nvenc_h264_ok", "nvenc_hevc_main10_ok",
+				"sunshine_kms_egl_nvenc_interop_ok", "sunshine_kms_egl_nvenc_interop_failure",
+			})
+			fmt.Printf("  nvidia-smi             : %s\n", oneLine(strings.TrimSpace(mustOutput(ctx, deps, []string{"nvidia-smi", "--query-gpu=name,pci.bus_id,driver_version", "--format=csv,noheader"}))))
+			fmt.Printf("  /dev/dri               : %s\n", oneLine(strings.TrimSpace(mustOutput(ctx, deps, []string{"bash", "-lc", "ls -l /dev/dri 2>/dev/null || true"}))))
+			return nil
+		},
 	}
-	n, err := strconv.Atoi(strings.TrimPrefix(card, "/dev/dri/card"))
-	if err != nil {
-		return ""
+}
+
+func newDoctorBackendSelectCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "backend-select",
+		Short: "Explain selected capture backend and fallback status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			deps, lock, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			fmt.Println("doctor backend-select:")
+			printPhaseDetails(deps, phase.GPUCaptureCapabilityProbeName, []string{
+				"selected_backend", "wayland_kms_nvenc_hdr_available", "x11_nvfbc_nvenc_available", "x11_nvenc_fallback_available",
+				"sunshine_kms_egl_nvenc_interop_failure",
+			})
+			return nil
+		},
 	}
-	return fmt.Sprintf("/dev/dri/renderD%d", 128+n)
+}
+
+func newDoctorSunshineKMSEGLCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "sunshine-kms-egl",
+		Short: "Show Sunshine KMS/GBM/EGL/NVENC interop probe output",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			deps, lock, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			fmt.Println("doctor sunshine-kms-egl:")
+			printPhaseDetails(deps, phase.GPUCaptureCapabilityProbeName, []string{
+				"selected_drm_device", "selected_render_node", "egl_ldconfig_excerpt", "egl_vendor_json", "eglinfo_gbm_excerpt",
+				"sunshine_startup_probe_error", "sunshine_kms_egl_nvenc_interop_failure", "sunshine_startup_probe_excerpt",
+			})
+			return nil
+		},
+	}
+}
+
+func newDoctorNvFBCCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "nvfbc",
+		Short: "Show NvFBC fallback availability status",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			deps, lock, err := loadDeps(cmd, false)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			fmt.Println("doctor nvfbc:")
+			printPhaseDetails(deps, phase.GPUCaptureCapabilityProbeName, []string{"x11_nvfbc_nvenc_available", "x11_nvenc_fallback_available", "selected_backend"})
+			fmt.Println("  note                   : v3 currently records NvFBC fallback status but does not install an X11/NvFBC production service chain yet.")
+			return nil
+		},
+	}
+}
+
+func printPhaseDetails(deps *phase.Deps, name string, keys []string) {
+	ph := deps.State.Get(name)
+	if ph == nil || ph.Details == nil {
+		fmt.Printf("  phase %-22s: no state details\n", name)
+		return
+	}
+	fmt.Printf("  phase status           : %s\n", ph.Status)
+	if ph.Reason != "" {
+		fmt.Printf("  phase reason           : %s\n", ph.Reason)
+	}
+	for _, key := range keys {
+		if v, ok := ph.Details[key]; ok {
+			fmt.Printf("  %-22s: %v\n", key, v)
+		}
+	}
+}
+
+func mustOutput(ctx context.Context, deps *phase.Deps, argv []string) string {
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: argv, LogFile: "-", Timeout: 10 * time.Second})
+	if res.Err != nil {
+		return res.Err.Error()
+	}
+	return res.Stdout
 }
 
 // -----------------------------------------------------------------------------
@@ -1768,6 +1867,7 @@ func newPhaseCmd() *cobra.Command {
 	p.AddCommand(newPhaseImplCmd("sunshine-config", phase.SunshineConfigPhase{}))
 	p.AddCommand(newPhaseImplCmd("tailscale", phase.Tailscale{}))
 	p.AddCommand(newPhaseImplCmd("pipewire-audio", phase.PipeWireAudio{}))
+	p.AddCommand(newPhaseImplCmd("gpu-capture-capability-probe", phase.GPUCaptureCapabilityProbe{}))
 	p.AddCommand(newPhaseImplCmd("streaming-services", phase.StreamingServices{}))
 	p.AddCommand(newPhaseImplCmd("stream-validate", phase.StreamValidate{}))
 	p.AddCommand(newPhaseImplCmd("optional-apps", phase.OptionalApps{}))

@@ -824,7 +824,9 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	uid := uidFromState(deps)
 	conf := sunshineConfigPath(deps)
 	unit := renderSunshineService(desk.User, uid, cfg.InstallBin, conf, cfg)
+	backend := selectedCaptureBackend(deps)
 	details := map[string]any{
+		"selected_backend":          backend,
 		"compositor_service":        "kwin-realvt.service",
 		"sunshine_service":          "sunshine-headless.service",
 		"config":                    conf,
@@ -834,6 +836,9 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 		"advertises_av1_main10":     cfg.AdvertisesAV1Main10(),
 		"force_av1_hdr10_env":       cfg.ForceAV1HDR10,
 		"synthesize_hdr10_metadata": cfg.SynthesizeHDR10Metadata,
+	}
+	if backend != "" && backend != BackendWaylandKMSNVENCHDR {
+		return failPhase(deps, StreamingServicesName, details, "unsupported selected capture backend", fmt.Errorf("selected backend %s does not have a v3 production service renderer yet", backend), true)
 	}
 	if !deps.DryRun {
 		if err := os.WriteFile("/etc/systemd/system/sunshine-headless.service", []byte(unit), 0o644); err != nil {
@@ -905,7 +910,7 @@ func verifySunshineDeviceAccess(ctx context.Context, deps *Deps, user, drm strin
 	if strings.TrimSpace(drm) == "" {
 		return fmt.Errorf("selected DRM device is empty")
 	}
-	render := renderNodeForCard(drm)
+	render := RenderNodeForCard(drm)
 	probes := []struct {
 		label    string
 		path     string
@@ -965,19 +970,6 @@ os.close(fd)
 	return probe
 }
 
-func renderNodeForCard(card string) string {
-	card = strings.TrimSpace(card)
-	m := regexp.MustCompile(`^/dev/dri/card([0-9]+)$`).FindStringSubmatch(card)
-	if len(m) != 2 {
-		return ""
-	}
-	n, err := strconv.Atoi(m[1])
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf("/dev/dri/renderD%d", 128+n)
-}
-
 type StreamValidate struct {
 	ServiceActiveFn func(context.Context, *Deps) error
 	ServerInfoFn    func(context.Context, *Deps, string) (string, error)
@@ -997,7 +989,11 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	}
 	deps.State.MarkRunning(StreamValidateName)
 	_ = deps.PersistState()
-	details := map[string]any{}
+	backend := selectedCaptureBackend(deps)
+	details := map[string]any{"selected_backend": backend}
+	if backend != "" && backend != BackendWaylandKMSNVENCHDR {
+		return failPhase(deps, StreamValidateName, details, "unsupported selected capture backend", fmt.Errorf("selected backend %s does not have a v3 stream validator yet", backend), true)
+	}
 	if deps.DryRun {
 		details["dry_run"] = true
 		deps.State.MarkDone(StreamValidateName, details)
@@ -1624,6 +1620,15 @@ func selectedDRMDevice(deps *Deps) string {
 			return strings.TrimSpace(v)
 		}
 		if v, ok := p.Details["kwin_drm_device_resolved"].(string); ok {
+			return strings.TrimSpace(v)
+		}
+	}
+	return ""
+}
+
+func selectedCaptureBackend(deps *Deps) string {
+	if p := deps.State.Get(GPUCaptureCapabilityProbeName); p != nil && p.Details != nil {
+		if v, ok := p.Details["selected_backend"].(string); ok {
 			return strings.TrimSpace(v)
 		}
 	}

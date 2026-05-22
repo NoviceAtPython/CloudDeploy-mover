@@ -35,6 +35,7 @@ func TestApplyOrder_Milestone5AfterDRMValidateOptionalAppsLast(t *testing.T) {
 		"sunshine_config",
 		"tailscale",
 		"pipewire_audio",
+		"gpu_capture_capability_probe",
 		"streaming_services",
 		"stream_validate",
 		"optional_apps",

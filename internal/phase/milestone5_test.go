@@ -471,20 +471,6 @@ Error: h264_nvenc: dynamic range not supported
 	}
 }
 
-func TestRenderNodeForCard(t *testing.T) {
-	tests := map[string]string{
-		"/dev/dri/card0":    "/dev/dri/renderD128",
-		"/dev/dri/card1":    "/dev/dri/renderD129",
-		"/dev/dri/renderD1": "",
-		"":                  "",
-	}
-	for in, want := range tests {
-		if got := renderNodeForCard(in); got != want {
-			t.Fatalf("renderNodeForCard(%q): got %q want %q", in, got, want)
-		}
-	}
-}
-
 func TestContainsRawWebMarkerDetectsUnbuiltVueAssets(t *testing.T) {
 	for _, raw := range []string{
 		"<%- header %>",
