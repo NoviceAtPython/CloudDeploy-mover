@@ -79,8 +79,78 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newStateCmd())
 	root.AddCommand(newCollectLogsCmd())
 	root.AddCommand(newMonitorCmd())
+	root.AddCommand(newSunshineCmd())
 
 	return root
+}
+
+// newSunshineCmd hosts subcommands that touch the live Sunshine
+// install without going through `apply`. Today: reset-credentials.
+func newSunshineCmd() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "sunshine",
+		Short: "Operate on the live Sunshine install (reset-credentials, ...)",
+	}
+	cmd.AddCommand(newSunshineResetCredentialsCmd())
+	return cmd
+}
+
+// newSunshineResetCredentialsCmd is the safe path to rewrite the
+// Sunshine username/password without editing state.json by hand. It
+// reads SUNSHINE_USER + SUNSHINE_PASS from the env, calls
+// `sunshine --creds`, and refuses to leave the system in a half-set
+// state. It DOES NOT log the password and DOES NOT mutate any phase
+// state-machine markers; only the SunshineCredentialsPresent /
+// SunshineCredentialsUser fields on State are updated.
+func newSunshineResetCredentialsCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "reset-credentials",
+		Short: "Re-set Sunshine Web UI credentials from SUNSHINE_USER + SUNSHINE_PASS",
+		Long: `Re-set the Sunshine Web UI credentials without touching CloudDeploy
+phase state. SUNSHINE_USER (optional, defaults to the headless desktop
+user) and SUNSHINE_PASS (required) must be exported in the environment.
+The password is passed to sunshine --creds and the runner redacts the
+final argv slot from logs.
+
+Sunshine's credentials store lives in ~cloudgamer/.config/sunshine and
+is recreated on the next service restart, so this command is the safe
+alternative to "rm -rf ~/.config/sunshine/credentials" + manual rerun.`,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			ctx := context.Background()
+			deps, lock, err := loadDeps(cmd, true)
+			if err != nil {
+				return err
+			}
+			defer lock.Release()
+			pass := os.Getenv("SUNSHINE_PASS")
+			if strings.TrimSpace(pass) == "" {
+				return fmt.Errorf("SUNSHINE_PASS is not set; refusing to leave Sunshine without credentials")
+			}
+			desk := deps.Profile.EffectiveDesktop()
+			cfg := deps.Profile.EffectiveSunshine()
+			bin := strings.TrimSpace(cfg.InstallBin)
+			if bin == "" {
+				bin = "/usr/local/bin/sunshine-clouddeploy"
+			}
+			fmt.Printf("sunshine reset-credentials: resetting credentials for user %q via %s\n", desk.User, bin)
+			ok, sunUser, credsErr := phase.SetSunshineCredentialsForReset(ctx, deps, desk.User, bin)
+			deps.State.SunshineCredentialsPresent = ok
+			deps.State.SunshineCredentialsUser = sunUser
+			_ = deps.PersistState()
+			if credsErr != nil {
+				return credsErr
+			}
+			if !ok {
+				return fmt.Errorf("sunshine --creds returned success but no credentials evidence was found in /home/%s/.config/sunshine", desk.User)
+			}
+			fmt.Println("sunshine reset-credentials: ok; restart sunshine-headless.service for the new credentials to take effect.")
+			_ = deps.Runner.Exec(ctx, runner.CommandSpec{
+				Argv: []string{"systemctl", "try-restart", "sunshine-headless.service"},
+				Sudo: true, LogFile: "-", Timeout: time.Minute, DryRun: deps.DryRun,
+			})
+			return nil
+		},
+	}
 }
 
 const longDescription = `clouddeployctl is the v3 CloudDeploy orchestrator.
@@ -408,6 +478,10 @@ in the active profile or via --auto-reboot / CLOUDDEPLOY_AUTO_REBOOT=1.
 				}
 			}
 
+			if err := preflightUnattendedCredentials(deps); err != nil {
+				return err
+			}
+
 			err = runPhasesAndBanner(ctx, deps, false)
 			releaseErr := lock.Release()
 			if err == nil && releaseErr != nil {
@@ -423,6 +497,37 @@ in the active profile or via --auto-reboot / CLOUDDEPLOY_AUTO_REBOOT=1.
 			return err
 		},
 	}
+}
+
+// preflightUnattendedCredentials refuses to start an unattended deploy
+// without the credentials that streaming_services / sunshine --creds
+// will need. This shifts the failure from "stream phase explodes after
+// 40 minutes of building Sunshine" to "the very first thing we report
+// is what's missing". Interactive deploys keep the old behavior:
+// streaming_services prompts (or the operator visits the Web UI).
+//
+// We persist sunshine_credentials_present at deploy start so monitor
+// and state-show can surface the missing-credentials state immediately.
+func preflightUnattendedCredentials(deps *phase.Deps) error {
+	if deps == nil || deps.State == nil {
+		return nil
+	}
+	unattended := deps.Unattended
+	if !unattended && deps.Profile != nil {
+		unattended = deps.Profile.Deploy.Unattended
+	}
+	pass := strings.TrimSpace(os.Getenv("SUNSHINE_PASS"))
+	user := strings.TrimSpace(os.Getenv("SUNSHINE_USER"))
+	deps.State.SunshineCredentialsPresent = pass != ""
+	deps.State.SunshineCredentialsUser = user
+	_ = deps.PersistState()
+	if unattended && pass == "" {
+		return fmt.Errorf("unattended deploy requested but SUNSHINE_PASS is not set in the environment. " +
+			"Set SUNSHINE_PASS (and optionally SUNSHINE_USER) in /etc/clouddeploy/secrets.env or the apply environment " +
+			"before retrying. The clouddeployctl sunshine reset-credentials subcommand can also write the value " +
+			"to a running deploy without touching state.")
+	}
+	return nil
 }
 
 // runPhasesAndBanner is shared between apply and resume.
@@ -1354,6 +1459,21 @@ func newDoctorSunshineWebCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "sunshine-web",
 		Short: "Report Sunshine Web UI asset/rendering state (read-only)",
+		Long: `Verifies the Sunshine Web UI is serving COMPILED frontend assets,
+not raw Vue/template source. Pulls the live HTML from
+https://127.0.0.1:47990 and grades it against:
+
+  - missing index.html  -> served from embedded/unknown location
+  - "<%- header %>"     -> server is leaking the unprocessed EJS
+                           layout template; the deploy left raw
+                           Sunshine source in /usr/local/assets/web
+  - .vue references     -> the asset pipeline did not run; the page
+                           is trying to import source files at runtime
+  - vite/webpack hashes -> compiled bundle present and reachable
+  - sample asset 200/!  -> the first referenced JS/CSS asset URL must
+                           actually return 200 from the running server
+
+Read-only. Never restarts the service or touches credentials.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			deps, _, err := loadDeps(cmd, false)
@@ -1373,12 +1493,84 @@ func newDoctorSunshineWebCmd() *cobra.Command {
 			fmt.Printf("  raw template markers   : %v\n", raw)
 			fmt.Printf("  localhost Web UI       : %s\n", curlHTTPStatus(ctx, deps, "https://127.0.0.1:47990"))
 			fmt.Printf("  localhost /welcome     : %s\n", curlHTTPStatus(ctx, deps, "https://127.0.0.1:47990/welcome"))
+			// Pull the actual HTML body. The live VM saw both:
+			// (a) HTTP 200 + raw "<%- header %>" body, and
+			// (b) HTTP 200 + blank page with no asset references.
+			// Either is a failure even though the status code is happy.
+			body, fetchErr := curlFetchBody(ctx, deps, "https://127.0.0.1:47990/")
+			if fetchErr != nil {
+				fmt.Printf("  index HTML fetch       : error: %v\n", fetchErr)
+			} else {
+				fmt.Printf("  index HTML bytes       : %d\n", len(body))
+				hasRawHeader := strings.Contains(body, "<%- header %>")
+				hasVueImport := strings.Contains(body, ".vue\"") || strings.Contains(body, ".vue'") ||
+					strings.Contains(body, "from 'vue'") || strings.Contains(body, `from "vue"`)
+				asset := firstAssetURL(body)
+				fmt.Printf("  served raw <%%- header %%>: %v\n", hasRawHeader)
+				fmt.Printf("  served raw .vue refs   : %v\n", hasVueImport)
+				if asset == "" {
+					fmt.Println("  first asset URL        : (none detected)")
+				} else {
+					fmt.Printf("  first asset URL        : %s\n", asset)
+					if !strings.HasPrefix(asset, "http") {
+						asset = strings.TrimRight("https://127.0.0.1:47990", "/") + "/" + strings.TrimLeft(asset, "/")
+					}
+					fmt.Printf("  first asset HTTP       : %s\n", curlHTTPStatus(ctx, deps, asset))
+				}
+				if hasRawHeader || hasVueImport {
+					fmt.Println("  diagnosis              : Sunshine Web UI is serving RAW source. Re-run sunshine-build; the npm-build step in installSunshineAssets is supposed to produce compiled bundles.")
+				} else if asset == "" {
+					fmt.Println("  diagnosis              : Sunshine HTML rendered but no JS/CSS asset URLs detected. The page may be empty or template-only.")
+				}
+			}
 			if raw {
-				fmt.Println("  diagnosis              : runtime web assets still look like raw Vue/template source; pairing helper remains CLI/API-safe.")
+				fmt.Println("  diagnosis              : runtime web assets still look like raw Vue/template source on disk; pairing helper remains CLI/API-safe.")
 			}
 			return nil
 		},
 	}
+}
+
+// curlFetchBody fetches the body of a URL via curl, ignoring TLS
+// validation (Sunshine uses a self-signed cert by default). Capped at
+// ~256 KiB which is far more than the index page needs.
+func curlFetchBody(ctx context.Context, deps *phase.Deps, url string) (string, error) {
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"curl", "-k", "-sS", "--max-time", "10", url},
+		LogFile: "-",
+		Timeout: 15 * time.Second,
+	})
+	if res.Err != nil {
+		return "", res.Err
+	}
+	return res.Stdout, nil
+}
+
+// firstAssetURL extracts the URL of the first <script src=...> or
+// <link rel=stylesheet href=...> tag from the served HTML. Used by
+// doctor sunshine-web to probe whether the asset URL actually returns
+// 200. We accept a slightly sloppy match because the live VM has seen
+// both `src="/assets/index-abc.js"` and `src='/assets/index-abc.js'`
+// shapes.
+func firstAssetURL(html string) string {
+	for _, prefix := range []string{`<script src="`, `<script src='`, `<script type="module" src="`, `<link rel="stylesheet" href="`, `<link href="`} {
+		idx := strings.Index(html, prefix)
+		if idx < 0 {
+			continue
+		}
+		rest := html[idx+len(prefix):]
+		var end int
+		if strings.HasSuffix(strings.TrimRight(prefix, " "), `'`) {
+			end = strings.Index(rest, `'`)
+		} else {
+			end = strings.Index(rest, `"`)
+		}
+		if end <= 0 {
+			continue
+		}
+		return rest[:end]
+	}
+	return ""
 }
 
 func newDoctorStreamSessionCmd() *cobra.Command {

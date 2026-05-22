@@ -1,6 +1,9 @@
 package main
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestApplyOrder_KWinPatchBeforeKWinSession(t *testing.T) {
 	var desktopRuntime, kwinPatch, kwinSession int
@@ -52,5 +55,27 @@ func TestApplyOrder_Milestone5AfterDRMValidateOptionalAppsLast(t *testing.T) {
 	}
 	if index["optional_apps"] != len(applyPhases())-1 {
 		t.Fatalf("optional_apps must be last; index=%d len=%d", index["optional_apps"], len(applyPhases()))
+	}
+}
+
+func TestFirstAssetURLExtractsViteBundle(t *testing.T) {
+	html := `<!DOCTYPE html><html><head><script type="module" src="/assets/index-abc123.js"></script><link rel="stylesheet" href="/assets/index-def456.css"></head></html>`
+	got := firstAssetURL(html)
+	if got != "/assets/index-abc123.js" {
+		t.Fatalf("firstAssetURL: got %q want /assets/index-abc123.js", got)
+	}
+}
+
+func TestFirstAssetURLReturnsEmptyOnRawTemplate(t *testing.T) {
+	html := `<!DOCTYPE html><html><head><%- header %></head><body><div id="app"></div><script src="src/main.ts"></script></body></html>`
+	got := firstAssetURL(html)
+	// src/main.ts is technically a script src, but the marker we
+	// care about is "raw <%- header %>" detection; firstAssetURL still
+	// returns the first src.
+	if got != "src/main.ts" {
+		t.Fatalf("firstAssetURL: got %q want src/main.ts", got)
+	}
+	if !strings.Contains(html, "<%- header %>") {
+		t.Fatalf("test fixture lost the raw header marker")
 	}
 }

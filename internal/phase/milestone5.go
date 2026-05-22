@@ -175,11 +175,17 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	if setcapFn == nil {
 		setcapFn = applySunshineSetcap
 	}
-	setcapTarget := cfg.InstallBin
-	if realTarget, err := filepath.EvalSymlinks(cfg.InstallBin); err == nil && strings.TrimSpace(realTarget) != "" {
-		setcapTarget = realTarget
+	setcapTarget, setcapTargetErr := resolveSunshineSetcapTarget(cfg.InstallBin)
+	details["setcap_target_requested"] = cfg.InstallBin
+	details["setcap_target_resolved"] = setcapTarget
+	if setcapTargetErr != nil {
+		details["setcap_target_rejected"] = setcapTargetErr.Error()
+		details["setcap_success"] = false
+		details["setcap_nonfatal"] = true
+		log.Warn("phase sunshine-build: setcap target rejected; relying on service-level capabilities", "target", cfg.InstallBin, "err", setcapTargetErr)
+	} else {
+		attemptSunshineSetcap(ctx, deps, details, setcapTarget, setcapFn, log)
 	}
-	attemptSunshineSetcap(ctx, deps, details, setcapTarget, setcapFn, log)
 	assets, err := installSunshineAssets(ctx, deps, cfg.BuildDir)
 	if err != nil {
 		return failPhase(deps, SunshineBuildName, details, "install Sunshine runtime assets", err, true)
@@ -209,6 +215,72 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 
 func applySunshineSetcap(ctx context.Context, deps *Deps, target string) error {
 	return run(ctx, deps, "", []string{"setcap", "cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep", target}, time.Minute, true)
+}
+
+// disallowedSetcapTargets are absolute paths we will NEVER call setcap
+// against, even if a misconfigured symlink/state file resolves to them.
+// The live VM regression that motivated this:
+//
+//	setcap ... /usr/sbin/setcap
+//	-> "Invalid file '/usr/sbin/setcap' for capability operation"
+//
+// presumably because cfg.InstallBin had been stomped or a symlink chain
+// pointed back at the setcap binary. Resolving and rejecting before the
+// argv is built turns that class of bug into a clear nonfatal warning
+// instead of a confusing libcap error.
+var disallowedSetcapTargets = map[string]bool{
+	"/usr/sbin/setcap":            true,
+	"/sbin/setcap":                true,
+	"/usr/bin/setcap":             true,
+	"/bin/setcap":                 true,
+	"/usr/sbin/getcap":            true,
+	"/usr/bin/getcap":             true,
+	"/usr/sbin/capsh":             true,
+	"/usr/bin/capsh":              true,
+	"/usr/local/bin/setcap":       true,
+	"/usr/local/sbin/setcap":      true,
+	"/etc/clouddeploy/state.json": true,
+}
+
+// resolveSunshineSetcapTarget validates and resolves the binary path
+// setcap will be called against. Returns an error when the input is
+// empty, points at a non-existent path, resolves to a directory, or
+// resolves to a known-disallowed binary (libcap helpers).
+func resolveSunshineSetcapTarget(installBin string) (string, error) {
+	installBin = strings.TrimSpace(installBin)
+	if installBin == "" {
+		return "", fmt.Errorf("setcap target is empty")
+	}
+	if !filepath.IsAbs(installBin) {
+		return "", fmt.Errorf("setcap target %q must be an absolute path", installBin)
+	}
+	base := filepath.Base(installBin)
+	if !strings.HasPrefix(strings.ToLower(base), "sunshine") {
+		return "", fmt.Errorf("setcap target %q basename %q does not start with \"sunshine\"; refusing to call setcap on a non-Sunshine binary", installBin, base)
+	}
+	resolved := installBin
+	if real, err := filepath.EvalSymlinks(installBin); err == nil && strings.TrimSpace(real) != "" {
+		resolved = real
+	} else if err != nil && !os.IsNotExist(err) {
+		// EvalSymlinks failed for a reason other than ENOENT (e.g. a
+		// broken symlink chain). Fall through with the raw path so the
+		// caller still surfaces it, but record nothing extra here.
+		_ = err
+	}
+	if disallowedSetcapTargets[resolved] || disallowedSetcapTargets[installBin] {
+		return "", fmt.Errorf("setcap target %q resolved to disallowed path %q; refusing to call setcap on itself or a libcap helper", installBin, resolved)
+	}
+	st, err := os.Stat(resolved)
+	if err != nil {
+		return "", fmt.Errorf("setcap target %q (resolved=%q) cannot be stat'd: %w", installBin, resolved, err)
+	}
+	if st.IsDir() {
+		return "", fmt.Errorf("setcap target %q (resolved=%q) is a directory", installBin, resolved)
+	}
+	if st.Mode()&0o111 == 0 {
+		return "", fmt.Errorf("setcap target %q (resolved=%q) is not executable", installBin, resolved)
+	}
+	return resolved, nil
 }
 
 func attemptSunshineSetcap(ctx context.Context, deps *Deps, details map[string]any, target string, fn func(context.Context, *Deps, string) error, log *slog.Logger) {
@@ -858,6 +930,21 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 			return failPhase(deps, StreamingServicesName, details, "KWin not ready", err, true)
 		}
 		_ = run(ctx, deps, "", []string{forceKwinModeScriptPath}, 90*time.Second, true)
+		// Guarantee NVIDIA EGL/GBM platform registration before Sunshine
+		// boots. The probe phase already writes these when it runs;
+		// streaming_services re-asserts them so a resumed deploy that
+		// skipped the probe still gets a working EGL stack. Idempotent.
+		eglVendorErr := ensureNVIDIAEGLVendorJSON()
+		eglGBMErr := ensureNVIDIAEGLExternalPlatformJSON()
+		details["egl_vendor_json_written"] = eglVendorErr == nil
+		details["egl_external_platform_json_written"] = eglGBMErr == nil
+		if eglVendorErr != nil {
+			details["egl_vendor_json_error"] = eglVendorErr.Error()
+		}
+		if eglGBMErr != nil {
+			details["egl_external_platform_json_error"] = eglGBMErr.Error()
+		}
+		_ = run(ctx, deps, "", []string{"ldconfig"}, time.Minute, true)
 		ensureUinput(ctx, deps, desk.User, details)
 		drm := selectedDRMDevice(deps)
 		if drm == "" {
@@ -871,6 +958,8 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 		if credsUser != "" {
 			details["sunshine_username"] = credsUser
 		}
+		deps.State.SunshineCredentialsPresent = credsSet
+		deps.State.SunshineCredentialsUser = credsUser
 		if credsErr != nil {
 			details["sunshine_credentials_warning"] = credsErr.Error()
 			if deps.Unattended || (deps.Profile != nil && deps.Profile.Deploy.Unattended) {
@@ -886,17 +975,45 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
+// uinputUdevRuleBody is what /etc/udev/rules.d/70-clouddeploy-uinput.rules
+// gets every deploy. The `static_node=uinput` OPTION asks the kernel to
+// create /dev/uinput at module-load time even before the first hot-plug
+// event fires, so Sunshine sees the node the moment uinput is loaded.
+// MODE="0660", GROUP="input" + cloudgamer in the input group is the
+// permission triangle Moonlight controller/keyboard injection needs.
+const uinputUdevRuleBody = `# Managed by clouddeploy v3 (phase streaming_services).
+# Static-node + group permissions for Moonlight controller/keyboard input.
+KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+`
+
+// uinputModulesLoadBody persists uinput across reboots. Without this,
+// the live VM lost Moonlight input until someone manually modprobed
+// uinput, which silently disabled the DS5 controller backend with
+// "permission denied".
+const uinputModulesLoadBody = `# Managed by clouddeploy v3 - load uinput at boot.
+uinput
+`
+
 func ensureUinput(ctx context.Context, deps *Deps, user string, details map[string]any) {
 	_ = run(ctx, deps, "", []string{"modprobe", "uinput"}, time.Minute, true)
-	rule := `KERNEL=="uinput", MODE="0660", GROUP="input"` + "\n"
 	if !deps.DryRun {
-		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-uinput.rules", []byte(rule), 0o644)
+		if err := os.MkdirAll("/etc/modules-load.d", 0o755); err == nil {
+			_ = os.WriteFile("/etc/modules-load.d/uinput.conf", []byte(uinputModulesLoadBody), 0o644)
+			details["uinput_modules_load_conf"] = "/etc/modules-load.d/uinput.conf"
+		}
+		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-uinput.rules", []byte(uinputUdevRuleBody), 0o644)
 	}
 	_ = run(ctx, deps, "", []string{"udevadm", "control", "--reload-rules"}, time.Minute, true)
 	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uinput"}, time.Minute, true)
+	// Add cloudgamer to the input group permanently. Without group
+	// membership the udev rule's MODE=0660,GROUP=input doesn't give
+	// the service user write access.
+	_ = run(ctx, deps, "", []string{"usermod", "-aG", "input", user}, 15*time.Second, true)
 	details["uinput_exists"] = pathExists("/dev/uinput")
 	details["uinput_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"}, 15*time.Second, true) == nil
 	details["uinput_rule"] = "/etc/udev/rules.d/70-clouddeploy-uinput.rules"
+	details["uinput_static_node_option"] = strings.Contains(uinputUdevRuleBody, "static_node=uinput")
+	details["uinput_group_member"] = run(ctx, deps, "", []string{"bash", "-lc", "id -nG " + shellQuote(user) + " | tr ' ' '\\n' | grep -qx input"}, 15*time.Second, true) == nil
 }
 
 type deviceAccessProbe struct {
@@ -1044,6 +1161,10 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		return failPhase(deps, StreamValidateName, details, "Sunshine serverinfo unreachable", err, true)
 	}
 	details["serverinfo_bytes"] = len(serverInfo)
+	// Provisionally mark server_ready=true as soon as /serverinfo
+	// responded - subsequent gates may flip it back to false when
+	// they fail. The lifecycle_marker detail records the final state.
+	details["server_ready"] = true
 	codecRaw, codecOK := sunshinecodec.ServerInfoInt(serverInfo, "ServerCodecModeSupport")
 	maxLumaHEVC, maxLumaOK := sunshinecodec.ServerInfoInt(serverInfo, "MaxLumaPixelsHEVC")
 	codecSupport := sunshinecodec.DecodeCodecModeSupport(codecRaw)
@@ -1120,6 +1241,16 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	} else if ev.AV1 && ev.HDR && ev.ColorDepth10 {
 		details["selected_hdr_codec"] = "av1"
 	}
+	details["sample_all_black_seen"] = ev.SampleAllBlackSeen
+	details["sample_all_black"] = ev.SampleAllBlack
+	details["sample_all_black_line"] = ev.SampleAllBlackLine
+	details["sample_nonblack_seen"] = ev.SampleNonblackSeen
+	details["sample_nonblack"] = ev.SampleNonblack
+	details["sample_avg_rgb"] = ev.SampleAvgRGB
+	details["sample_pixel_format"] = ev.SamplePixelFormat
+	details["sample_selected_plane"] = ev.SampleSelectedPlane
+	details["sample_selected_connector"] = ev.SampleSelectedConn
+	details["sample_selected_card_id"] = ev.SampleSelectedCardID
 	if ev.Fatal {
 		return failPhase(deps, StreamValidateName, details, "fatal Sunshine encoder/display log marker", fmt.Errorf("Sunshine fatal marker in journal"), true)
 	}
@@ -1127,6 +1258,13 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		return failPhase(deps, StreamValidateName, details, "invalid Sunshine H.264 HDR encode selection", fmt.Errorf("H.264 session selected HDR/10-bit/p010 or h264_nvenc rejected dynamic range: %s", ev.EncodeSelectionLine), true)
 	}
 	if ev.SelectedCaptureLine == "" {
+		// Server side is healthy but no Moonlight client has produced
+		// a STREAM_DIAG kms capture line yet. Recorded as
+		// lifecycle_marker=pending_moonlight_connect so monitor /
+		// state-show / doctor moonlight can distinguish "we're
+		// waiting on a client" from "the deploy is broken".
+		details["lifecycle_marker"] = "pending_moonlight_connect"
+		details["server_ready"] = true
 		deps.State.MarkPendingMoonlightConnect(StreamValidateName, "Sunshine serverinfo is reachable; waiting for Moonlight stream attempt to produce KMS/NVENC markers")
 		deps.State.Get(StreamValidateName).Details = details
 		_ = deps.PersistState()
@@ -1151,11 +1289,31 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	if !ev.KMS || !ev.Resolution4K || !ev.NVENC || !ev.HEVC {
 		return failPhase(deps, StreamValidateName, details, "missing required Sunshine KMS/NVENC markers", fmt.Errorf("kms=%v resolution4k=%v nvenc=%v hevc=%v", ev.KMS, ev.Resolution4K, ev.NVENC, ev.HEVC), true)
 	}
+	// Sunshine logged at least one KMS sample line. If every sample
+	// it has ever logged came back all-black AND none reported
+	// nonblack pixels, the compositor produced no visible content
+	// (no Plasma desktop, no Wayland clients) - a black stream that
+	// will look broken on the Moonlight side even if every other
+	// marker is healthy. Treat it as fatal so stream_validate can
+	// distinguish "stream reaches Moonlight but is black" from
+	// "stream is good."
+	if ev.SampleAllBlackSeen && ev.SampleAllBlack && !(ev.SampleNonblackSeen && ev.SampleNonblack > 0) {
+		return failPhase(deps, StreamValidateName, details, "Sunshine KMS sample is all-black", fmt.Errorf("sample_all_black=true sample_nonblack=%d avg_rgb=%q pixel_format=%q; the compositor is producing no visible content. Launch a visible Wayland client (e.g. plasmashell or `foot`) and re-run; if Sunshine keeps reporting all-black, the KMS plane is not the one being composited.", ev.SampleNonblack, ev.SampleAvgRGB, ev.SamplePixelFormat), true)
+	}
 	if deps.Profile != nil && deps.Profile.Display.HDR {
 		if !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
-			return failPhase(deps, StreamValidateName, details, "missing required Sunshine HDR Main10 markers", fmt.Errorf("hdr=%v color_depth_10=%v p010=%v", ev.HDR, ev.ColorDepth10, ev.P010), true)
+			// The server produced KMS+NVENC markers BUT the negotiated
+			// session didn't pick the HDR/10-bit/p010 combo. If the
+			// selected codec is H.264, that's a server bug we already
+			// fatal'd above. If the selected codec is HEVC/AV1 but
+			// without 10-bit, it's a client downgrade we surface as
+			// client_codec_mismatch - the operator's deploy is fine
+			// but their Moonlight client probably picked SDR.
+			details["lifecycle_marker"] = "client_codec_mismatch"
+			return failPhase(deps, StreamValidateName, details, "missing required Sunshine HDR Main10 markers", fmt.Errorf("hdr=%v color_depth_10=%v p010=%v (server reached Moonlight but the negotiated session is not 10-bit HDR; check the client's codec preference)", ev.HDR, ev.ColorDepth10, ev.P010), true)
 		}
 	}
+	details["lifecycle_marker"] = "stream_success"
 	deps.State.MarkDone(StreamValidateName, details)
 	_ = deps.PersistState()
 	return nil
@@ -1239,6 +1397,18 @@ Environment=LOGNAME=%s
 Environment=XDG_RUNTIME_DIR=/run/user/%s
 Environment=WAYLAND_DISPLAY=wayland-0
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/%s/bus
+# NVIDIA EGL/GBM platform registration. Without these, Sunshine's
+# capture probe fails with "couldn't open egl display" even though
+# nvidia-smi works and KWin is running. The matching JSON files are
+# written by the streaming_services phase (15_nvidia_gbm.json) and
+# the nvidia-driver phase (10_nvidia.json); the EGL_PLATFORM=gbm +
+# GBM_BACKEND=nvidia-drm pair tells libEGL to use the NVIDIA GBM
+# external platform instead of falling back to mesa/llvmpipe.
+Environment=GBM_BACKEND=nvidia-drm
+Environment=EGL_PLATFORM=gbm
+Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d
+Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 Environment=SUNSHINE_STREAM_DIAG_REUSE_AUDIO_PEER=1
 Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
 Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
@@ -1403,6 +1573,23 @@ type sunshineStreamEvidence struct {
 	VideoFormat                 string
 	ClientDynamicRange          string
 	HDRLine                     string
+	// KMS-sample diagnostics from Sunshine's frame-validation
+	// instrumentation. The live VM showed sample_all_black=true on
+	// every captured frame until a visible Wayland client was
+	// launched; after that the same code path logged
+	// sample_all_black=false, sample_nonblack=254. We parse the most
+	// RECENT marker line (later occurrences overwrite earlier ones)
+	// so the lifecycle in journal is preserved.
+	SampleAllBlackSeen   bool
+	SampleAllBlack       bool
+	SampleAllBlackLine   string
+	SampleNonblackSeen   bool
+	SampleNonblack       int
+	SampleAvgRGB         string
+	SamplePixelFormat    string
+	SampleSelectedPlane  string
+	SampleSelectedConn   string
+	SampleSelectedCardID string
 }
 
 func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
@@ -1476,6 +1663,35 @@ func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
 			strings.Contains(line, "Encoder [nvenc] failed") {
 			ev.Fatal = true
 		}
+		// Sunshine KMS sample diagnostics. We look for any of the
+		// shape variants the fork emits ("sample_all_black=true",
+		// "STREAM_DIAG kms sample sample_all_black=true ...").
+		if strings.Contains(line, "sample_all_black=") {
+			ev.SampleAllBlackSeen = true
+			ev.SampleAllBlackLine = line
+			ev.SampleAllBlack = strings.Contains(line, "sample_all_black=true")
+		}
+		if v := parseLogKV(line, "sample_nonblack"); v != "" {
+			ev.SampleNonblackSeen = true
+			if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+				ev.SampleNonblack = n
+			}
+		}
+		if v := parseLogKV(line, "sample_avg_rgb"); v != "" {
+			ev.SampleAvgRGB = v
+		}
+		if v := parseLogKV(line, "pixel_format"); v != "" && ev.SamplePixelFormat == "" {
+			ev.SamplePixelFormat = v
+		}
+		if v := parseLogKV(line, "selected_plane"); v != "" {
+			ev.SampleSelectedPlane = v
+		}
+		if v := parseLogKV(line, "selected_connector"); v != "" {
+			ev.SampleSelectedConn = v
+		}
+		if v := parseLogKV(line, "selected_card_id"); v != "" {
+			ev.SampleSelectedCardID = v
+		}
 	}
 	return ev
 }
@@ -1520,6 +1736,14 @@ func validateSunshineSelectedCapture(line, drm, connector, width, height string)
 		return fmt.Errorf("Sunshine selected virtual/low-res capture target: %s", line)
 	}
 	return nil
+}
+
+// SetSunshineCredentialsForReset is the public helper the
+// `clouddeployctl sunshine reset-credentials` subcommand calls.
+// Wraps setSunshineCredentials with the same redacted-runner call so
+// the password never reaches a log file. Returns (set, sunUser, err).
+func SetSunshineCredentialsForReset(ctx context.Context, deps *Deps, user, bin string) (bool, string, error) {
+	return setSunshineCredentials(ctx, deps, user, bin)
 }
 
 func setSunshineCredentials(ctx context.Context, deps *Deps, user, bin string) (bool, string, error) {

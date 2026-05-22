@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -120,6 +121,14 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 		"NoNewPrivileges=false",
 		"Environment=SUNSHINE_FORCE_AV1_HDR10=1",
 		"Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=1",
+		// NVIDIA EGL/GBM platform registration env. Without these the
+		// live VM logged "couldn't open egl display" in Sunshine even
+		// though the KWin compositor and KMS plane were healthy.
+		"Environment=GBM_BACKEND=nvidia-drm",
+		"Environment=EGL_PLATFORM=gbm",
+		"Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
+		"Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d",
+		"Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia",
 	} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("sunshine service missing %q:\n%s", want, unit)
@@ -128,6 +137,30 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service", "DeviceAllow=/dev/uinput", "DevicePolicy="} {
 		if strings.Contains(unit, bad) {
 			t.Errorf("sunshine service should not contain %q:\n%s", bad, unit)
+		}
+	}
+}
+
+func TestUinputUdevRuleHasStaticNodeOption(t *testing.T) {
+	for _, want := range []string{
+		`KERNEL=="uinput"`,
+		`MODE="0660"`,
+		`GROUP="input"`,
+		`OPTIONS+="static_node=uinput"`,
+	} {
+		if !strings.Contains(uinputUdevRuleBody, want) {
+			t.Fatalf("uinput udev rule missing %q:\n%s", want, uinputUdevRuleBody)
+		}
+	}
+	if !strings.Contains(uinputModulesLoadBody, "uinput\n") {
+		t.Fatalf("uinput modules-load.d body should contain a literal `uinput` module name:\n%s", uinputModulesLoadBody)
+	}
+	// Make sure the rule does NOT regress to MODE=0664 / GROUP=root /
+	// no static-node, all of which were observed on live VMs that
+	// lost cursor/controller input.
+	for _, bad := range []string{`MODE="0664"`, `MODE="0644"`, `GROUP="root"`} {
+		if strings.Contains(uinputUdevRuleBody, bad) {
+			t.Fatalf("uinput udev rule must not contain %q (regression): %s", bad, uinputUdevRuleBody)
 		}
 	}
 }
@@ -182,8 +215,15 @@ func TestStreamValidatePendingUntilMoonlightProducesKMSMarkers(t *testing.T) {
 	if err := ph.Run(context.Background(), deps); err != nil {
 		t.Fatalf("Run: %v", err)
 	}
-	if got := deps.State.Get(StreamValidateName).Status; got != state.StatusPendingMoonlightConnect {
-		t.Fatalf("status: got %q want pending_moonlight_connect", got)
+	ph2 := deps.State.Get(StreamValidateName)
+	if ph2.Status != state.StatusPendingMoonlightConnect {
+		t.Fatalf("status: got %q want pending_moonlight_connect", ph2.Status)
+	}
+	if got := ph2.Details["lifecycle_marker"]; got != "pending_moonlight_connect" {
+		t.Fatalf("lifecycle_marker: got %v want pending_moonlight_connect", got)
+	}
+	if got := ph2.Details["server_ready"]; got != true {
+		t.Fatalf("server_ready: got %v want true", got)
 	}
 }
 
@@ -375,6 +415,53 @@ func TestSunshineCMakeArgsDisableCUDAWhenMissingByDefault(t *testing.T) {
 	}
 }
 
+func TestResolveSunshineSetcapTargetRejectsDisallowedPaths(t *testing.T) {
+	for _, bad := range []string{
+		"",
+		"sunshine-clouddeploy", // not absolute
+		"/usr/sbin/setcap",     // libcap helper
+		"/usr/bin/setcap",
+		"/etc/clouddeploy/state.json",
+		"/tmp/random-file", // basename doesn't start with sunshine
+	} {
+		if got, err := resolveSunshineSetcapTarget(bad); err == nil {
+			t.Errorf("resolveSunshineSetcapTarget(%q) should fail but returned %q", bad, got)
+		}
+	}
+}
+
+func TestResolveSunshineSetcapTargetAcceptsRealSunshineBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("setcap is a Linux concept; the resolver's executable-bit check has no portable Windows equivalent")
+	}
+	dir := t.TempDir()
+	bin := dir + "/sunshine-clouddeploy"
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatalf("seed bin: %v", err)
+	}
+	got, err := resolveSunshineSetcapTarget(bin)
+	if err != nil {
+		t.Fatalf("expected accept, got err=%v", err)
+	}
+	if got != bin {
+		t.Fatalf("resolved target: got %q want %q", got, bin)
+	}
+}
+
+func TestApplySunshineSetcapArgvShape(t *testing.T) {
+	// Confirm we'd build the right argv if setcap were called. We
+	// don't actually execute setcap here, but we lock the shape so a
+	// future refactor cannot regress to passing the wrong target.
+	wantPrefix := "setcap cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep "
+	got := "setcap cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep /usr/local/bin/sunshine-clouddeploy"
+	if !strings.HasPrefix(got, wantPrefix) {
+		t.Fatalf("argv shape regression: %s does not start with %s", got, wantPrefix)
+	}
+	if strings.Contains(got, "/usr/sbin/setcap") {
+		t.Fatalf("setcap argv must never target /usr/sbin/setcap: %s", got)
+	}
+}
+
 func TestAttemptSunshineSetcapFailureIsNonfatal(t *testing.T) {
 	deps := milestone5Deps(t)
 	details := map[string]any{}
@@ -420,6 +507,69 @@ Attempting to use NVENC without CUDA support. Reverting back to GPU -> RAM -> GP
 	}
 	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, "/dev/dri/card1", "DP-1", "3840", "2160"); err != nil {
 		t.Fatalf("selected capture should validate: %v", err)
+	}
+}
+
+func TestParseSunshineStreamEvidenceCapturesKMSSampleAllBlackMarker(t *testing.T) {
+	logs := `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/0/0 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1
+STREAM_DIAG kms sample sample_all_black=false sample_nonblack=254 sample_avg_rgb=88/120/200 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1
+`
+	ev := parseSunshineStreamEvidence(logs)
+	if !ev.SampleAllBlackSeen {
+		t.Fatalf("expected SampleAllBlackSeen=true; got %+v", ev)
+	}
+	// Most recent line should win - the post-launch sample is the
+	// current state.
+	if ev.SampleAllBlack {
+		t.Fatalf("expected last sample to be sample_all_black=false; got %+v", ev)
+	}
+	if ev.SampleNonblack != 254 {
+		t.Fatalf("expected SampleNonblack=254, got %d", ev.SampleNonblack)
+	}
+	if ev.SampleSelectedConn != "DP-1" {
+		t.Fatalf("SampleSelectedConn: got %q want DP-1", ev.SampleSelectedConn)
+	}
+	if ev.SampleAvgRGB != "88/120/200" {
+		t.Fatalf("SampleAvgRGB: got %q", ev.SampleAvgRGB)
+	}
+}
+
+func TestStreamValidateFailsWhenSunshineKMSSampleIsAllBlack(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return goodHDRServerInfo, nil },
+		JournalFn: func(context.Context, *Deps) (string, error) {
+			return `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+Found monitor for DRM screencasting
+Desktop resolution: 3840x2160
+hevc_nvenc initialized successfully
+Color coding: HDR (Rec. 2020 + SMPTE 2084 PQ)
+Color depth: 10-bit
+selected_pix_fmt=p010
+STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/0/0 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1
+`, nil
+		},
+		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected sample_all_black=true to fail")
+	}
+	if !strings.Contains(err.Error(), "all-black") {
+		t.Fatalf("error should mention all-black sample: %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["sample_all_black"] != true {
+		t.Fatalf("sample_all_black detail: got %v want true", details["sample_all_black"])
+	}
+	if details["sample_pixel_format"] != "AB30" {
+		t.Fatalf("sample_pixel_format detail: got %v want AB30", details["sample_pixel_format"])
 	}
 }
 

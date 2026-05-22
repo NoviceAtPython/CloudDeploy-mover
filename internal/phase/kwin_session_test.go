@@ -711,6 +711,33 @@ func TestKWinSession_Run_ExplicitProfileOverrideBypassesResolver(t *testing.T) {
 	}
 }
 
+func TestCleanStaleKDEConfig_SkipsWhenPriorRunDone(t *testing.T) {
+	deps := kwinDeps(t)
+	deps.State.MarkDone(KWinSessionName, map[string]any{"unit": "kwin-realvt.service"})
+	if got := shouldCleanStaleKDEConfig(deps); got {
+		t.Fatalf("shouldCleanStaleKDEConfig: got true, want false (prior run was done)")
+	}
+}
+
+func TestCleanStaleKDEConfig_RemovesPathsAfterFailure(t *testing.T) {
+	deps := kwinDeps(t)
+	deps.State.MarkFailed(KWinSessionName, "previous failure", errors.New("boom"), true)
+	if got := shouldCleanStaleKDEConfig(deps); !got {
+		t.Fatalf("shouldCleanStaleKDEConfig: got false, want true (prior run failed)")
+	}
+}
+
+func TestCleanStaleKDEConfig_PreservesKwinrc(t *testing.T) {
+	// kwinrc should NEVER appear in the cleanup list. The user may
+	// have hand-tuned that file; we only ever wipe kscreen output
+	// sidecars + caches.
+	for _, rel := range staleKDEConfigPaths {
+		if strings.HasSuffix(rel, "kwinrc") || rel == ".config/kwinrc" {
+			t.Fatalf("cleanup list must NOT touch ~/.config/kwinrc: %v", staleKDEConfigPaths)
+		}
+	}
+}
+
 func TestParseKWinOutputBackendAcceptsPlasma64SectionStyleDRM(t *testing.T) {
 	support := `KWin Support Information
 

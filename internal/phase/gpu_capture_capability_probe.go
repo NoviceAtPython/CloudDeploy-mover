@@ -168,6 +168,23 @@ func probeNVIDIAEGLRuntime(ctx context.Context, deps *Deps, user, uid string, de
 		}
 	}
 	details["egl_vendor_json"] = strings.TrimSpace(jsons)
+	// External-platform JSON: NVIDIA's GBM platform shim. Required
+	// when EGL_PLATFORM=gbm is in the unit env (KWin + Sunshine
+	// services). Without it, libEGL falls back to mesa/llvmpipe and
+	// the KMS+EGL+NVENC interop probe fails with "couldn't open egl
+	// display".
+	gbmJSONs, _ := output(ctx, deps, "", []string{"bash", "-lc", "grep -Rsl 'libnvidia-egl-gbm.so' /usr/share/egl/egl_external_platform.d/*.json 2>/dev/null || true"}, 10*time.Second, false)
+	if strings.Contains(ldconfig, "libnvidia-egl-gbm.so.1") && strings.TrimSpace(gbmJSONs) == "" {
+		err := ensureNVIDIAEGLExternalPlatformJSON()
+		details["egl_external_platform_json_repaired"] = err == nil
+		if err != nil {
+			details["egl_external_platform_json_repair_error"] = err.Error()
+		} else {
+			_ = run(ctx, deps, "", []string{"ldconfig"}, time.Minute, true)
+			gbmJSONs, _ = output(ctx, deps, "", []string{"bash", "-lc", "grep -Rsl 'libnvidia-egl-gbm.so' /usr/share/egl/egl_external_platform.d/*.json 2>/dev/null || true"}, 10*time.Second, false)
+		}
+	}
+	details["egl_external_platform_json"] = strings.TrimSpace(gbmJSONs)
 	eglo, err := outputAsDesktop(ctx, deps, user, uid, []string{"bash", "-lc", "command -v eglinfo >/dev/null 2>&1 && timeout 15s eglinfo --display gbm 2>&1 || true"}, 20*time.Second)
 	details["eglinfo_gbm_excerpt"] = lastLines(eglo, 20)
 	egloLower := strings.ToLower(eglo)
@@ -196,6 +213,30 @@ func ensureNVIDIAEGLVendorJSON() error {
 		return err
 	}
 	return nil
+}
+
+// ensureNVIDIAEGLExternalPlatformJSON writes the NVIDIA GBM external-
+// platform config that libEGL needs to dispatch the GBM platform to
+// the NVIDIA driver shim (libnvidia-egl-gbm.so.1). Without this file
+// AND __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS pointing at the directory,
+// EGL_PLATFORM=gbm falls back to mesa/llvmpipe (or fails) even when
+// libnvidia-egl-gbm.so.1 is loadable. Live VM evidence: manually
+// dropping this file + restarting sunshine-headless.service was the
+// step that fixed "couldn't open egl display" in the capture probe.
+func ensureNVIDIAEGLExternalPlatformJSON() error {
+	const dir = "/usr/share/egl/egl_external_platform.d"
+	const path = dir + "/15_nvidia_gbm.json"
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	content := []byte(`{
+    "file_format_version" : "1.0.0",
+    "ICD" : {
+        "library_path" : "libnvidia-egl-gbm.so.1"
+    }
+}
+`)
+	return os.WriteFile(path, content, 0o644)
 }
 func recordNVENCProbe(ctx context.Context, deps *Deps, details map[string]any, fn func(context.Context, *Deps, string, string) error, user, codec string) bool {
 	err := fn(ctx, deps, user, codec)

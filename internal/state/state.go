@@ -90,6 +90,17 @@ type State struct {
 	// interrupted-running phase). Diagnostic only; never gates
 	// behavior.
 	StartupRecovery *StartupRecovery `json:"startup_recovery,omitempty"`
+	// SunshineCredentialsPresent records whether SUNSHINE_PASS was set
+	// in the apply/resume environment at the start of the deploy. The
+	// unattended pre-flight refuses to start when this is false; the
+	// streaming_services phase later sets it definitively (true once
+	// `sunshine --creds` succeeds AND sunshine_state.json/credentials/
+	// exist). Never contains the password itself.
+	SunshineCredentialsPresent bool `json:"sunshine_credentials_present,omitempty"`
+	// SunshineCredentialsUser is the user the deploy will Sunshine-pair
+	// as (i.e. SUNSHINE_USER, defaulting to the headless desktop user).
+	// Diagnostic only.
+	SunshineCredentialsUser string `json:"sunshine_credentials_user,omitempty"`
 }
 
 // StartupRecovery records the most recent automatic cleanup the

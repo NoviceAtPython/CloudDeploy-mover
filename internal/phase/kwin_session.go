@@ -158,9 +158,16 @@ Environment=KWIN_DRM_DEVICES={{ .KwinDRMDevice }}
 Environment=KWIN_DRM_NO_DIRECT_SCANOUT=1
 Environment=KWIN_FORCE_SW_CURSOR=1
 Environment=KWIN_USE_OVERLAYS=0
-# NVIDIA EGL/GBM bring-up.
+# NVIDIA EGL/GBM bring-up. The EGL_PLATFORM=gbm +
+# __EGL_EXTERNAL_PLATFORM_CONFIG_DIRS pair is what makes libEGL pick
+# up the NVIDIA GBM external platform shim (15_nvidia_gbm.json)
+# instead of falling back to mesa/llvmpipe when nvidia-egl-gbm is
+# present but unmapped. Without it the live VM logs
+# "couldn't open egl display" even with libEGL_nvidia.so.0 loadable.
 Environment=GBM_BACKEND=nvidia-drm
+Environment=EGL_PLATFORM=gbm
 Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json
+Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 {{ .PrivateHDREnv }}
 
@@ -779,7 +786,20 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		}
 	}
 
-	// 2. daemon-reload + enable + start.
+	// 2. Stale-config cleanup. Live VM evidence (2026-05-21): a
+	// rerun of the deploy started KWin, plasmashell, and Sunshine,
+	// but wayland-info reported "no monitors available" because the
+	// previous boot's KScreen/output config had pinned DP-1 to a
+	// mode KWin no longer believed was available. Wiping
+	// ~/.local/share/kscreen and the orphan wayland socket(s) was
+	// the fix. Idempotent and gated on "first launch OR previous
+	// failure" so an operator's hand-tuned kwinrc survives.
+	cleaned := cleanStaleKDEConfigIfNeeded(deps, desk.User, uid)
+	if len(cleaned) > 0 {
+		details["stale_kde_config_removed"] = cleaned
+	}
+
+	// 3. daemon-reload + enable + start.
 	steps := []struct {
 		name string
 		args []string
@@ -1407,4 +1427,93 @@ func (p KWinSession) resolveDRMDevice(requested string, requestedExplicit bool, 
 		return filepath.Join(devdri, "card1"), "fallback card1 present"
 	}
 	return filepath.Join(devdri, "card0"), "fallback final"
+}
+
+// staleKDEConfigPaths is the v2-derived list of per-user KDE
+// config/cache directories that, when carried over from a previous
+// boot, cause KWin/plasmashell to come up with no wl_output or to
+// pin an unavailable mode. Empty string entries are skipped at
+// runtime. Relative to the headless user's $HOME.
+var staleKDEConfigPaths = []string{
+	".local/share/kscreen",
+	".config/kwinoutputconfig.json",
+	".cache/kscreen",
+	".cache/kscreend",
+	".cache/plasmashell",
+	".cache/plasma-systemmonitor",
+}
+
+// cleanStaleKDEConfigIfNeeded removes per-user KDE/KScreen caches and
+// stale wayland sockets BEFORE the kwin-realvt unit starts, but only
+// when the previous kwin_session run failed (or this is the first
+// run). The "operator pinned kwinrc" case is preserved by never
+// touching ~/.config/kwinrc itself - only the output-config sidecars
+// and KScreen cache.
+//
+// Returns the list of paths actually removed (for state.Details).
+// Idempotent and best-effort: errors are swallowed so a missing path
+// never prevents the start.
+func cleanStaleKDEConfigIfNeeded(deps *Deps, user, uid string) []string {
+	if deps == nil || deps.DryRun {
+		return nil
+	}
+	if !shouldCleanStaleKDEConfig(deps) {
+		return nil
+	}
+	home := "/home/" + user
+	var removed []string
+	for _, rel := range staleKDEConfigPaths {
+		if rel == "" {
+			continue
+		}
+		full := filepath.Join(home, rel)
+		if _, err := os.Stat(full); err != nil {
+			continue
+		}
+		if err := os.RemoveAll(full); err == nil {
+			removed = append(removed, full)
+		}
+	}
+	// Orphan wayland sockets from a previous compositor run. KWin
+	// will recreate wayland-0 the moment it owns DRM master; an
+	// orphan socket with no listener confuses Sunshine + wayland-info.
+	if uid != "" {
+		runtimeDir := "/run/user/" + uid
+		entries, _ := os.ReadDir(runtimeDir)
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasPrefix(name, "wayland-") {
+				continue
+			}
+			full := filepath.Join(runtimeDir, name)
+			if err := os.Remove(full); err == nil {
+				removed = append(removed, full)
+			}
+		}
+	}
+	return removed
+}
+
+// shouldCleanStaleKDEConfig returns true when the prior kwin_session
+// phase status is anything OTHER than terminal-done. That covers:
+//   - first ever run (no phase entry)
+//   - last run failed (we want the clean slate)
+//   - last run was pending/running (interrupted; same)
+//
+// When the prior run completed successfully, we leave the operator's
+// configs alone - they may have tuned kscreen output IDs by hand.
+func shouldCleanStaleKDEConfig(deps *Deps) bool {
+	if deps == nil || deps.State == nil {
+		return true
+	}
+	prev := deps.State.Get(KWinSessionName)
+	if prev == nil {
+		return true
+	}
+	switch prev.Status {
+	case statepkg.StatusDone:
+		return false
+	default:
+		return true
+	}
 }
