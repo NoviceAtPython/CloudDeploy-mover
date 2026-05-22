@@ -43,7 +43,6 @@ const (
 	cudaNvidiaSmiTimeout    = 15 * time.Second
 	cudaSmokeCompileTimeout = 120 * time.Second
 	cudaSmokeRunTimeout     = 30 * time.Second
-	cudaTimeoutKillAfter    = 5 * time.Second
 )
 
 // CudaSmokeProgram is the trivial .cu file the phase compiles after
@@ -165,6 +164,13 @@ type Cuda struct {
 	// SmokeDirOverride lets tests redirect the smoke staging dir to a
 	// t.TempDir(). Empty = CudaSmokeDir.
 	SmokeDirOverride string
+
+	// Timeout overrides are test hooks. Production uses the constants
+	// above so live deploys get fixed, predictable ceilings.
+	NvccVersionTimeoutOverride  time.Duration
+	NvidiaSmiTimeoutOverride    time.Duration
+	SmokeCompileTimeoutOverride time.Duration
+	SmokeRunTimeoutOverride     time.Duration
 }
 
 // Name implements Phase.
@@ -776,7 +782,7 @@ func (p Cuda) verifyAndFinish(
 	details map[string]any,
 	log *slog.Logger,
 ) error {
-	log.Info("phase cuda: probing nvcc version", "timeout", cudaNvccVersionTimeout.String())
+	log.Info("phase cuda: probing nvcc version", "timeout", p.nvccVersionTimeout().String())
 	nvccProbe := p.readNvccReleaseDetailed(ctx, deps)
 	rel := nvccProbe.Release
 	layout := p.detectCudaLayout()
@@ -790,7 +796,7 @@ func (p Cuda) verifyAndFinish(
 	details["selection_policy"] = string(selection.Policy)
 	details["nvcc_version"] = rel.Full()
 	details["nvcc_path"] = nvccProbe.Path
-	details["nvcc_version_timeout"] = cudaNvccVersionTimeout.String()
+	details["nvcc_version_timeout"] = p.nvccVersionTimeout().String()
 	if nvccProbe.Error != nil {
 		details["nvcc_version_error"] = nvccProbe.Error.Error()
 		details["nvcc_version_reason"] = nvccProbe.Error.Reason
@@ -901,14 +907,15 @@ func (p Cuda) readNvccReleaseDetailed(ctx context.Context, deps *Deps) nvccProbe
 		nvcc = "nvcc"
 	}
 	start := time.Now()
+	limit := p.nvccVersionTimeout()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    timeoutArgv(cudaNvccVersionTimeout, nvcc, "--version"),
+		Argv:    []string{nvcc, "--version"},
 		LogFile: "-",
-		Timeout: cudaNvccVersionTimeout + cudaTimeoutKillAfter + 5*time.Second,
+		Timeout: limit,
 	})
 	if res.Err != nil {
 		reason := "nvcc_version_failed"
-		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+		if res.TimedOut {
 			reason = "nvcc_version_timeout"
 		}
 		return nvccProbeResult{
@@ -916,7 +923,7 @@ func (p Cuda) readNvccReleaseDetailed(ctx context.Context, deps *Deps) nvccProbe
 			Error: &cudaStageError{
 				Stage:      "nvcc_version",
 				Reason:     reason,
-				Limit:      cudaNvccVersionTimeout,
+				Limit:      limit,
 				Elapsed:    elapsedOr(res.Duration, start),
 				StdoutTail: tailLines(res.Stdout, 8),
 				StderrTail: tailLines(res.Stderr, 8),
@@ -1049,8 +1056,10 @@ func (p Cuda) runSmokeIfRequested(
 	if !compileSmokeTest {
 		return nil
 	}
-	details["smoke_compile_timeout"] = cudaSmokeCompileTimeout.String()
-	details["smoke_run_timeout"] = cudaSmokeRunTimeout.String()
+	compileTimeout := p.smokeCompileTimeout()
+	runTimeout := p.smokeRunTimeout()
+	details["smoke_compile_timeout"] = compileTimeout.String()
+	details["smoke_run_timeout"] = runTimeout.String()
 	dir := p.SmokeDirOverride
 	if dir == "" {
 		dir = CudaSmokeDir
@@ -1072,10 +1081,10 @@ func (p Cuda) runSmokeIfRequested(
 	details["smoke_binary"] = bin
 	details["smoke_source_generated"] = true
 
-	log.Info("phase cuda: smoke compile start", "src", src, "bin", bin, "timeout", cudaSmokeCompileTimeout.String())
+	log.Info("phase cuda: smoke compile start", "src", src, "bin", bin, "timeout", compileTimeout.String())
 	details["smoke_compile_started"] = true
 	if err := p.smokeCompile(ctx, deps, src, bin); err != nil {
-		err = normalizeCudaStageError("smoke_compile", "smoke_compile_failed", cudaSmokeCompileTimeout, err)
+		err = normalizeCudaStageError("smoke_compile", "smoke_compile_failed", compileTimeout, err)
 		recordCudaStageError(details, err, "smoke_compile")
 		details["compile_smoke_test_passed"] = false
 		details["compile_smoke_test_error"] = err.Error()
@@ -1084,10 +1093,10 @@ func (p Cuda) runSmokeIfRequested(
 	details["compile_smoke_test_passed"] = true
 	log.Info("phase cuda: smoke compile success", "bin", bin)
 
-	log.Info("phase cuda: smoke run start", "bin", bin, "timeout", cudaSmokeRunTimeout.String())
+	log.Info("phase cuda: smoke run start", "bin", bin, "timeout", runTimeout.String())
 	details["smoke_run_started"] = true
 	if runErr := p.smokeRun(ctx, deps, bin); runErr != nil {
-		runErr = normalizeCudaStageError("smoke_run", "smoke_run_failed", cudaSmokeRunTimeout, runErr)
+		runErr = normalizeCudaStageError("smoke_run", "smoke_run_failed", runTimeout, runErr)
 		recordCudaStageError(details, runErr, "smoke_run")
 		log.Warn("phase cuda: smoke binary run failed", "err", runErr)
 		details["runtime_smoke_test_passed"] = false
@@ -1113,20 +1122,21 @@ func (p Cuda) smokeCompile(ctx context.Context, deps *Deps, src, bin string) err
 		nvcc = "nvcc"
 	}
 	start := time.Now()
+	limit := p.smokeCompileTimeout()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    timeoutArgv(cudaSmokeCompileTimeout, nvcc, "-o", bin, src),
+		Argv:    []string{nvcc, "-o", bin, src},
 		Sudo:    true,
-		Timeout: cudaSmokeCompileTimeout + cudaTimeoutKillAfter + 10*time.Second,
+		Timeout: limit,
 	})
 	if res.Err != nil {
 		reason := "smoke_compile_failed"
-		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+		if res.TimedOut {
 			reason = "smoke_compile_timeout"
 		}
 		return &cudaStageError{
 			Stage:      "smoke_compile",
 			Reason:     reason,
-			Limit:      cudaSmokeCompileTimeout,
+			Limit:      limit,
 			Elapsed:    elapsedOr(res.Duration, start),
 			StdoutTail: tailLines(res.Stdout, 12),
 			StderrTail: tailLines(res.Stderr, 12),
@@ -1144,20 +1154,21 @@ func (p Cuda) smokeRun(ctx context.Context, deps *Deps, bin string) error {
 		return nil
 	}
 	start := time.Now()
+	limit := p.smokeRunTimeout()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    timeoutArgv(cudaSmokeRunTimeout, bin),
+		Argv:    []string{bin},
 		Sudo:    true,
-		Timeout: cudaSmokeRunTimeout + cudaTimeoutKillAfter + 10*time.Second,
+		Timeout: limit,
 	})
 	if res.Err != nil {
 		reason := "smoke_run_failed"
-		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+		if res.TimedOut {
 			reason = "smoke_run_timeout"
 		}
 		return &cudaStageError{
 			Stage:      "smoke_run",
 			Reason:     reason,
-			Limit:      cudaSmokeRunTimeout,
+			Limit:      limit,
 			Elapsed:    elapsedOr(res.Duration, start),
 			StdoutTail: tailLines(res.Stdout, 8),
 			StderrTail: tailLines(res.Stderr, 8),
@@ -1246,17 +1257,6 @@ func cudaFailureSummary(err error) string {
 	return "CUDA validation failed"
 }
 
-func timeoutArgv(limit time.Duration, argv0 string, args ...string) []string {
-	out := []string{
-		"timeout",
-		"--kill-after=" + secondsString(cudaTimeoutKillAfter),
-		secondsString(limit),
-		argv0,
-	}
-	out = append(out, args...)
-	return out
-}
-
 func secondsString(d time.Duration) string {
 	if d <= 0 {
 		return "0s"
@@ -1277,6 +1277,34 @@ func elapsedOr(d time.Duration, started time.Time) time.Duration {
 	return 0
 }
 
+func (p Cuda) nvccVersionTimeout() time.Duration {
+	if p.NvccVersionTimeoutOverride > 0 {
+		return p.NvccVersionTimeoutOverride
+	}
+	return cudaNvccVersionTimeout
+}
+
+func (p Cuda) nvidiaSmiTimeout() time.Duration {
+	if p.NvidiaSmiTimeoutOverride > 0 {
+		return p.NvidiaSmiTimeoutOverride
+	}
+	return cudaNvidiaSmiTimeout
+}
+
+func (p Cuda) smokeCompileTimeout() time.Duration {
+	if p.SmokeCompileTimeoutOverride > 0 {
+		return p.SmokeCompileTimeoutOverride
+	}
+	return cudaSmokeCompileTimeout
+}
+
+func (p Cuda) smokeRunTimeout() time.Duration {
+	if p.SmokeRunTimeoutOverride > 0 {
+		return p.SmokeRunTimeoutOverride
+	}
+	return cudaSmokeRunTimeout
+}
+
 func (p Cuda) probeNvidiaSmi(ctx context.Context, deps *Deps, details map[string]any, log *slog.Logger) {
 	if details == nil || deps == nil || deps.Runner == nil {
 		return
@@ -1286,16 +1314,17 @@ func (p Cuda) probeNvidiaSmi(ctx context.Context, deps *Deps, details map[string
 		details["nvidia_smi_reason"] = "skipped_non_linux"
 		return
 	}
+	limit := p.nvidiaSmiTimeout()
 	if log != nil {
-		log.Info("phase cuda: probing nvidia-smi", "timeout", cudaNvidiaSmiTimeout.String())
+		log.Info("phase cuda: probing nvidia-smi", "timeout", limit.String())
 	}
 	start := time.Now()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    timeoutArgv(cudaNvidiaSmiTimeout, "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"),
+		Argv:    []string{"nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"},
 		LogFile: "-",
-		Timeout: cudaNvidiaSmiTimeout + cudaTimeoutKillAfter + 5*time.Second,
+		Timeout: limit,
 	})
-	details["nvidia_smi_timeout"] = cudaNvidiaSmiTimeout.String()
+	details["nvidia_smi_timeout"] = limit.String()
 	details["nvidia_smi_elapsed"] = elapsedOr(res.Duration, start).Round(time.Millisecond).String()
 	details["nvidia_smi_stdout_tail"] = tailLines(res.Stdout, 8)
 	details["nvidia_smi_stderr_tail"] = tailLines(res.Stderr, 8)
@@ -1306,14 +1335,14 @@ func (p Cuda) probeNvidiaSmi(ctx context.Context, deps *Deps, details map[string
 	}
 	details["nvidia_smi_works"] = false
 	reason := "nvidia_smi_failed"
-	if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+	if res.TimedOut {
 		reason = "nvidia_smi_timeout"
 	}
 	details["nvidia_smi_reason"] = reason
 	details["nvidia_smi_error"] = (&cudaStageError{
 		Stage:      "nvidia_smi",
 		Reason:     reason,
-		Limit:      cudaNvidiaSmiTimeout,
+		Limit:      limit,
 		Elapsed:    elapsedOr(res.Duration, start),
 		StdoutTail: tailLines(res.Stdout, 8),
 		StderrTail: tailLines(res.Stderr, 8),

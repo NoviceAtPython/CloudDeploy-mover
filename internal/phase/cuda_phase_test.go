@@ -1494,26 +1494,17 @@ func TestCudaPhase_SmokeCompileTimeoutFailsRequiredWithDiagnostics(t *testing.T)
 	}
 }
 
-func TestCudaPhaseTimeoutArgvUsesGNUTimeoutProcessGroupGuard(t *testing.T) {
-	got := strings.Join(timeoutArgv(30*time.Second, "/tmp/smoke", "--flag"), " ")
-	for _, want := range []string{"timeout", "--kill-after=5s", "30s", "/tmp/smoke", "--flag"} {
-		if !strings.Contains(got, want) {
-			t.Fatalf("timeoutArgv %q missing %q", got, want)
-		}
-	}
-}
-
 func TestCudaPhaseNvccVersionTimeoutIsRecorded(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("uses a POSIX fake timeout shim")
+		t.Skip("uses a POSIX fake nvcc shim")
 	}
 	dir := t.TempDir()
-	writeExecutable(t, filepath.Join(dir, "timeout"), "#!/bin/sh\nprintf 'nvcc stdout tail\\n'\nprintf 'nvcc stderr tail\\n' >&2\nexit 124\n")
+	writeExecutable(t, filepath.Join(dir, "nvcc"), "#!/bin/sh\nprintf 'nvcc stdout tail\\n'\nprintf 'nvcc stderr tail\\n' >&2\nsleep 5\n")
 	oldPath := os.Getenv("PATH")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
 
 	deps := cudaPhaseDeps(t, cudaTestProfile("apt", ""))
-	got := (Cuda{}).readNvccReleaseDetailed(context.Background(), deps)
+	got := (Cuda{NvccVersionTimeoutOverride: 100 * time.Millisecond}).readNvccReleaseDetailed(context.Background(), deps)
 	if got.Error == nil {
 		t.Fatal("expected nvcc timeout error")
 	}
@@ -1527,16 +1518,16 @@ func TestCudaPhaseNvccVersionTimeoutIsRecorded(t *testing.T) {
 
 func TestCudaPhaseNvidiaSmiTimeoutIsRecorded(t *testing.T) {
 	if runtime.GOOS == "windows" {
-		t.Skip("uses a POSIX fake timeout shim")
+		t.Skip("uses a POSIX fake nvidia-smi shim")
 	}
 	dir := t.TempDir()
-	writeExecutable(t, filepath.Join(dir, "timeout"), "#!/bin/sh\nprintf 'smi stdout tail\\n'\nprintf 'smi stderr tail\\n' >&2\nexit 124\n")
+	writeExecutable(t, filepath.Join(dir, "nvidia-smi"), "#!/bin/sh\nprintf 'smi stdout tail\\n'\nprintf 'smi stderr tail\\n' >&2\nsleep 5\n")
 	oldPath := os.Getenv("PATH")
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
 
 	deps := cudaPhaseDeps(t, cudaTestProfile("apt", ""))
 	details := map[string]any{}
-	(Cuda{}).probeNvidiaSmi(context.Background(), deps, details, slog.Default())
+	(Cuda{NvidiaSmiTimeoutOverride: 100 * time.Millisecond}).probeNvidiaSmi(context.Background(), deps, details, slog.Default())
 	if details["nvidia_smi_reason"] != "nvidia_smi_timeout" {
 		t.Fatalf("reason: got %v want nvidia_smi_timeout; details=%+v", details["nvidia_smi_reason"], details)
 	}

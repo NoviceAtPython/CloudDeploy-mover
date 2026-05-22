@@ -224,14 +224,19 @@ func (r *Runner) Exec(ctx context.Context, spec CommandSpec) (res Result) {
 		progPath = resolved
 	}
 
-	// Build *exec.Cmd.
+	// Build *exec.Cmd. We intentionally do not use exec.CommandContext:
+	// on timeout/cancel we need to kill the whole process group, not
+	// just the immediate child. This matters for probes such as CUDA
+	// smoke tests where a child can otherwise keep running under PID 1
+	// and keep pipes open forever.
 	cmdCtx := ctx
 	var cancel context.CancelFunc
 	if spec.Timeout > 0 {
 		cmdCtx, cancel = context.WithTimeout(ctx, spec.Timeout)
 		defer cancel()
 	}
-	cmd := exec.CommandContext(cmdCtx, progPath, spec.Argv[1:]...)
+	cmd := exec.Command(progPath, spec.Argv[1:]...)
+	prepareCommandForTreeKill(cmd)
 	if spec.Cwd != "" {
 		cmd.Dir = spec.Cwd
 	}
@@ -260,7 +265,7 @@ func (r *Runner) Exec(ctx context.Context, spec CommandSpec) (res Result) {
 	cmd.Stderr = stderrW
 
 	// Run.
-	runErr := cmd.Run()
+	runErr := runCommandWithTreeTimeout(cmdCtx, cmd)
 	res.Stdout = stdoutCap.String()
 	res.Stderr = stderrCap.String()
 
@@ -295,6 +300,35 @@ func (r *Runner) Exec(ctx context.Context, spec CommandSpec) (res Result) {
 	}
 	r.appendLogLine(logPath, footer)
 	return res
+}
+
+func runCommandWithTreeTimeout(ctx context.Context, cmd *exec.Cmd) error {
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	waitCh := make(chan error, 1)
+	go func() {
+		waitCh <- cmd.Wait()
+	}()
+
+	select {
+	case err := <-waitCh:
+		return err
+	case <-ctx.Done():
+		terminateProcessTree(cmd)
+		select {
+		case err := <-waitCh:
+			return err
+		case <-time.After(2 * time.Second):
+			forceKillProcessTree(cmd)
+			select {
+			case err := <-waitCh:
+				return err
+			case <-time.After(5 * time.Second):
+				return ctx.Err()
+			}
+		}
+	}
 }
 
 // formatRunHeader returns the "RUN <cmd>" line written to the log
