@@ -18,7 +18,10 @@ nvidia:
   prefer_server: false
 
 cuda:
-  mode: required
+  # Unattended paid-VM runs must keep going to EDID/KWin/Sunshine if
+  # the CUDA detector/smoke test degrades; NVENC validation happens
+  # later and is independent of the CUDA toolkit smoke binary.
+  mode: optional
   method: apt
   selection_policy: latest-compatible
   prefer_major: "13"

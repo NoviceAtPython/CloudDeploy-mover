@@ -351,6 +351,9 @@ func TestHDRCudaAutoProfileSpec(t *testing.T) {
 	if !p.CUDA.AllowCrossDistroCudaRepo {
 		t.Error("cuda.allow_cross_distro_cuda_repo must be true")
 	}
+	if strings.ToLower(p.CUDA.Mode) != "optional" {
+		t.Errorf("cuda-auto profile must use cuda.mode=optional so smoke-test degradation does not block streaming deploys; got %q", p.CUDA.Mode)
+	}
 	if p.CUDA.PreferMajor != "13" {
 		t.Errorf("cuda.prefer_major: got %q want 13", p.CUDA.PreferMajor)
 	}

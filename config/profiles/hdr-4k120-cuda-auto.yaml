@@ -1,4 +1,4 @@
-# hdr-4k120-cuda-auto - HDR streaming + CUDA required, OS AND CUDA
+# hdr-4k120-cuda-auto - HDR streaming + CUDA attempted, OS AND CUDA
 # repo chosen by the resolvers.
 #
 # Composition of two resolvers:
@@ -29,7 +29,10 @@ nvidia:
   prefer_server: false
 
 cuda:
-  mode: required
+  # Auto deploys attempt CUDA for Sunshine build/perf diagnostics, but
+  # the KMS+NVENC gaming path must not be blocked forever by a toolkit
+  # smoke-test hang. Strict CUDA profiles keep cuda.mode=required.
+  mode: optional
   method: apt
   selection_policy: latest-compatible
   prefer_major: "13"

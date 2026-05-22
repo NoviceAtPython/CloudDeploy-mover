@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/cuda"
@@ -76,6 +78,13 @@ func layoutUbuntuArchiveFn() func() cuda.CudaLayout {
 			Headers: "/usr/include/cuda_runtime.h",
 			Libs:    "/usr/lib/x86_64-linux-gnu/libcudart.so.12",
 		}
+	}
+}
+
+func writeExecutable(t *testing.T, path, body string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+		t.Fatalf("write executable %s: %v", path, err)
 	}
 }
 
@@ -1217,7 +1226,7 @@ func TestCudaPhase_SmokeCompileFailureFailsRequiredMode(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected fatal smoke-compile failure in required mode")
 	}
-	if !strings.Contains(err.Error(), "compile smoke test failed") {
+	if !strings.Contains(err.Error(), "CUDA smoke compile failed") {
 		t.Errorf("error should mention compile smoke test failure: %v", err)
 	}
 	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
@@ -1335,10 +1344,7 @@ func TestCudaPhase_CompileSmokeFalseSkipsSmoke(t *testing.T) {
 	}
 }
 
-func TestCudaPhase_SmokeRunFailureIsNonFatalEvenInRequired(t *testing.T) {
-	// "Some headless/cloud contexts may not expose a usable CUDA
-	// device before reboot/driver reload." Compile success must let
-	// the phase succeed even if running the binary fails.
+func TestCudaPhase_SmokeRunFailureFailsRequired(t *testing.T) {
 	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
 	p := cudaTestProfile("runfile", url)
 	p.CUDA.RunfileMaxAttempts = 1
@@ -1365,11 +1371,15 @@ func TestCudaPhase_SmokeRunFailureIsNonFatalEvenInRequired(t *testing.T) {
 		RunfileTmpDirOverride: tmpdir,
 		SmokeDirOverride:      smokeDir,
 	}
-	if err := ph.Run(context.Background(), deps); err != nil {
-		t.Fatalf("required + compile-pass + run-fail must NOT fail the phase; got err: %v", err)
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("required + compile-pass + run-fail must fail clearly")
 	}
-	if got := deps.State.Get(CudaName).Status; got != state.StatusDone {
-		t.Errorf("status: got %q want done", got)
+	if !strings.Contains(err.Error(), "CUDA smoke exited nonzero") {
+		t.Fatalf("error should explain smoke run failure; got %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusFailedFatal {
+		t.Errorf("status: got %q want failed_fatal", got)
 	}
 	d := deps.State.Get(CudaName).Details
 	if d["runtime_smoke_test_passed"] != false {
@@ -1377,6 +1387,161 @@ func TestCudaPhase_SmokeRunFailureIsNonFatalEvenInRequired(t *testing.T) {
 	}
 	if d["compile_smoke_test_passed"] != true {
 		t.Errorf("details.compile_smoke_test_passed must remain true; got %v", d["compile_smoke_test_passed"])
+	}
+}
+
+func TestCudaPhase_SmokeRunTimeoutOptionalMarksDegraded(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.Mode = "optional"
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutCanonicalFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn:   func(context.Context, *Deps, string, string) error { return nil },
+		SmokeRunFn: func(context.Context, *Deps, string) error {
+			return &cudaStageError{
+				Stage:      "smoke_run",
+				Reason:     "smoke_run_timeout",
+				Limit:      cudaSmokeRunTimeout,
+				Elapsed:    cudaSmokeRunTimeout,
+				StdoutTail: "device query started",
+				StderrTail: "still running",
+				Err:        errors.New("simulated timeout"),
+			}
+		},
+		RunfileTmpDirOverride: tmpdir,
+		SmokeDirOverride:      smokeDir,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("optional + smoke timeout should mark degraded and continue: %v", err)
+	}
+	if got := deps.State.Get(CudaName).Status; got != state.StatusSkipped {
+		t.Fatalf("status: got %q want skipped/degraded", got)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["cuda_status"] != "degraded" {
+		t.Fatalf("cuda_status: got %v want degraded", d["cuda_status"])
+	}
+	if d["cuda_degraded_reason"] != "smoke_run_timeout" {
+		t.Fatalf("cuda_degraded_reason: got %v", d["cuda_degraded_reason"])
+	}
+	if d["cuda_required"] != false {
+		t.Fatalf("cuda_required: got %v want false", d["cuda_required"])
+	}
+	if d["smoke_stdout_tail"] != "device query started" || d["smoke_stderr_tail"] != "still running" {
+		t.Fatalf("smoke tails not persisted: %+v", d)
+	}
+}
+
+func TestCudaPhase_SmokeCompileTimeoutFailsRequiredWithDiagnostics(t *testing.T) {
+	url := "https://example/cuda/13.0.2/cuda_13.0.2_580.95.05_linux.run"
+	p := cudaTestProfile("runfile", url)
+	p.CUDA.RunfileMaxAttempts = 1
+	p.CUDA.CompileSmokeTest = true
+	deps := cudaPhaseDeps(t, p)
+	tmpdir := t.TempDir()
+	smokeDir := t.TempDir()
+
+	ph := Cuda{
+		CudaLayoutFn:           layoutCanonicalFn(),
+		NvccProbeFn:            stagedNvccProbe(cuda.NvccRelease{}, cuda.NvccRelease{Major: "13", Minor: "0"}),
+		RepoProbeFn:            func(string) bool { return false },
+		CurrentUbuntuVersionFn: func() string { return "25.10" },
+		DownloadFn: func(_ context.Context, _ *Deps, _ string, dst string) (int64, error) {
+			_ = os.WriteFile(dst, []byte("ok"), 0o644)
+			return cuda.MinRunfileBytes + 1, nil
+		},
+		RunfileCheckFn:   func(context.Context, *Deps, string, string) error { return nil },
+		RunfileInstallFn: func(context.Context, *Deps, string, string) error { return nil },
+		SmokeCompileFn: func(context.Context, *Deps, string, string) error {
+			return &cudaStageError{
+				Stage:      "smoke_compile",
+				Reason:     "smoke_compile_timeout",
+				Limit:      cudaSmokeCompileTimeout,
+				Elapsed:    cudaSmokeCompileTimeout,
+				StdoutTail: "nvcc started",
+				StderrTail: "ptxas still running",
+				Err:        errors.New("simulated timeout"),
+			}
+		},
+		RunfileTmpDirOverride: tmpdir,
+		SmokeDirOverride:      smokeDir,
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatal("expected required compile timeout to fail")
+	}
+	if !strings.Contains(err.Error(), "CUDA smoke compile timed out after 120s") {
+		t.Fatalf("error should name compile timeout: %v", err)
+	}
+	d := deps.State.Get(CudaName).Details
+	if d["smoke_compile_stderr_tail"] != "ptxas still running" {
+		t.Fatalf("compile stderr tail not persisted: %+v", d)
+	}
+}
+
+func TestCudaPhaseTimeoutArgvUsesGNUTimeoutProcessGroupGuard(t *testing.T) {
+	got := strings.Join(timeoutArgv(30*time.Second, "/tmp/smoke", "--flag"), " ")
+	for _, want := range []string{"timeout", "--kill-after=5s", "30s", "/tmp/smoke", "--flag"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("timeoutArgv %q missing %q", got, want)
+		}
+	}
+}
+
+func TestCudaPhaseNvccVersionTimeoutIsRecorded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake timeout shim")
+	}
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "timeout"), "#!/bin/sh\nprintf 'nvcc stdout tail\\n'\nprintf 'nvcc stderr tail\\n' >&2\nexit 124\n")
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+
+	deps := cudaPhaseDeps(t, cudaTestProfile("apt", ""))
+	got := (Cuda{}).readNvccReleaseDetailed(context.Background(), deps)
+	if got.Error == nil {
+		t.Fatal("expected nvcc timeout error")
+	}
+	if got.Error.Reason != "nvcc_version_timeout" {
+		t.Fatalf("reason: got %q want nvcc_version_timeout", got.Error.Reason)
+	}
+	if got.Error.StdoutTail != "nvcc stdout tail" || got.Error.StderrTail != "nvcc stderr tail" {
+		t.Fatalf("tails not captured: stdout=%q stderr=%q", got.Error.StdoutTail, got.Error.StderrTail)
+	}
+}
+
+func TestCudaPhaseNvidiaSmiTimeoutIsRecorded(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("uses a POSIX fake timeout shim")
+	}
+	dir := t.TempDir()
+	writeExecutable(t, filepath.Join(dir, "timeout"), "#!/bin/sh\nprintf 'smi stdout tail\\n'\nprintf 'smi stderr tail\\n' >&2\nexit 124\n")
+	oldPath := os.Getenv("PATH")
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+oldPath)
+
+	deps := cudaPhaseDeps(t, cudaTestProfile("apt", ""))
+	details := map[string]any{}
+	(Cuda{}).probeNvidiaSmi(context.Background(), deps, details, slog.Default())
+	if details["nvidia_smi_reason"] != "nvidia_smi_timeout" {
+		t.Fatalf("reason: got %v want nvidia_smi_timeout; details=%+v", details["nvidia_smi_reason"], details)
+	}
+	if details["nvidia_smi_stdout_tail"] != "smi stdout tail" || details["nvidia_smi_stderr_tail"] != "smi stderr tail" {
+		t.Fatalf("tails not captured: %+v", details)
 	}
 }
 

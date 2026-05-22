@@ -38,11 +38,20 @@ const RunfileCheckCorruptHint = "NVIDIA runfile internal checksum failed; artifa
 	"or pin a different cuda.runfile_url (a different CUDA 13.x version) AND set cuda.runfile_sha256 " +
 	"to a value that passes `sh cuda_*_linux.run --check`."
 
+const (
+	cudaNvccVersionTimeout  = 15 * time.Second
+	cudaNvidiaSmiTimeout    = 15 * time.Second
+	cudaSmokeCompileTimeout = 120 * time.Second
+	cudaSmokeRunTimeout     = 30 * time.Second
+	cudaTimeoutKillAfter    = 5 * time.Second
+)
+
 // CudaSmokeProgram is the trivial .cu file the phase compiles after
 // install to prove that nvcc actually works against the installed
-// toolkit headers + libraries. Running the resulting binary is
-// best-effort (cloud images may not expose a usable CUDA device pre-
-// reboot); we only fail required mode on compile failure.
+// toolkit headers + libraries. Running the resulting binary is also
+// bounded: required mode fails cleanly on compile/run failures, while
+// optional mode records a degraded terminal state and lets the gaming
+// deployment continue to NVENC/Sunshine validation.
 const CudaSmokeProgram = `// clouddeployctl cuda smoke test: prove nvcc + toolkit headers/libs work.
 #include <cuda_runtime.h>
 __global__ void k() {}
@@ -59,6 +68,59 @@ int main(void) {
 
 // CudaSmokeDir is the default staging dir for the smoke test.
 const CudaSmokeDir = "/var/tmp/clouddeploy-cuda-smoke"
+
+type cudaStageError struct {
+	Stage      string
+	Reason     string
+	Limit      time.Duration
+	Elapsed    time.Duration
+	StdoutTail string
+	StderrTail string
+	Err        error
+}
+
+func (e *cudaStageError) Error() string {
+	if e == nil {
+		return ""
+	}
+	switch e.Reason {
+	case "smoke_compile_timeout":
+		return fmt.Sprintf("CUDA smoke compile timed out after %s", secondsString(e.Limit))
+	case "smoke_compile_failed":
+		if e.Err != nil {
+			return "CUDA smoke compile failed: " + e.Err.Error()
+		}
+		return "CUDA smoke compile failed"
+	case "smoke_run_timeout":
+		return fmt.Sprintf("CUDA smoke run timed out after %s", secondsString(e.Limit))
+	case "smoke_run_failed":
+		if e.Err != nil {
+			return "CUDA smoke exited nonzero: " + e.Err.Error()
+		}
+		return "CUDA smoke exited nonzero"
+	case "nvcc_version_timeout":
+		return fmt.Sprintf("CUDA nvcc --version timed out after %s", secondsString(e.Limit))
+	case "nvidia_smi_timeout":
+		return fmt.Sprintf("nvidia-smi timed out after %s", secondsString(e.Limit))
+	}
+	if e.Err != nil {
+		return e.Err.Error()
+	}
+	return e.Reason
+}
+
+func (e *cudaStageError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
+
+type nvccProbeResult struct {
+	Release cuda.NvccRelease
+	Path    string
+	Error   *cudaStageError
+}
 
 // Cuda phase: real v2-equivalent CUDA toolkit install. Honors:
 //
@@ -211,15 +273,19 @@ func (p Cuda) Run(ctx context.Context, deps *Deps) error {
 			"layout_libs":            layout.Libs,
 			"verified_layout":        true,
 		}
+		p.probeNvidiaSmi(ctx, deps, baseDetails, log)
 		if err := p.runSmokeIfRequested(ctx, deps, compileSmokeTest, baseDetails, log); err != nil {
+			recordCudaDegraded(baseDetails, plan, err)
 			if plan.FailsDeployOnError {
-				return p.fail(deps, plan, "compile smoke test failed (already-installed path)", err)
+				return p.failWithDetails(deps, plan, cudaFailureSummary(err), err, baseDetails)
 			}
-			return p.skipNonfatal(deps, plan, "compile smoke test failed (already-installed); mode=optional", baseDetails)
+			return p.skipNonfatal(deps, plan, cudaFailureSummary(err)+"; mode=optional -> degraded", baseDetails)
 		}
 		if err := p.writeProfileSnippet(); err != nil {
 			log.Warn("phase cuda: failed to write profile.d snippet", "err", err)
 		}
+		baseDetails["cuda_status"] = "ok"
+		baseDetails["cuda_required"] = plan.FailsDeployOnError
 		baseDetails["profile_snippet"] = p.profileSnippetPath()
 		deps.State.MarkDone(CudaName, baseDetails)
 		_ = deps.PersistState()
@@ -310,6 +376,7 @@ func (p Cuda) runAptPath(
 				"selection_policy":       string(selection.Policy),
 				"host_ubuntu_version":    hostVersion,
 				"host_codename":          hostCodename,
+				"host_native_repo":       repoSel.HostNative,
 				"cuda_repo_distro_tried": repoSel.Tried,
 				"selected_repo_distro":   "",
 				"cross_distro_cuda_repo": false,
@@ -360,6 +427,7 @@ func (p Cuda) runAptPath(
 		m := map[string]any{
 			"host_ubuntu_version":    hostVersion,
 			"host_codename":          hostCodename,
+			"host_native_repo":       repoSel.HostNative,
 			"cuda_repo_distro_tried": repoSel.Tried,
 			"selected_repo_distro":   repoDisplay,
 			"cross_distro_cuda_repo": repoSel.CrossDistro,
@@ -708,7 +776,9 @@ func (p Cuda) verifyAndFinish(
 	details map[string]any,
 	log *slog.Logger,
 ) error {
-	rel := p.readNvccRelease(ctx, deps)
+	log.Info("phase cuda: probing nvcc version", "timeout", cudaNvccVersionTimeout.String())
+	nvccProbe := p.readNvccReleaseDetailed(ctx, deps)
+	rel := nvccProbe.Release
 	layout := p.detectCudaLayout()
 
 	// Richer state-of-record fields. The pre-existing `expected_major`
@@ -719,6 +789,15 @@ func (p Cuda) verifyAndFinish(
 	details["mode"] = string(plan.Mode)
 	details["selection_policy"] = string(selection.Policy)
 	details["nvcc_version"] = rel.Full()
+	details["nvcc_path"] = nvccProbe.Path
+	details["nvcc_version_timeout"] = cudaNvccVersionTimeout.String()
+	if nvccProbe.Error != nil {
+		details["nvcc_version_error"] = nvccProbe.Error.Error()
+		details["nvcc_version_reason"] = nvccProbe.Error.Reason
+		details["nvcc_version_elapsed"] = nvccProbe.Error.Elapsed.Round(time.Millisecond).String()
+		details["nvcc_version_stdout_tail"] = nvccProbe.Error.StdoutTail
+		details["nvcc_version_stderr_tail"] = nvccProbe.Error.StderrTail
+	}
 	details["cuda_major"] = rel.Major
 	details["selected_major"] = rel.Major
 	details["selected_package"] = stringOr(details, "package", "")
@@ -731,6 +810,8 @@ func (p Cuda) verifyAndFinish(
 	details["layout_headers"] = layout.Headers
 	details["layout_libs"] = layout.Libs
 	details["verified_layout"] = layout.Kind != cuda.LayoutMissing
+	details["cuda_required"] = plan.FailsDeployOnError
+	p.probeNvidiaSmi(ctx, deps, details, log)
 
 	// Source-aware layout requirement.
 	expected := cuda.LayoutFromInstallSource(
@@ -741,14 +822,14 @@ func (p Cuda) verifyAndFinish(
 	if rel.Major == "" {
 		err := fmt.Errorf("cuda verification failed: nvcc_release=%q (could not parse `nvcc --version`)", rel.Full())
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "cuda post-install verification failed", err)
+			return p.failWithDetails(deps, plan, "cuda post-install verification failed", err, details)
 		}
 		return p.skipNonfatal(deps, plan, "cuda verification failed; mode=optional", details)
 	}
 	if layout.Kind == cuda.LayoutMissing {
 		err := fmt.Errorf("cuda verification failed: no usable toolkit layout on disk (looked for /usr/local/cuda/{bin/nvcc,include,lib64} AND /usr/bin/nvcc + /usr/include/cuda_runtime.h|/usr/lib/cuda/include + libcudart)")
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "cuda post-install verification failed", err)
+			return p.failWithDetails(deps, plan, "cuda post-install verification failed", err, details)
 		}
 		return p.skipNonfatal(deps, plan, "cuda verification failed; mode=optional", details)
 	}
@@ -760,29 +841,31 @@ func (p Cuda) verifyAndFinish(
 		err := fmt.Errorf("cuda verification failed: install source=%q expects %q layout but host shows %q",
 			details["source"], expected, layout.Kind)
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "cuda layout does not match install source", err)
+			return p.failWithDetails(deps, plan, "cuda layout does not match install source", err, details)
 		}
 		return p.skipNonfatal(deps, plan, "cuda layout mismatch; mode=optional", details)
 	}
 	if ok, why := selection.SatisfiesNvcc(rel); !ok {
 		err := fmt.Errorf("cuda selection policy not satisfied: %s", why)
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "cuda selection policy not satisfied", err)
+			return p.failWithDetails(deps, plan, "cuda selection policy not satisfied", err, details)
 		}
 		return p.skipNonfatal(deps, plan, "cuda selection policy not satisfied; mode=optional", details)
 	}
 
 	if err := p.runSmokeIfRequested(ctx, deps, compileSmokeTest, details, log); err != nil {
+		recordCudaDegraded(details, plan, err)
 		if plan.FailsDeployOnError {
-			return p.fail(deps, plan, "compile smoke test failed", err)
+			return p.failWithDetails(deps, plan, cudaFailureSummary(err), err, details)
 		}
-		return p.skipNonfatal(deps, plan, "compile smoke test failed; mode=optional", details)
+		return p.skipNonfatal(deps, plan, cudaFailureSummary(err)+"; mode=optional -> degraded", details)
 	}
 
 	if err := p.writeProfileSnippet(); err != nil {
 		log.Warn("phase cuda: writing profile.d snippet failed", "err", err)
 	}
 	details["profile_snippet"] = p.profileSnippetPath()
+	details["cuda_status"] = "ok"
 	deps.State.MarkDone(CudaName, details)
 	_ = deps.PersistState()
 	log.Info("phase cuda: done", "nvcc", rel.Full(), "source", details["source"])
@@ -803,22 +886,48 @@ func (p Cuda) alreadyInstalledMatches(ctx context.Context, deps *Deps, selection
 }
 
 func (p Cuda) readNvccRelease(ctx context.Context, deps *Deps) cuda.NvccRelease {
+	return p.readNvccReleaseDetailed(ctx, deps).Release
+}
+
+func (p Cuda) readNvccReleaseDetailed(ctx context.Context, deps *Deps) nvccProbeResult {
 	if p.NvccProbeFn != nil {
-		return p.NvccProbeFn(ctx, deps)
+		return nvccProbeResult{
+			Release: p.NvccProbeFn(ctx, deps),
+			Path:    "injected",
+		}
 	}
 	nvcc := filepath.Join(cuda.CudaRoot, "bin", "nvcc")
 	if _, err := os.Stat(nvcc); err != nil {
 		nvcc = "nvcc"
 	}
+	start := time.Now()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    []string{nvcc, "--version"},
+		Argv:    timeoutArgv(cudaNvccVersionTimeout, nvcc, "--version"),
 		LogFile: "-",
-		Timeout: 30 * time.Second,
+		Timeout: cudaNvccVersionTimeout + cudaTimeoutKillAfter + 5*time.Second,
 	})
 	if res.Err != nil {
-		return cuda.NvccRelease{}
+		reason := "nvcc_version_failed"
+		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+			reason = "nvcc_version_timeout"
+		}
+		return nvccProbeResult{
+			Path: nvcc,
+			Error: &cudaStageError{
+				Stage:      "nvcc_version",
+				Reason:     reason,
+				Limit:      cudaNvccVersionTimeout,
+				Elapsed:    elapsedOr(res.Duration, start),
+				StdoutTail: tailLines(res.Stdout, 8),
+				StderrTail: tailLines(res.Stderr, 8),
+				Err:        res.Err,
+			},
+		}
 	}
-	return cuda.ParseNvccRelease(res.Stdout)
+	return nvccProbeResult{
+		Release: cuda.ParseNvccRelease(res.Stdout),
+		Path:    nvcc,
+	}
 }
 
 // detectCudaLayout returns the on-disk evidence of an installed CUDA
@@ -924,11 +1033,11 @@ func (p Cuda) writeProfileSnippet() error {
 // smoke test
 // -----------------------------------------------------------------------------
 
-// runSmokeIfRequested writes the smoke .cu, compiles it with nvcc,
-// and (best-effort) runs the compiled binary. Mutates `details` with
-// compile_smoke_test* keys. Returns a non-nil error only on compile
-// failure when compileSmokeTest=true; run failures are recorded but
-// never fatal.
+// runSmokeIfRequested writes the smoke .cu, compiles it with nvcc, and
+// runs the compiled binary under a short timeout. Mutates `details`
+// with compile_smoke_test* and runtime_smoke_test* keys. The caller
+// decides whether a returned error is fatal (cuda.mode=required) or a
+// degraded terminal skip (cuda.mode=optional / auto profiles).
 func (p Cuda) runSmokeIfRequested(
 	ctx context.Context,
 	deps *Deps,
@@ -940,6 +1049,8 @@ func (p Cuda) runSmokeIfRequested(
 	if !compileSmokeTest {
 		return nil
 	}
+	details["smoke_compile_timeout"] = cudaSmokeCompileTimeout.String()
+	details["smoke_run_timeout"] = cudaSmokeRunTimeout.String()
 	dir := p.SmokeDirOverride
 	if dir == "" {
 		dir = CudaSmokeDir
@@ -957,23 +1068,34 @@ func (p Cuda) runSmokeIfRequested(
 		return fmt.Errorf("smoke test write %s: %w", src, err)
 	}
 	details["compile_smoke_test_binary"] = bin
+	details["smoke_source"] = src
+	details["smoke_binary"] = bin
+	details["smoke_source_generated"] = true
 
-	log.Info("phase cuda: compiling smoke test", "src", src, "bin", bin)
+	log.Info("phase cuda: smoke compile start", "src", src, "bin", bin, "timeout", cudaSmokeCompileTimeout.String())
+	details["smoke_compile_started"] = true
 	if err := p.smokeCompile(ctx, deps, src, bin); err != nil {
+		err = normalizeCudaStageError("smoke_compile", "smoke_compile_failed", cudaSmokeCompileTimeout, err)
+		recordCudaStageError(details, err, "smoke_compile")
 		details["compile_smoke_test_passed"] = false
 		details["compile_smoke_test_error"] = err.Error()
 		return fmt.Errorf("nvcc compile %s: %w", src, err)
 	}
 	details["compile_smoke_test_passed"] = true
+	log.Info("phase cuda: smoke compile success", "bin", bin)
 
-	// Best-effort run: record outcome, never fatal.
+	log.Info("phase cuda: smoke run start", "bin", bin, "timeout", cudaSmokeRunTimeout.String())
+	details["smoke_run_started"] = true
 	if runErr := p.smokeRun(ctx, deps, bin); runErr != nil {
-		log.Warn("phase cuda: smoke binary run failed (non-fatal; no CUDA device on this image?)", "err", runErr)
+		runErr = normalizeCudaStageError("smoke_run", "smoke_run_failed", cudaSmokeRunTimeout, runErr)
+		recordCudaStageError(details, runErr, "smoke_run")
+		log.Warn("phase cuda: smoke binary run failed", "err", runErr)
 		details["runtime_smoke_test_passed"] = false
 		details["runtime_smoke_test_error"] = runErr.Error()
-	} else {
-		details["runtime_smoke_test_passed"] = true
+		return fmt.Errorf("run CUDA smoke binary %s: %w", bin, runErr)
 	}
+	details["runtime_smoke_test_passed"] = true
+	log.Info("phase cuda: smoke run success", "bin", bin)
 	return nil
 }
 
@@ -990,14 +1112,26 @@ func (p Cuda) smokeCompile(ctx context.Context, deps *Deps, src, bin string) err
 	if _, err := os.Stat(nvcc); err != nil {
 		nvcc = "nvcc"
 	}
+	start := time.Now()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    []string{nvcc, "-o", bin, src},
+		Argv:    timeoutArgv(cudaSmokeCompileTimeout, nvcc, "-o", bin, src),
 		Sudo:    true,
-		Timeout: 5 * time.Minute,
+		Timeout: cudaSmokeCompileTimeout + cudaTimeoutKillAfter + 10*time.Second,
 	})
 	if res.Err != nil {
-		return fmt.Errorf("%s -o %s %s: %w; stderr=%q",
-			nvcc, bin, src, res.Err, tailLines(res.Stderr, 12))
+		reason := "smoke_compile_failed"
+		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+			reason = "smoke_compile_timeout"
+		}
+		return &cudaStageError{
+			Stage:      "smoke_compile",
+			Reason:     reason,
+			Limit:      cudaSmokeCompileTimeout,
+			Elapsed:    elapsedOr(res.Duration, start),
+			StdoutTail: tailLines(res.Stdout, 12),
+			StderrTail: tailLines(res.Stderr, 12),
+			Err:        fmt.Errorf("%s -o %s %s: %w", nvcc, bin, src, res.Err),
+		}
 	}
 	return nil
 }
@@ -1009,15 +1143,182 @@ func (p Cuda) smokeRun(ctx context.Context, deps *Deps, bin string) error {
 	if deps.DryRun {
 		return nil
 	}
+	start := time.Now()
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
-		Argv:    []string{bin},
+		Argv:    timeoutArgv(cudaSmokeRunTimeout, bin),
 		Sudo:    true,
-		Timeout: 30 * time.Second,
+		Timeout: cudaSmokeRunTimeout + cudaTimeoutKillAfter + 10*time.Second,
 	})
 	if res.Err != nil {
-		return fmt.Errorf("run %s: %w; stderr=%q", bin, res.Err, tailLines(res.Stderr, 5))
+		reason := "smoke_run_failed"
+		if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+			reason = "smoke_run_timeout"
+		}
+		return &cudaStageError{
+			Stage:      "smoke_run",
+			Reason:     reason,
+			Limit:      cudaSmokeRunTimeout,
+			Elapsed:    elapsedOr(res.Duration, start),
+			StdoutTail: tailLines(res.Stdout, 8),
+			StderrTail: tailLines(res.Stderr, 8),
+			Err:        fmt.Errorf("run %s: %w", bin, res.Err),
+		}
 	}
 	return nil
+}
+
+func normalizeCudaStageError(stage, fallbackReason string, limit time.Duration, err error) error {
+	if err == nil {
+		return nil
+	}
+	var se *cudaStageError
+	if errors.As(err, &se) {
+		return se
+	}
+	return &cudaStageError{
+		Stage:   stage,
+		Reason:  fallbackReason,
+		Limit:   limit,
+		Elapsed: 0,
+		Err:     err,
+	}
+}
+
+func recordCudaStageError(details map[string]any, err error, prefix string) {
+	if details == nil || err == nil {
+		return
+	}
+	var se *cudaStageError
+	if !errors.As(err, &se) || se == nil {
+		details[prefix+"_error"] = err.Error()
+		return
+	}
+	details[prefix+"_reason"] = se.Reason
+	details[prefix+"_error"] = se.Error()
+	if se.Elapsed > 0 {
+		details[prefix+"_elapsed"] = se.Elapsed.Round(time.Millisecond).String()
+	}
+	if se.Limit > 0 {
+		details[prefix+"_limit"] = se.Limit.String()
+	}
+	if se.StdoutTail != "" {
+		details[prefix+"_stdout_tail"] = se.StdoutTail
+	}
+	if se.StderrTail != "" {
+		details[prefix+"_stderr_tail"] = se.StderrTail
+	}
+	// Compatibility aliases for the live-run debug fields the operator
+	// asked to see in state.json after a CUDA smoke timeout.
+	switch prefix {
+	case "smoke_compile":
+		details["smoke_compile_elapsed"] = details[prefix+"_elapsed"]
+		details["smoke_compile_stdout_tail"] = se.StdoutTail
+		details["smoke_compile_stderr_tail"] = se.StderrTail
+	case "smoke_run":
+		details["smoke_run_elapsed"] = details[prefix+"_elapsed"]
+		details["smoke_stdout_tail"] = se.StdoutTail
+		details["smoke_stderr_tail"] = se.StderrTail
+	}
+}
+
+func recordCudaDegraded(details map[string]any, plan cuda.PlanResult, err error) {
+	if details == nil {
+		return
+	}
+	details["cuda_status"] = "degraded"
+	details["cuda_required"] = plan.FailsDeployOnError
+	details["cuda_degraded_reason"] = cudaFailureReason(err)
+}
+
+func cudaFailureReason(err error) string {
+	var se *cudaStageError
+	if errors.As(err, &se) && se != nil && se.Reason != "" {
+		return se.Reason
+	}
+	return "cuda_validation_failed"
+}
+
+func cudaFailureSummary(err error) string {
+	var se *cudaStageError
+	if errors.As(err, &se) && se != nil {
+		return se.Error()
+	}
+	return "CUDA validation failed"
+}
+
+func timeoutArgv(limit time.Duration, argv0 string, args ...string) []string {
+	out := []string{
+		"timeout",
+		"--kill-after=" + secondsString(cudaTimeoutKillAfter),
+		secondsString(limit),
+		argv0,
+	}
+	out = append(out, args...)
+	return out
+}
+
+func secondsString(d time.Duration) string {
+	if d <= 0 {
+		return "0s"
+	}
+	if d%time.Second == 0 {
+		return fmt.Sprintf("%ds", int(d/time.Second))
+	}
+	return d.String()
+}
+
+func elapsedOr(d time.Duration, started time.Time) time.Duration {
+	if d > 0 {
+		return d
+	}
+	if !started.IsZero() {
+		return time.Since(started)
+	}
+	return 0
+}
+
+func (p Cuda) probeNvidiaSmi(ctx context.Context, deps *Deps, details map[string]any, log *slog.Logger) {
+	if details == nil || deps == nil || deps.Runner == nil {
+		return
+	}
+	if runtime.GOOS != "linux" {
+		details["nvidia_smi_works"] = false
+		details["nvidia_smi_reason"] = "skipped_non_linux"
+		return
+	}
+	if log != nil {
+		log.Info("phase cuda: probing nvidia-smi", "timeout", cudaNvidiaSmiTimeout.String())
+	}
+	start := time.Now()
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    timeoutArgv(cudaNvidiaSmiTimeout, "nvidia-smi", "--query-gpu=name,driver_version", "--format=csv,noheader"),
+		LogFile: "-",
+		Timeout: cudaNvidiaSmiTimeout + cudaTimeoutKillAfter + 5*time.Second,
+	})
+	details["nvidia_smi_timeout"] = cudaNvidiaSmiTimeout.String()
+	details["nvidia_smi_elapsed"] = elapsedOr(res.Duration, start).Round(time.Millisecond).String()
+	details["nvidia_smi_stdout_tail"] = tailLines(res.Stdout, 8)
+	details["nvidia_smi_stderr_tail"] = tailLines(res.Stderr, 8)
+	if res.Err == nil {
+		details["nvidia_smi_works"] = true
+		details["nvidia_smi"] = strings.TrimSpace(res.Stdout)
+		return
+	}
+	details["nvidia_smi_works"] = false
+	reason := "nvidia_smi_failed"
+	if res.TimedOut || res.ExitCode == 124 || res.ExitCode == 137 {
+		reason = "nvidia_smi_timeout"
+	}
+	details["nvidia_smi_reason"] = reason
+	details["nvidia_smi_error"] = (&cudaStageError{
+		Stage:      "nvidia_smi",
+		Reason:     reason,
+		Limit:      cudaNvidiaSmiTimeout,
+		Elapsed:    elapsedOr(res.Duration, start),
+		StdoutTail: tailLines(res.Stdout, 8),
+		StderrTail: tailLines(res.Stderr, 8),
+		Err:        res.Err,
+	}).Error()
 }
 
 // -----------------------------------------------------------------------------
@@ -1068,12 +1369,20 @@ func (p Cuda) httpHead(ctx context.Context, deps *Deps, url string) bool {
 // -----------------------------------------------------------------------------
 
 func (p Cuda) fail(deps *Deps, plan cuda.PlanResult, reason string, err error) error {
+	return p.failWithDetails(deps, plan, reason, err, nil)
+}
+
+func (p Cuda) failWithDetails(deps *Deps, plan cuda.PlanResult, reason string, err error, extra map[string]any) error {
 	deps.State.MarkFailed(CudaName, reason, err, true)
-	deps.State.Get(CudaName).Details = map[string]any{
+	d := map[string]any{
 		"mode":     string(plan.Mode),
 		"fatal":    true,
 		"plan_msg": plan.Rationale,
 	}
+	for k, v := range extra {
+		d[k] = v
+	}
+	deps.State.Get(CudaName).Details = d
 	_ = deps.PersistState()
 	return fmt.Errorf("phase cuda (mode=%s): %s: %w", plan.Mode, reason, err)
 }

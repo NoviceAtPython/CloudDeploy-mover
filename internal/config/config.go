@@ -226,12 +226,11 @@ type CUDAConfig struct {
 
 	// CompileSmokeTest, when true, makes the phase write a trivial
 	// .cu file under /var/tmp/clouddeploy-cuda-smoke and compile it
-	// with the freshly-installed nvcc before MarkDone. Required mode
-	// fails the deploy on compile failure; optional mode records a
-	// nonfatal skip. Running the compiled binary is best-effort
-	// (some headless cloud images have no usable CUDA device until
-	// the next reboot loads the driver fully) and never gates the
-	// phase status today.
+	// with the freshly-installed nvcc before MarkDone, then run it
+	// under a short timeout. Required mode fails the deploy on
+	// compile/run timeout/failure; optional mode records a degraded
+	// terminal skip and continues because NVENC/Sunshine validation is
+	// independent of the CUDA toolkit smoke binary.
 	CompileSmokeTest bool `yaml:"compile_smoke_test"`
 
 	// PreferMajor is a *soft* preference. Under latest-compatible /

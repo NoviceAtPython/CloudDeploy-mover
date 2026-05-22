@@ -11,8 +11,9 @@
 # When 26.04 lands and CloudDeploy validates the streaming stack on
 # it, adding "26.04" to internal/ubuntu.supportedVersions will make
 # this profile auto-upgrade fresh deploys to 26.04 with no profile
-# edit. The cuda phase is intentionally OFF here - layer
-# `hdr-4k120-cuda-auto` on top when CUDA is also required.
+# edit. The cuda phase is intentionally OFF here - use
+# `hdr-4k120-cuda-auto` when CUDA should be attempted nonfatally, or a
+# strict `hdr-4k120-cuda*` profile when CUDA itself must gate deploy.
 #
 # Compared to hdr-4k120 (which hardcodes ubuntu_version: "25.10"),
 # this profile is the right starting point for "deploy this, and let

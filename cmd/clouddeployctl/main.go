@@ -2312,6 +2312,18 @@ Resilient to in-progress apt upgrades that temporarily disable sudo.`,
 				} else {
 					fmt.Printf("current phase: (none; all phases terminal-done)\n")
 				}
+				if ph := st.Get("cuda"); ph != nil && ph.Details != nil && fmt.Sprint(ph.Details["cuda_status"]) == "degraded" {
+					fmt.Printf("cuda degraded/nonfatal: %s", evOrUnknown(fmt.Sprint(ph.Details["cuda_degraded_reason"])))
+					if elapsed := strings.TrimSpace(fmt.Sprint(ph.Details["smoke_run_elapsed"])); elapsed != "" && elapsed != "<nil>" {
+						fmt.Printf(" after %s", elapsed)
+					}
+					fmt.Println()
+					fmt.Printf("  selected repo: %s\n", evOrUnknown(fmt.Sprint(ph.Details["selected_repo_distro"])))
+					fmt.Printf("  host native repo: %s\n", evOrUnknown(fmt.Sprint(ph.Details["host_native_repo"])))
+					fmt.Printf("  nvcc: %s\n", evOrUnknown(fmt.Sprint(ph.Details["layout_nvcc"])))
+					fmt.Printf("  nvidia-smi works: %v\n", ph.Details["nvidia_smi_works"])
+					fmt.Printf("  continuing because cuda_required=%v\n", ph.Details["cuda_required"])
+				}
 				fmt.Println()
 				names := make([]string, 0, len(st.Phases))
 				for name := range st.Phases {
