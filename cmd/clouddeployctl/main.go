@@ -992,6 +992,70 @@ func newDoctorCudaCmd() *cobra.Command {
 				runfileMaxAttempts,
 				cuda.ResolveRunfileMaxAttempts(runfileMaxAttempts, os.Getenv("CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS")))
 			fmt.Printf("  nvcc on PATH                  : %v\n", nvccPresent)
+			// Surface the actual installed runtime/toolkit so the
+			// operator can tell "the profile said required but Sunshine
+			// built without CUDA" from "everything matches". nvidia-smi
+			// reports the driver-side CUDA runtime capability (which is
+			// what NVENC sees); nvcc --version is the toolkit + reports
+			// the SDK version Sunshine could link against. Either may
+			// be absent without that being a deploy failure -- Sunshine
+			// builds with -DSUNSHINE_ENABLE_CUDA=OFF when nvcc is
+			// missing and EnableCUDA != "true".
+			ctx := context.Background()
+			r := runner.New()
+			r.PrintToStdout = false
+			smi := r.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"nvidia-smi", "--query-gpu=driver_version,name", "--format=csv,noheader"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			smiCUDA := r.Exec(ctx, runner.CommandSpec{
+				Argv:    []string{"bash", "-lc", "nvidia-smi 2>/dev/null | awk -F'CUDA Version:' 'NF==2 {print $2}' | awk '{print $1}' | tr -d ' '"},
+				LogFile: "-",
+				Timeout: 10 * time.Second,
+			})
+			fmt.Println()
+			fmt.Println("Installed runtime / toolkit (probed live):")
+			fmt.Printf("  nvidia-smi GPU                : %s\n", evOrUnknown(strings.TrimSpace(smi.Stdout)))
+			fmt.Printf("  nvidia-smi CUDA runtime cap   : %s\n", evOrUnknown(strings.TrimSpace(smiCUDA.Stdout)))
+			if nvccPresent {
+				nvccVer := r.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"bash", "-lc", "nvcc --version 2>/dev/null | tail -n 1"},
+					LogFile: "-",
+					Timeout: 10 * time.Second,
+				})
+				nvccPath := r.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"bash", "-lc", "command -v nvcc"},
+					LogFile: "-",
+					Timeout: 5 * time.Second,
+				})
+				fmt.Printf("  nvcc path                     : %s\n", evOrUnknown(strings.TrimSpace(nvccPath.Stdout)))
+				fmt.Printf("  nvcc --version (last line)    : %s\n", evOrUnknown(strings.TrimSpace(nvccVer.Stdout)))
+			} else {
+				fmt.Println("  nvcc                          : not installed (ok unless profile.cuda.mode=required)")
+			}
+			// CUDA phase state - what was actually installed/skipped.
+			if deps.State != nil {
+				if ph := deps.State.Get("cuda"); ph != nil {
+					fmt.Printf("  cuda phase status             : %s\n", ph.Status)
+					if ph.Reason != "" {
+						fmt.Printf("  cuda phase reason             : %s\n", ph.Reason)
+					}
+					if ph.Details != nil {
+						if v, ok := ph.Details["installed_via"]; ok {
+							fmt.Printf("  cuda installed via            : %v\n", v)
+						}
+						if v, ok := ph.Details["installed_major"]; ok {
+							fmt.Printf("  cuda installed major          : %v\n", v)
+						}
+						if v, ok := ph.Details["skipped_reason"]; ok {
+							fmt.Printf("  cuda skipped reason           : %v\n", v)
+						}
+					}
+				} else {
+					fmt.Println("  cuda phase                    : (not yet run)")
+				}
+			}
 			fmt.Println()
 			fmt.Println("Apt candidate ladder (policy-filtered):")
 			for _, c := range cuda.CandidateLadder(selection.CandidateOptions(packageName)) {
@@ -2213,15 +2277,42 @@ func newStateCmd() *cobra.Command {
 func newMonitorCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "monitor",
-		Short: "Print live CloudDeploy status, lock, process and continuation-log tail",
+		Short: "Print live CloudDeploy status, current phase, service statuses, and continuation-log tail",
+		Long: `monitor is the first place an operator should look when a deploy
+seems stuck. It prints:
+
+  - current phase (the most recent running/failed/pending one)
+  - per-phase status table
+  - reboot/continuation-service state
+  - sunshine credentials present (yes/no -- never the value)
+  - active deploy processes (clouddeployctl/apt-get/dpkg/cmake/ninja)
+  - service statuses (kwin-realvt, plasmashell-on-kwin, sunshine-headless, tailscaled)
+  - tails of /var/log/clouddeploy/continue.log + apt/dpkg logs
+
+Resilient to in-progress apt upgrades that temporarily disable sudo.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := context.Background()
 			statePath, _ := cmd.Flags().GetString("state-path")
 			lockPath, _ := cmd.Flags().GetString("lock-path")
 			fmt.Printf("clouddeploy monitor @ %s\n\n", time.Now().Format(time.RFC3339))
+			fmt.Printf("state path : %s\n", statePath)
+			fmt.Printf("lock path  : %s\n", lockPath)
+			fmt.Printf("log path   : /var/log/clouddeploy/continue.log\n\n")
 			if st, err := state.Load(statePath); err == nil {
 				fmt.Printf("profile=%s reboot_needed=%v resume_target=%s reboot_count=%d same_phase_reboots=%d\n",
 					st.Profile, st.RebootNeeded, evOrUnknown(st.ResumeTarget), st.RebootCount, st.SamePhaseRebootCount)
+				fmt.Printf("sunshine credentials present: %v (user=%s)\n",
+					st.SunshineCredentialsPresent, evOrUnknown(st.SunshineCredentialsUser))
+				// Highlight the current phase (the most recent non-terminal
+				// or most-recently-failed entry). This is the line an operator
+				// scanning monitor output is most likely to be looking for.
+				currentPhase, currentStatus, currentReason := monitorCurrentPhase(st)
+				if currentPhase != "" {
+					fmt.Printf("current phase: %s [%s] %s\n", currentPhase, currentStatus, currentReason)
+				} else {
+					fmt.Printf("current phase: (none; all phases terminal-done)\n")
+				}
+				fmt.Println()
 				names := make([]string, 0, len(st.Phases))
 				for name := range st.Phases {
 					names = append(names, name)
@@ -2229,7 +2320,7 @@ func newMonitorCmd() *cobra.Command {
 				sort.Strings(names)
 				for _, name := range names {
 					ph := st.Phases[name]
-					fmt.Printf("  %-24s %-24s %s\n", name, ph.Status, ph.Reason)
+					fmt.Printf("  %-30s %-26s %s\n", name, ph.Status, ph.Reason)
 				}
 			} else {
 				fmt.Printf("state: cannot read %s: %v\n", statePath, err)
@@ -2238,21 +2329,98 @@ func newMonitorCmd() *cobra.Command {
 			info := state.Inspect(lockPath)
 			fmt.Printf("lock: exists=%v pid=%d alive=%v path=%s\n\n", info.Exists, info.PID, info.HolderLive, info.Path)
 			r := runner.New()
+			// systemctl probes intentionally do NOT use sudo so they
+			// keep working even if the operator's sudo is temporarily
+			// broken by an apt upgrade midway through dist-upgrade.
+			serviceStatus := func(unit string) string {
+				res := r.Exec(ctx, runner.CommandSpec{
+					Argv:    []string{"systemctl", "is-active", unit},
+					LogFile: "-",
+					Timeout: 5 * time.Second,
+				})
+				out := strings.TrimSpace(res.Stdout)
+				if out == "" {
+					out = "(unknown)"
+				}
+				return out
+			}
+			fmt.Println("=== service statuses ===")
+			for _, unit := range []string{
+				"kwin-realvt.service",
+				"plasma-realvt.service",
+				"clouddeploy-plasmashell-on-kwin.service",
+				"sunshine-headless.service",
+				"tailscaled.service",
+				"clouddeploy-v3-continue.service",
+				"clouddeploy-watch-streaming.timer",
+			} {
+				fmt.Printf("  %-44s %s\n", unit, serviceStatus(unit))
+			}
+			fmt.Println()
 			for _, item := range []struct {
 				title string
 				argv  []string
 			}{
-				{"active deploy processes", []string{"bash", "-lc", "ps -eo pid,ppid,etime,args | grep -E 'clouddeployctl|apt-get|dpkg|cmake|ninja' | grep -v grep || true"}},
+				{"active deploy processes", []string{"bash", "-lc", "ps -eo pid,ppid,etime,args 2>/dev/null | grep -E 'clouddeployctl|apt-get|dpkg|cmake|ninja' | grep -v grep || true"}},
 				{"continue.log tail", []string{"bash", "-lc", "tail -n 80 /var/log/clouddeploy/continue.log 2>/dev/null || true"}},
 				{"apt/dpkg tail", []string{"bash", "-lc", "tail -n 80 /var/log/apt/term.log 2>/dev/null || true; tail -n 80 /var/log/dpkg.log 2>/dev/null || true"}},
+				{"sunshine-headless journal", []string{"bash", "-lc", "journalctl -u sunshine-headless.service -n 60 --no-pager 2>/dev/null || true"}},
 			} {
 				fmt.Printf("=== %s ===\n", item.title)
 				res := r.Exec(ctx, runner.CommandSpec{Argv: item.argv, LogFile: "-", Timeout: 15 * time.Second})
 				fmt.Println(strings.TrimRight(res.Stdout, "\n"))
+				fmt.Println()
 			}
+			fmt.Println("If sudo is temporarily broken (apt-get upgrade rewriting /usr/bin/sudo)")
+			fmt.Println("the systemctl probes above still work because they read the unit table")
+			fmt.Println("directly. Wait for the apt phase to finish, then re-run monitor.")
 			return nil
 		},
 	}
+}
+
+// monitorCurrentPhase returns the (name, status, reason) of the most
+// relevant phase. Preference order: running, failed_fatal/nonfatal,
+// pending_moonlight_connect, pending. We assume a deploy has at most
+// one running phase at a time; if multiple are running, the
+// alphabetically-first one wins as a deterministic tiebreaker.
+func monitorCurrentPhase(st *state.State) (string, string, string) {
+	if st == nil {
+		return "", "", ""
+	}
+	names := make([]string, 0, len(st.Phases))
+	for name := range st.Phases {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	priority := map[state.PhaseStatus]int{
+		state.StatusRunning:                 0,
+		state.StatusFailedFatal:             1,
+		state.StatusFailedNonfatal:          2,
+		state.StatusPendingMoonlightConnect: 3,
+		state.StatusPending:                 4,
+	}
+	bestRank := 999
+	bestName := ""
+	bestStatus := ""
+	bestReason := ""
+	for _, name := range names {
+		ph := st.Phases[name]
+		if ph == nil {
+			continue
+		}
+		rank, ok := priority[ph.Status]
+		if !ok {
+			continue
+		}
+		if rank < bestRank {
+			bestRank = rank
+			bestName = name
+			bestStatus = string(ph.Status)
+			bestReason = ph.Reason
+		}
+	}
+	return bestName, bestStatus, bestReason
 }
 
 // -----------------------------------------------------------------------------

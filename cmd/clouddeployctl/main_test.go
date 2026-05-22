@@ -3,6 +3,8 @@ package main
 import (
 	"strings"
 	"testing"
+
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
 func TestApplyOrder_KWinPatchBeforeKWinSession(t *testing.T) {
@@ -63,6 +65,37 @@ func TestFirstAssetURLExtractsViteBundle(t *testing.T) {
 	got := firstAssetURL(html)
 	if got != "/assets/index-abc123.js" {
 		t.Fatalf("firstAssetURL: got %q want /assets/index-abc123.js", got)
+	}
+}
+
+func TestMonitorCurrentPhasePrefersRunning(t *testing.T) {
+	st := state.New("hdr-4k120")
+	st.MarkDone("base_packages", nil)
+	st.MarkRunning("kwin_session")
+	st.MarkFailed("nvidia_driver", "boom", nil, false)
+	name, status, _ := monitorCurrentPhase(st)
+	if name != "kwin_session" || status != string(state.StatusRunning) {
+		t.Fatalf("currentPhase: got (%q, %q), want (kwin_session, running)", name, status)
+	}
+}
+
+func TestMonitorCurrentPhasePicksFailedWhenNoneRunning(t *testing.T) {
+	st := state.New("hdr-4k120")
+	st.MarkDone("base_packages", nil)
+	st.MarkFailed("cuda", "boom", nil, true)
+	name, status, _ := monitorCurrentPhase(st)
+	if name != "cuda" || status != string(state.StatusFailedFatal) {
+		t.Fatalf("currentPhase: got (%q, %q), want (cuda, failed_fatal)", name, status)
+	}
+}
+
+func TestMonitorCurrentPhaseEmptyWhenAllDone(t *testing.T) {
+	st := state.New("hdr-4k120")
+	st.MarkDone("base_packages", nil)
+	st.MarkDone("nvidia_driver", nil)
+	name, _, _ := monitorCurrentPhase(st)
+	if name != "" {
+		t.Fatalf("currentPhase: got %q, want empty (all phases terminal-done)", name)
 	}
 }
 
