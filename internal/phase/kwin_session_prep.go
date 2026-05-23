@@ -1010,11 +1010,18 @@ func (p *KWinSession) defaultHealthProbe(ctx context.Context, deps *Deps, unit, 
 		sample.UnitInvocStable = false
 	}
 	// One probe tick == StablePIDInterval (default 2s) wall-clock.
-	// Multiply consecutive samples by the probe interval to get an
-	// approximate seconds-of-stable PID. We floor the per-tick
-	// contribution at 1 so sub-second test intervals still
-	// accumulate (otherwise stability would never reach 1 and the
-	// caller's `stabilitySeconds >= 1` floor would never fire).
+	// Stability is measured in CONFIRMING samples: the first time we
+	// see a particular MainPID does NOT count as "stable", only
+	// every subsequent same-PID sample does. So:
+	//
+	//   sample 1 (pid=A):  stable = 0  (we have only seen A once)
+	//   sample 2 (pid=A):  stable = 1 * tickSeconds
+	//   sample 3 (pid=A):  stable = 2 * tickSeconds
+	//
+	// This is what catches the live VM restart-loop case: when the
+	// PID bumps every tick, consecutiveStableSamples resets to 1 each
+	// time and StablePIDFor stays at 0, so AllGatesPass keeps
+	// rejecting until enough confirming samples accumulate.
 	interval := p.StablePIDInterval
 	if interval <= 0 {
 		interval = 2 * time.Second
@@ -1023,7 +1030,11 @@ func (p *KWinSession) defaultHealthProbe(ctx context.Context, deps *Deps, unit, 
 	if tickSeconds < 1 {
 		tickSeconds = 1
 	}
-	sample.StablePIDFor = p.healthProbeState.consecutiveStableSamples * tickSeconds
+	confirms := p.healthProbeState.consecutiveStableSamples - 1
+	if confirms < 0 {
+		confirms = 0
+	}
+	sample.StablePIDFor = confirms * tickSeconds
 	return sample
 }
 

@@ -1057,6 +1057,32 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 				details["kwin_late_adopt_invocation_fatals"] = adopt.JournalFatals
 			}
 		}
+		// Restart-loop protection. The probe above only samples
+		// MainPID once. If the unit is restart-looping the PID
+		// will change between samples; verify by re-reading the
+		// PID after a short delay and refusing late adoption if
+		// they differ. The verification interval is the same as
+		// the gate-poll probe interval (default 2s) so the total
+		// added latency is bounded.
+		if adopt.Adoptable {
+			verifyInterval := probeInterval
+			if verifyInterval <= 0 {
+				verifyInterval = 2 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(verifyInterval):
+			}
+			second, err := p.mainPID(ctx, deps, choice.UnitName)
+			details["kwin_late_adopt_verify_pid"] = second
+			if err != nil || second != adopt.MainPID || second <= 0 {
+				adopt.Adoptable = false
+				details["kwin_late_adopt_restart_loop"] = true
+				log.Warn("phase kwin-session: late adopt rejected; MainPID changed between samples (restart loop)",
+					"first", adopt.MainPID, "second", second, "err", err)
+			}
+		}
 		if adopt.Adoptable {
 			log.Info("phase kwin-session: late adoption succeeded after slow start",
 				"unit", choice.UnitName, "main_pid", adopt.MainPID, "socket_present", adopt.SocketPresent)
