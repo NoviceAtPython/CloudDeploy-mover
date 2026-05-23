@@ -372,7 +372,11 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		}
 	}
 	details["wayland_socket_ok"] = p.waylandSocketExists(uid)
-	sysfsConnectors := p.discoverSysfsConnectors()
+	sysfsConnectors, sysfsNames, sysfsErr := p.discoverSysfsConnectors()
+	details["sysfs_class_drm_entries"] = sysfsNames
+	if sysfsErr != nil {
+		details["sysfs_discovery_error"] = sysfsErr.Error()
+	}
 	details["sysfs_connectors"] = sysfsConnectors
 	kernelWarnings := p.kernelDisplayWarnings(ctx, deps)
 	if len(kernelWarnings) > 0 {
@@ -468,7 +472,8 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 				}
 			}
 			attempts = append(attempts, attempt)
-			sysfsConnectors = p.discoverSysfsConnectors()
+			sysfsConnectors, sysfsNames, _ = p.discoverSysfsConnectors()
+			details["sysfs_class_drm_entries_after_repair"] = sysfsNames
 			sys = findSysfsConnector(sysfsConnectors, connector)
 			details["sysfs_connectors_after_repair"] = sysfsConnectors
 			if sys != nil {
@@ -770,31 +775,30 @@ func (p DRMDisplayValidate) waylandSocketExists(uid string) bool {
 	return waylandSocketExists(uid)
 }
 
-func (p DRMDisplayValidate) discoverSysfsConnectors() []DRMConnectorState {
+func (p DRMDisplayValidate) discoverSysfsConnectors() ([]DRMConnectorState, []string, error) {
 	root := p.SysfsRoot
 	if root == "" {
 		root = "/sys"
 	}
 	base := filepath.Join(root, "class", "drm")
-	entries, _ := os.ReadDir(base)
-	var out []DRMConnectorState
+	entries, err := os.ReadDir(base)
+	var out []DRMConnectorState = make([]DRMConnectorState, 0)
+	var allNames []string = make([]string, 0)
+	if err != nil {
+		return out, nil, err
+	}
 	for _, e := range entries {
 		name := e.Name()
-		isDirOrSym := e.IsDir() || (e.Type()&os.ModeSymlink != 0)
-		if isDirOrSym && strings.Contains(name, "-") {
+		allNames = append(allNames, name)
+		if strings.HasPrefix(name, "card") && strings.Contains(name, "-") {
 			full := filepath.Join(base, name)
 			var cardName, connName string
-			if strings.HasPrefix(name, "card") {
-				parts := strings.SplitN(name, "-", 2)
-				if len(parts) != 2 {
-					continue
-				}
-				cardName = parts[0]
-				connName = parts[1]
-			} else {
-				cardName = ""
-				connName = name
+			parts := strings.SplitN(name, "-", 2)
+			if len(parts) != 2 {
+				continue
 			}
+			cardName = parts[0]
+			connName = parts[1]
 			st := DRMConnectorState{
 				Card:          cardName,
 				Name:          connName,
@@ -822,7 +826,7 @@ func (p DRMDisplayValidate) discoverSysfsConnectors() []DRMConnectorState {
 		}
 		return out[i].Name < out[j].Name
 	})
-	return out
+	return out, allNames, nil
 }
 
 func sysfsConnectorIsNVIDIA(connectorPath string) bool {

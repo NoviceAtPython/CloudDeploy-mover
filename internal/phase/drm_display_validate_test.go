@@ -578,7 +578,7 @@ os.MkdirAll(filepath.Join(drmRoot, "card0-HDMI-A-1"), 0o755)
 os.MkdirAll(filepath.Join(drmRoot, "card0-eDP-1"), 0o755)
 os.MkdirAll(filepath.Join(drmRoot, "DP-1"), 0o755)
 
-connectors := p.discoverSysfsConnectors()
+	connectors, _, _ := p.discoverSysfsConnectors()
 find := func(sysfs string) *DRMConnectorState {
 for i := range connectors {
 if connectors[i].SysfsBasename == sysfs {
@@ -592,7 +592,6 @@ cases := map[string]string{
 "card1-DP-2": "DP-2",
 "card0-HDMI-A-1": "HDMI-A-1",
 "card0-eDP-1": "eDP-1",
-"DP-1": "DP-1",
 }
 for sysfs, wantConn := range cases {
 c := find(sysfs)
@@ -620,5 +619,26 @@ got := formatDiscoveredSysfs(list)
     want := "[card0-DP-1 normalized=DP-1 status=connected enabled=enabled modes=[3840x2160@120 1920x1080@60 800x600 ...]]"
 if got != want {
 t.Errorf("got %q, want %q", got, want)
+}
+}
+func TestDiscoverSysfsConnectors_Empty(t *testing.T) {
+temp := t.TempDir()
+p := DRMDisplayValidate{SysfsRoot: temp}
+
+drmRoot := filepath.Join(temp, "class", "drm")
+os.MkdirAll(drmRoot, 0o755)
+
+connectors, names, err := p.discoverSysfsConnectors()
+if err != nil {
+t.Fatalf("unexpected error: %v", err)
+}
+if connectors == nil {
+t.Fatalf("expected empty slice, got nil connectors")
+}
+if names == nil {
+t.Fatalf("expected empty slice, got nil names")
+}
+if len(connectors) != 0 || len(names) != 0 {
+t.Fatalf("expected 0 connectors and names, got %d and %d", len(connectors), len(names))
 }
 }
