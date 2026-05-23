@@ -5,16 +5,50 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 )
 
 // DRMDisplayValidateName is the canonical state-key.
 const DRMDisplayValidateName = "drm_display_validate"
+
+const (
+	DRMFailNoCandidateConnector           = "drm_no_candidate_connector"
+	DRMFailExpectedModeMissing            = "drm_expected_mode_missing"
+	DRMFailKScreenRejectedOutputConfig    = "kscreen_rejected_output_config"
+	DRMFailKScreenSysfsStateMismatch      = "kscreen_sysfs_state_mismatch"
+	DRMFailSysfsEnabledKScreenDisabled    = "drm_sysfs_enabled_but_kscreen_disabled_unverified"
+	DRMVerifiedSysfsWayland               = "drm_output_verified_via_sysfs_and_wayland"
+	DRMWarnNvidiaDumbCreateAlloc          = "nvidia_dumb_create_alloc_warning"
+	DRMDisplayTargetFallbackApplied       = "display_target_fallback_applied"
+	DRMFailDisplayTargetStrictUnavailable = "display_target_strict_unavailable"
+)
+
+type DRMConnectorState struct {
+	Card      string   `json:"card"`
+	Name      string   `json:"name"`
+	Path      string   `json:"path"`
+	Status    string   `json:"status"`
+	Enabled   string   `json:"enabled"`
+	Modes     []string `json:"modes"`
+	NVIDIA    bool     `json:"nvidia"`
+	Connected bool     `json:"connected"`
+	IsEnabled bool     `json:"is_enabled"`
+}
+
+type displayTarget struct {
+	Mode       string `json:"mode"`
+	HDR        bool   `json:"hdr"`
+	Reason     string `json:"reason"`
+	Diagnostic bool   `json:"diagnostic"`
+}
 
 // KScreenDoctorOutput is the parsed shape of `kscreen-doctor -o`.
 // We only model the subset of fields the phase actually cares about
@@ -27,6 +61,9 @@ type KScreenDoctorOutput struct {
 // are stored as "<width>x<height>@<refresh>" strings for stable
 // equality checks.
 type KScreenConnector struct {
+	// ID is the kscreen output id used in commands like
+	// `kscreen-doctor output.<ID>.enable`.
+	ID string
 	// Name is the connector name (e.g. "DP-1", "HDMI-A-1").
 	Name string
 	// Enabled is the boolean kscreen-doctor reports.
@@ -36,8 +73,10 @@ type KScreenConnector struct {
 	// Modes is every mode kscreen-doctor enumerated under this
 	// connector, in the same order it printed them.
 	Modes []string
-	HDR   bool
-	WCG   bool
+	// ModeIDs maps canonical mode strings to kscreen mode ids.
+	ModeIDs map[string]string
+	HDR     bool
+	WCG     bool
 }
 
 // FindConnector returns the connector matching name (case-sensitive),
@@ -64,7 +103,7 @@ func (c KScreenConnector) HasMode(mode string) bool {
 
 // kscreenOutputRE matches the "Output: <id> <Name>" header
 // kscreen-doctor prints. The id is ignored.
-var kscreenOutputRE = regexp.MustCompile(`^Output:\s+\S+\s+(\S+)`)
+var kscreenOutputRE = regexp.MustCompile(`^Output:\s+(\S+)\s+(\S+)`)
 
 // kscreenEnabledRE matches "        enabled" / "        disabled" on
 // its own line (older kscreen-doctor output shape).
@@ -125,7 +164,7 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 		line := strings.TrimRight(raw, "\r")
 		if m := kscreenOutputRE.FindStringSubmatch(line); m != nil {
 			flush()
-			cur = &KScreenConnector{Name: m[1]}
+			cur = &KScreenConnector{ID: m[1], Name: m[2], ModeIDs: map[string]string{}}
 			// Live VM (Plasma 6.4.x): the Output: header line also
 			// includes the connection state inline, e.g.
 			//   "Output: 1 DP-1 hdmi enabled connected priority 1 1"
@@ -146,7 +185,7 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 			continue
 		}
 		if m := kscreenModesLineRE.FindStringSubmatch(line); m != nil {
-			cur.Modes, cur.CurrentMode = parseKScreenModesField(m[1])
+			cur.Modes, cur.CurrentMode, cur.ModeIDs = parseKScreenModesField(m[1])
 			continue
 		}
 		if m := kscreenHDRRE.FindStringSubmatch(line); m != nil {
@@ -165,17 +204,22 @@ func ParseKScreenDoctor(text string) KScreenDoctorOutput {
 // parseKScreenModesField turns "1!  3840x2160@120, 2  1920x1080@60" into
 // ([3840x2160@120, 1920x1080@60], "3840x2160@120") where the second
 // return is the entry marked with "!" (the currently selected mode).
-func parseKScreenModesField(field string) (modes []string, current string) {
-	liveRE := regexp.MustCompile(`\b[0-9]+:([0-9]+x[0-9]+@[0-9.]+)([!*]?)`)
-	for _, m := range liveRE.FindAllStringSubmatch(field, -1) {
-		mode := m[1]
+func parseKScreenModesField(field string) (modes []string, current string, modeIDs map[string]string) {
+	modeIDs = map[string]string{}
+	liveWithIDRE := regexp.MustCompile(`\b([0-9]+):([0-9]+x[0-9]+@[0-9.]+)([!*]?)`)
+	for _, m := range liveWithIDRE.FindAllStringSubmatch(field, -1) {
+		modeID := m[1]
+		mode := m[2]
 		modes = append(modes, mode)
-		if strings.Contains(m[2], "*") {
+		if _, ok := modeIDs[mode]; !ok {
+			modeIDs[mode] = modeID
+		}
+		if strings.Contains(m[3], "*") {
 			current = mode
 		}
 	}
 	if len(modes) > 0 {
-		return modes, current
+		return modes, current, modeIDs
 	}
 	for _, raw := range strings.Split(field, ",") {
 		s := strings.TrimSpace(raw)
@@ -189,6 +233,7 @@ func parseKScreenModesField(field string) (modes []string, current string) {
 		}
 		head := parts[0]
 		modeStr := s
+		modeID := strings.TrimSuffix(strings.TrimSuffix(head, "!"), "*")
 		if len(parts) >= 2 {
 			modeStr = parts[1]
 		}
@@ -199,8 +244,11 @@ func parseKScreenModesField(field string) (modes []string, current string) {
 		}
 		modeStr = strings.TrimSuffix(strings.TrimSuffix(modeStr, "*"), "!")
 		modes = append(modes, modeStr)
+		if _, ok := modeIDs[modeStr]; !ok && modeID != "" {
+			modeIDs[modeStr] = modeID
+		}
 	}
-	return modes, current
+	return modes, current, modeIDs
 }
 
 // FormatMode returns the canonical "<W>x<H>@<refresh>" string from
@@ -244,6 +292,20 @@ type DRMDisplayValidate struct {
 	// DBus name first and bail out cleanly if it's missing. nil =
 	// real `qdbus --session org.kde.KWin /KWin Introspect`.
 	KWinDBusFn func(ctx context.Context, deps *Deps, user, uid string) (bool, string, error)
+
+	// KScreenApplyFn lets tests inject kscreen-doctor repair
+	// attempts. nil = `kscreen-doctor output.N...` via runner.
+	KScreenApplyFn func(ctx context.Context, deps *Deps, user, uid string, args []string) (string, error)
+
+	// WaylandSocketFn overrides the socket presence check.
+	WaylandSocketFn func(uid string) bool
+
+	// SysfsRoot overrides /sys for tests.
+	SysfsRoot string
+
+	// KernelLogFn returns recent kernel log text for warning
+	// classification. nil = best-effort dmesg/journalctl via runner.
+	KernelLogFn func(ctx context.Context, deps *Deps) string
 }
 
 // Name implements Phase.
@@ -276,7 +338,7 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 		"uid":               uid,
 		"connector":         connector,
 		"expected_mode":     wantMode,
-		"wayland_socket_ok": uid != "" && waylandSocketExists(uid),
+		"wayland_socket_ok": uid != "" && p.waylandSocketExists(uid),
 		"kscreen_doctor_ok": false,
 		"enabled":           false,
 		"selected_mode":     "",
@@ -285,8 +347,8 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	unitName := UnitNameForSession(desk.SessionBackend, desk.CompositorMode)
 	details["service_name"] = unitName
 
-	if uid == "" || connector == "" {
-		err := fmt.Errorf("drm-display-validate needs uid (from headless_user) and display.forced_connector to be set; uid=%q connector=%q", uid, connector)
+	if uid == "" {
+		err := fmt.Errorf("drm-display-validate needs uid (from headless_user); uid=%q", uid)
 		details["err"] = err.Error()
 		deps.State.MarkFailed(DRMDisplayValidateName, "missing inputs", err, true)
 		deps.State.Get(DRMDisplayValidateName).Details = details
@@ -296,11 +358,11 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 
 	// Wait briefly for the wayland socket if kwin-session just
 	// started.
-	if !waylandSocketExists(uid) && !deps.DryRun {
+	if !p.waylandSocketExists(uid) && !deps.DryRun {
 		log.Info("phase drm-display-validate: waiting for wayland socket",
 			"socket", waylandSocketPath(uid))
 		deadline := time.Now().Add(15 * time.Second)
-		for time.Now().Before(deadline) && !waylandSocketExists(uid) {
+		for time.Now().Before(deadline) && !p.waylandSocketExists(uid) {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -308,7 +370,18 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 			}
 		}
 	}
-	details["wayland_socket_ok"] = waylandSocketExists(uid)
+	details["wayland_socket_ok"] = p.waylandSocketExists(uid)
+	sysfsConnectors := p.discoverSysfsConnectors()
+	details["sysfs_connectors"] = sysfsConnectors
+	kernelWarnings := p.kernelDisplayWarnings(ctx, deps)
+	if len(kernelWarnings) > 0 {
+		details["kernel_display_warnings"] = kernelWarnings
+		for _, w := range kernelWarnings {
+			if w == DRMWarnNvidiaDumbCreateAlloc {
+				details["nvidia_dumb_create_alloc_warning"] = true
+			}
+		}
+	}
 
 	// Preflight: confirm org.kde.KWin owns the session bus name
 	// BEFORE asking kscreen-doctor to talk to it. Live VM (2026-05-21)
@@ -351,37 +424,111 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	details["kscreen_raw_bytes"] = len(rawOut)
 
 	parsed := ParseKScreenDoctor(rawOut)
-	conn := parsed.FindConnector(connector)
+	details["kscreen_connector_names"] = connectorNames(parsed)
+	connector, conn, sys := selectDisplayConnector(connector, parsed, sysfsConnectors, wantMode)
+	details["connector"] = connector
+	details["selected_connector"] = connector
+	if sys != nil {
+		details["selected_sysfs_connector"] = *sys
+	}
+	if conn == nil && sys == nil {
+		err := fmt.Errorf("no candidate DRM connector found for requested=%q (kscreen=%v sysfs=%v)", connector, connectorNames(parsed), sysfsConnectorNames(sysfsConnectors))
+		details["err"] = err.Error()
+		details["drm_error_category"] = DRMFailNoCandidateConnector
+		deps.State.MarkFailed(DRMDisplayValidateName, DRMFailNoCandidateConnector, err, true)
+		deps.State.Get(DRMDisplayValidateName).Details = details
+		_ = deps.PersistState()
+		return fmt.Errorf("phase drm-display-validate: %w", err)
+	}
+
+	attempts := []map[string]any{}
+	repairRejected := false
+	displayHDR := deps.Profile != nil && deps.Profile.Display.HDR
+	if conn != nil && (!conn.Enabled || (wantMode != "" && !conn.HasMode(wantMode)) || (displayHDR && (!conn.HDR || !conn.WCG))) {
+		targets := displayRepairTargets(conn, wantMode, displayHDR)
+		for _, target := range targets {
+			args, ok := kscreenApplyArgs(*conn, target)
+			if !ok {
+				continue
+			}
+			out, applyErr := p.runKScreenApply(ctx, deps, desk.User, uid, args)
+			attempt := map[string]any{
+				"connector": connector,
+				"target":    target,
+				"args":      args,
+				"ok":        applyErr == nil,
+				"output":    lastLines(out, 8),
+			}
+			if applyErr != nil {
+				attempt["err"] = applyErr.Error()
+				if strings.Contains(strings.ToLower(out+" "+applyErr.Error()), "rejected") {
+					repairRejected = true
+					attempt["category"] = DRMFailKScreenRejectedOutputConfig
+				}
+			}
+			attempts = append(attempts, attempt)
+			sysfsConnectors = p.discoverSysfsConnectors()
+			sys = findSysfsConnector(sysfsConnectors, connector)
+			details["sysfs_connectors_after_repair"] = sysfsConnectors
+			if sys != nil {
+				details["selected_sysfs_connector"] = *sys
+			}
+			rawAfter, rerunErr := p.runKScreen(ctx, deps, desk.User, uid)
+			if rerunErr == nil {
+				parsed = ParseKScreenDoctor(rawAfter)
+				if updated := parsed.FindConnector(connector); updated != nil {
+					conn = updated
+					details["kscreen_after_repair_excerpt"] = lastLines(rawAfter, 20)
+					if conn.Enabled && (wantMode == "" || conn.HasMode(wantMode) || target.Mode != "") {
+						break
+					}
+				}
+			}
+		}
+	}
+	if len(attempts) > 0 {
+		details["kscreen_repair_attempts"] = attempts
+	}
+	if repairRejected {
+		details["kscreen_rejected_output_config"] = true
+	}
 	if conn == nil {
-		// Live VM (2026-05-21): the parser would report
-		// `saw []` even when the raw kscreen output clearly
-		// contained DP-1 + HDR + WCG -- the culprit was ANSI
-		// color escapes. The parser now strips them, but if
-		// we ever land in a new parser-mismatch regression
-		// (newer kscreen output format), call it out as a
-		// PARSER bug rather than an absent-connector bug so
-		// the operator doesn't go looking for a missing
-		// monitor that's actually present.
 		stripped := StripANSI(rawOut)
-		mentionsConnector := strings.Contains(stripped, connector)
-		details["kscreen_connector_names"] = connectorNames(parsed)
+		mentionsConnector := connector != "" && strings.Contains(stripped, connector)
 		details["kscreen_raw_excerpt"] = lastLines(rawOut, 20)
 		details["kscreen_stripped_excerpt"] = lastLines(stripped, 20)
 		details["kscreen_raw_mentions_connector"] = mentionsConnector
-		var err error
-		if mentionsConnector {
-			err = fmt.Errorf(
-				"kscreen-doctor output contained %q but parser failed; possible format/color issue. "+
-					"Raw bytes=%d. supportInformation already confirmed DRM + connector earlier, "+
-					"so this is a parser regression, not an absent-monitor regression. "+
-					"Capture: sudo -u %s env XDG_RUNTIME_DIR=/run/user/%s WAYLAND_DISPLAY=wayland-0 NO_COLOR=1 TERM=dumb kscreen-doctor -o",
-				connector, len(rawOut), desk.User, uid)
-			deps.State.MarkFailed(DRMDisplayValidateName, "kscreen-doctor parser failed despite connector in raw output", err, true)
-		} else {
-			err = fmt.Errorf("kscreen-doctor reports no connector named %q (saw %v)", connector, connectorNames(parsed))
-			deps.State.MarkFailed(DRMDisplayValidateName, "connector missing in kscreen-doctor output", err, true)
+		if sys != nil && p.mixedSourceUsabilityOK(details, sys, wantMode) {
+			details["enabled"] = false
+			details["selected_mode"] = ""
+			details["modes"] = sys.Modes
+			details["verification_method"] = DRMVerifiedSysfsWayland
+			details["drm_error_category"] = DRMVerifiedSysfsWayland
+			deps.State.MarkDone(DRMDisplayValidateName, details)
+			_ = deps.PersistState()
+			log.Info("phase drm-display-validate: done via sysfs+wayland proof",
+				"connector", connector, "expected_mode", wantMode)
+			return nil
 		}
+		if mentionsConnector {
+			err := fmt.Errorf("kscreen-doctor output contained %q but parser failed; possible format/color issue", connector)
+			details["err"] = err.Error()
+			deps.State.MarkFailed(DRMDisplayValidateName, "kscreen-doctor parser failed despite connector in raw output", err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
+		}
+		category := DRMFailNoCandidateConnector
+		if sys != nil {
+			category = DRMFailKScreenSysfsStateMismatch
+			if sys.IsEnabled {
+				category = DRMFailSysfsEnabledKScreenDisabled
+			}
+		}
+		err := fmt.Errorf("kscreen-doctor did not report selected connector %q and usable output could not be proven (kscreen=%v sysfs=%+v)", connector, connectorNames(parsed), sys)
 		details["err"] = err.Error()
+		details["drm_error_category"] = category
+		deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
 		deps.State.Get(DRMDisplayValidateName).Details = details
 		_ = deps.PersistState()
 		return fmt.Errorf("phase drm-display-validate: %w", err)
@@ -391,31 +538,71 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	details["modes"] = conn.Modes
 	details["hdr_enabled"] = conn.HDR
 	details["wcg_enabled"] = conn.WCG
+	details["kscreen_output_id"] = conn.ID
 	if !conn.Enabled {
-		err := fmt.Errorf("connector %q exists but is disabled in kscreen-doctor output", connector)
-		details["err"] = err.Error()
-		deps.State.MarkFailed(DRMDisplayValidateName, "connector disabled", err, true)
-		deps.State.Get(DRMDisplayValidateName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase drm-display-validate: %w", err)
-	}
-	if wantMode != "" && !conn.HasMode(wantMode) {
-		err := fmt.Errorf("connector %q does not advertise expected mode %q (saw modes %v)", connector, wantMode, conn.Modes)
-		details["err"] = err.Error()
-		deps.State.MarkFailed(DRMDisplayValidateName, "expected mode missing", err, true)
-		deps.State.Get(DRMDisplayValidateName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase drm-display-validate: %w", err)
-	}
-	if deps.Profile != nil && deps.Profile.Display.HDR {
-		if !conn.HDR || !conn.WCG {
-			err := fmt.Errorf("HDR profile requires kscreen-doctor to report HDR enabled and Wide Color Gamut enabled on %q (hdr=%v wcg=%v)",
-				connector, conn.HDR, conn.WCG)
+		if p.mixedSourceUsabilityOK(details, sys, wantMode) {
+			details["drm_error_category"] = DRMVerifiedSysfsWayland
+			details["verification_method"] = DRMVerifiedSysfsWayland
+		} else {
+			category := DRMFailKScreenSysfsStateMismatch
+			if sys != nil && sys.IsEnabled {
+				category = DRMFailSysfsEnabledKScreenDisabled
+			}
+			err := fmt.Errorf("connector %q is disabled in kscreen-doctor and usable output could not be proven (sysfs=%+v)", connector, sys)
 			details["err"] = err.Error()
-			deps.State.MarkFailed(DRMDisplayValidateName, "HDR/WCG not enabled", err, true)
+			details["drm_error_category"] = category
+			deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
 			deps.State.Get(DRMDisplayValidateName).Details = details
 			_ = deps.PersistState()
 			return fmt.Errorf("phase drm-display-validate: %w", err)
+		}
+	}
+	if wantMode != "" && !conn.HasMode(wantMode) {
+		if deps.Profile != nil {
+			if target, ok := allowedDisplayFallback(deps.Profile.Display, conn.Modes); ok {
+				details["display_target_original"] = displayTargetName(deps.Profile.Display.HDR, wantMode)
+				details["display_target_effective"] = displayTargetName(target.HDR, target.Mode)
+				details["fallback_reason"] = target.Reason
+				details["drm_error_category"] = DRMDisplayTargetFallbackApplied
+				wantMode = target.Mode
+			} else {
+				err := fmt.Errorf("connector %q does not advertise expected mode %q (saw modes %v)", connector, wantMode, conn.Modes)
+				details["err"] = err.Error()
+				details["drm_error_category"] = DRMFailExpectedModeMissing
+				deps.State.MarkFailed(DRMDisplayValidateName, DRMFailExpectedModeMissing, err, true)
+				deps.State.Get(DRMDisplayValidateName).Details = details
+				_ = deps.PersistState()
+				return fmt.Errorf("phase drm-display-validate: %w", err)
+			}
+		} else {
+			err := fmt.Errorf("connector %q does not advertise expected mode %q (saw modes %v)", connector, wantMode, conn.Modes)
+			details["err"] = err.Error()
+			details["drm_error_category"] = DRMFailExpectedModeMissing
+			deps.State.MarkFailed(DRMDisplayValidateName, DRMFailExpectedModeMissing, err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
+		}
+	}
+	if deps.Profile != nil && deps.Profile.Display.HDR {
+		if !conn.HDR || !conn.WCG {
+			if deps.Profile.Display.AllowFallback && deps.Profile.Display.AllowSDRFallback {
+				details["display_target_original"] = displayTargetName(true, wantMode)
+				details["display_target_effective"] = displayTargetName(false, wantMode)
+				details["fallback_reason"] = "kscreen_rejected_config"
+				details["drm_error_category"] = DRMDisplayTargetFallbackApplied
+			} else if details["verification_method"] == DRMVerifiedSysfsWayland {
+				details["hdr_wcg_unverified_warning"] = true
+			} else {
+				err := fmt.Errorf("HDR profile requires kscreen-doctor to report HDR enabled and Wide Color Gamut enabled on %q (hdr=%v wcg=%v)",
+					connector, conn.HDR, conn.WCG)
+				details["err"] = err.Error()
+				details["drm_error_category"] = DRMFailDisplayTargetStrictUnavailable
+				deps.State.MarkFailed(DRMDisplayValidateName, DRMFailDisplayTargetStrictUnavailable, err, true)
+				deps.State.Get(DRMDisplayValidateName).Details = details
+				_ = deps.PersistState()
+				return fmt.Errorf("phase drm-display-validate: %w", err)
+			}
 		}
 	}
 
@@ -523,6 +710,328 @@ func (p DRMDisplayValidate) runKScreen(ctx context.Context, deps *Deps, user, ui
 			res.Err, lastLines(res.Stderr, 5))
 	}
 	return res.Stdout, nil
+}
+
+func (p DRMDisplayValidate) runKScreenApply(ctx context.Context, deps *Deps, user, uid string, args []string) (string, error) {
+	if p.KScreenApplyFn != nil {
+		return p.KScreenApplyFn(ctx, deps, user, uid, args)
+	}
+	if deps.DryRun {
+		return "dry-run kscreen apply", nil
+	}
+	kscreen, kerr := resolveKScreenDoctor()
+	if kerr != nil {
+		return "", fmt.Errorf("missing kscreen-doctor: %w", kerr)
+	}
+	argv := []string{
+		"sudo", "-u", user,
+		"env",
+		"XDG_RUNTIME_DIR=/run/user/" + uid,
+		"WAYLAND_DISPLAY=wayland-0",
+		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
+		"QT_QPA_PLATFORM=wayland",
+		"XDG_CURRENT_DESKTOP=KDE",
+		"XDG_SESSION_TYPE=wayland",
+		"NO_COLOR=1",
+		"TERM=dumb",
+		"CLICOLOR=0",
+		kscreen.Path,
+	}
+	argv = append(argv, args...)
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    argv,
+		Sudo:    true,
+		Timeout: 20 * time.Second,
+	})
+	if res.Err != nil {
+		return res.Stdout, fmt.Errorf("kscreen-doctor apply: %w (stderr=%q)", res.Err, lastLines(res.Stderr, 5))
+	}
+	return res.Stdout, nil
+}
+
+func (p DRMDisplayValidate) waylandSocketExists(uid string) bool {
+	if p.WaylandSocketFn != nil {
+		return p.WaylandSocketFn(uid)
+	}
+	return waylandSocketExists(uid)
+}
+
+func (p DRMDisplayValidate) discoverSysfsConnectors() []DRMConnectorState {
+	root := p.SysfsRoot
+	if root == "" {
+		root = "/sys"
+	}
+	base := filepath.Join(root, "class", "drm")
+	entries, _ := os.ReadDir(base)
+	var out []DRMConnectorState
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() && strings.HasPrefix(name, "card") && strings.Contains(name, "-") {
+			full := filepath.Join(base, name)
+			parts := strings.SplitN(name, "-", 2)
+			if len(parts) != 2 {
+				continue
+			}
+			st := DRMConnectorState{
+				Card:    filepath.Join("/dev/dri", parts[0]),
+				Name:    parts[1],
+				Path:    full,
+				Status:  strings.TrimSpace(readFileString(filepath.Join(full, "status"))),
+				Enabled: strings.TrimSpace(readFileString(filepath.Join(full, "enabled"))),
+				Modes:   readLines(filepath.Join(full, "modes")),
+				NVIDIA:  sysfsConnectorIsNVIDIA(full),
+			}
+			st.Connected = st.Status == "connected"
+			st.IsEnabled = st.Enabled == "enabled"
+			out = append(out, st)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].NVIDIA != out[j].NVIDIA {
+			return out[i].NVIDIA
+		}
+		if out[i].Connected != out[j].Connected {
+			return out[i].Connected
+		}
+		if out[i].IsEnabled != out[j].IsEnabled {
+			return out[i].IsEnabled
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out
+}
+
+func sysfsConnectorIsNVIDIA(connectorPath string) bool {
+	vendor := readFileString(filepath.Join(connectorPath, "device", "vendor"))
+	if vendor == "" {
+		// Connector dirs are often card0-DP-1 with device symlink at
+		// ../card0/device rather than connector/device.
+		cardName := strings.SplitN(filepath.Base(connectorPath), "-", 2)[0]
+		vendor = readFileString(filepath.Join(filepath.Dir(connectorPath), cardName, "device", "vendor"))
+	}
+	return strings.Contains(strings.ToLower(vendor), "0x10de")
+}
+
+func readFileString(path string) string {
+	b, _ := os.ReadFile(path)
+	return string(b)
+}
+
+func readLines(path string) []string {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+func (p DRMDisplayValidate) kernelDisplayWarnings(ctx context.Context, deps *Deps) []string {
+	var text string
+	if p.KernelLogFn != nil {
+		text = p.KernelLogFn(ctx, deps)
+	} else if deps != nil && deps.Runner != nil && !deps.DryRun {
+		res := deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv:    []string{"bash", "-lc", "dmesg 2>/dev/null | tail -n 300 || journalctl -k -n 300 --no-pager 2>/dev/null || true"},
+			LogFile: "-",
+			Timeout: 10 * time.Second,
+		})
+		text = res.Stdout
+	}
+	var warnings []string
+	if strings.Contains(text, "Failed to allocate NvKmsKapiMemory for dumb object") {
+		warnings = append(warnings, DRMWarnNvidiaDumbCreateAlloc)
+	}
+	return warnings
+}
+
+func selectDisplayConnector(requested string, parsed KScreenDoctorOutput, sysfs []DRMConnectorState, wantMode string) (string, *KScreenConnector, *DRMConnectorState) {
+	if requested = strings.TrimSpace(requested); requested != "" {
+		return requested, parsed.FindConnector(requested), findSysfsConnector(sysfs, requested)
+	}
+	names := map[string]bool{}
+	for _, s := range sysfs {
+		if !s.Connected {
+			continue
+		}
+		names[s.Name] = true
+	}
+	for _, c := range parsed.Connectors {
+		names[c.Name] = true
+	}
+	var candidates []string
+	for name := range names {
+		candidates = append(candidates, name)
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		si := findSysfsConnector(sysfs, candidates[i])
+		sj := findSysfsConnector(sysfs, candidates[j])
+		score := func(s *DRMConnectorState, c *KScreenConnector) int {
+			n := 0
+			if s != nil && s.NVIDIA {
+				n += 100
+			}
+			if s != nil && s.Connected {
+				n += 50
+			}
+			if s != nil && s.IsEnabled {
+				n += 25
+			}
+			if c != nil && c.Enabled {
+				n += 20
+			}
+			if wantMode != "" {
+				if c != nil && c.HasMode(wantMode) {
+					n += 10
+				}
+				if s != nil && modeListHasKScreenMode(s.Modes, wantMode) {
+					n += 10
+				}
+			}
+			return n
+		}
+		return score(si, parsed.FindConnector(candidates[i])) > score(sj, parsed.FindConnector(candidates[j]))
+	})
+	if len(candidates) == 0 {
+		return "", nil, nil
+	}
+	name := candidates[0]
+	return name, parsed.FindConnector(name), findSysfsConnector(sysfs, name)
+}
+
+func findSysfsConnector(list []DRMConnectorState, name string) *DRMConnectorState {
+	for i := range list {
+		if list[i].Name == name {
+			return &list[i]
+		}
+	}
+	return nil
+}
+
+func sysfsConnectorNames(list []DRMConnectorState) []string {
+	out := make([]string, 0, len(list))
+	for _, s := range list {
+		out = append(out, s.Name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func modeListHasKScreenMode(modes []string, mode string) bool {
+	if mode == "" {
+		return true
+	}
+	wantRes := strings.Split(mode, "@")[0]
+	for _, m := range modes {
+		if m == mode || m == wantRes {
+			return true
+		}
+	}
+	return false
+}
+
+func displayRepairTargets(conn *KScreenConnector, wantMode string, wantHDR bool) []displayTarget {
+	seen := map[string]bool{}
+	var out []displayTarget
+	add := func(mode, reason string, hdr bool) {
+		if mode == "" || seen[mode+"|"+fmt.Sprint(hdr)] {
+			return
+		}
+		if conn != nil && !conn.HasMode(mode) {
+			return
+		}
+		seen[mode+"|"+fmt.Sprint(hdr)] = true
+		out = append(out, displayTarget{Mode: mode, HDR: hdr, Reason: reason})
+	}
+	if conn != nil {
+		add(conn.CurrentMode, "current_preferred", wantHDR)
+	}
+	add("3840x2160@60", "safe_4k60", wantHDR)
+	add("3840x2160@120", "target_4k120", wantHDR)
+	add(wantMode, "configured_target", wantHDR)
+	return out
+}
+
+func kscreenApplyArgs(conn KScreenConnector, target displayTarget) ([]string, bool) {
+	if conn.ID == "" || target.Mode == "" {
+		return nil, false
+	}
+	modeID := conn.ModeIDs[target.Mode]
+	if modeID == "" {
+		return nil, false
+	}
+	args := []string{
+		"output." + conn.ID + ".enable",
+		"output." + conn.ID + ".mode." + modeID,
+		"output." + conn.ID + ".position.0,0",
+		"output." + conn.ID + ".scale.1",
+	}
+	if target.HDR {
+		args = append(args, "output."+conn.ID+".hdr.enable", "output."+conn.ID+".wcg.enable")
+	}
+	return args, true
+}
+
+func allowedDisplayFallback(display config.DisplayConfig, modes []string) (displayTarget, bool) {
+	if !display.AllowFallback {
+		return displayTarget{}, false
+	}
+	w, h := ParseResolution(display.Resolution)
+	if w <= 0 || h <= 0 {
+		return displayTarget{}, false
+	}
+	if display.AllowLowerRefreshFallback {
+		mode := FormatMode(w, h, 60)
+		if mode != "" && stringListHas(modes, mode) {
+			return displayTarget{Mode: mode, HDR: display.HDR && !display.AllowSDRFallback, Reason: "lower_refresh_fallback"}, true
+		}
+	}
+	if display.AllowSDRFallback {
+		mode := FormatMode(w, h, display.Refresh)
+		if mode != "" && stringListHas(modes, mode) {
+			return displayTarget{Mode: mode, HDR: false, Reason: "sdr_fallback"}, true
+		}
+	}
+	return displayTarget{}, false
+}
+
+func stringListHas(list []string, want string) bool {
+	for _, got := range list {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
+func displayTargetName(hdr bool, mode string) string {
+	prefix := "sdr"
+	if hdr {
+		prefix = "hdr"
+	}
+	return prefix + "_" + strings.ReplaceAll(mode, "@", "_")
+}
+
+func (p DRMDisplayValidate) mixedSourceUsabilityOK(details map[string]any, sys *DRMConnectorState, wantMode string) bool {
+	if sys == nil || !sys.Connected || !sys.IsEnabled {
+		return false
+	}
+	if wantMode != "" && !modeListHasKScreenMode(sys.Modes, wantMode) {
+		return false
+	}
+	if fmt.Sprint(details["wayland_socket_ok"]) != "true" {
+		return false
+	}
+	if fmt.Sprint(details["dbus_kwin_ok"]) != "true" {
+		return false
+	}
+	return true
 }
 
 func waylandSocketExists(uid string) bool {

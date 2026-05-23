@@ -2,6 +2,9 @@ package phase
 
 import (
 	"context"
+	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -183,6 +186,29 @@ func drmDeps(t *testing.T) *Deps {
 	return deps
 }
 
+func writeDRMConnector(t *testing.T, root, card, connector, status, enabled string, modes []string) {
+	t.Helper()
+	drmRoot := filepath.Join(root, "class", "drm")
+	connDir := filepath.Join(drmRoot, card+"-"+connector)
+	cardDeviceDir := filepath.Join(drmRoot, card, "device")
+	if err := os.MkdirAll(connDir, 0o755); err != nil {
+		t.Fatalf("mkdir connector: %v", err)
+	}
+	if err := os.MkdirAll(cardDeviceDir, 0o755); err != nil {
+		t.Fatalf("mkdir card device: %v", err)
+	}
+	mustWrite := func(path, content string) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", path, err)
+		}
+	}
+	mustWrite(filepath.Join(connDir, "status"), status+"\n")
+	mustWrite(filepath.Join(connDir, "enabled"), enabled+"\n")
+	mustWrite(filepath.Join(connDir, "modes"), strings.Join(modes, "\n")+"\n")
+	mustWrite(filepath.Join(cardDeviceDir, "vendor"), "0x10de\n")
+}
+
 func TestDRMDisplayValidate_HappyPath(t *testing.T) {
 	deps := drmDeps(t)
 	ph := DRMDisplayValidate{
@@ -260,6 +286,139 @@ func TestDRMDisplayValidate_ConnectorDisabledFailsFatal(t *testing.T) {
 	}
 }
 
+func TestDRMDisplayValidate_KScreenDisabledSysfsEnabledNoUsabilityProofFails(t *testing.T) {
+	deps := drmDeps(t)
+	sysfs := t.TempDir()
+	writeDRMConnector(t, sysfs, "card0", "DP-1", "connected", "enabled", []string{"3840x2160"})
+	ph := DRMDisplayValidate{
+		SysfsRoot: sysfs,
+		WaylandSocketFn: func(string) bool {
+			return true
+		},
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        disabled
+        Modes: 1:3840x2160@60 2:3840x2160@120
+`, nil
+		},
+		KScreenApplyFn: func(context.Context, *Deps, string, string, []string) (string, error) {
+			return "applying config failed! The driver rejected the output configuration", errors.New("rejected")
+		},
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal when KScreen disabled and sysfs proof is unverified")
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["drm_error_category"] != DRMFailSysfsEnabledKScreenDisabled {
+		t.Fatalf("drm_error_category: got %v want %s", d["drm_error_category"], DRMFailSysfsEnabledKScreenDisabled)
+	}
+	if d["kscreen_rejected_output_config"] != true {
+		t.Fatalf("expected rejected-output repair diagnostic: %v", d)
+	}
+}
+
+func TestDRMDisplayValidate_KScreenDisabledSysfsEnabledWithUsabilityProofPasses(t *testing.T) {
+	deps := drmDeps(t)
+	deps.DryRun = false
+	sysfs := t.TempDir()
+	writeDRMConnector(t, sysfs, "card0", "DP-1", "connected", "enabled", []string{"3840x2160"})
+	ph := DRMDisplayValidate{
+		SysfsRoot: sysfs,
+		KernelLogFn: func(context.Context, *Deps) string {
+			return ""
+		},
+		WaylandSocketFn: func(string) bool {
+			return true
+		},
+		KWinDBusFn: func(context.Context, *Deps, string, string) (bool, string, error) {
+			return true, "introspect OK", nil
+		},
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        disabled
+        Modes: 1:3840x2160@60 2:3840x2160@120
+`, nil
+		},
+		KScreenApplyFn: func(context.Context, *Deps, string, string, []string) (string, error) {
+			return "applying config failed! The driver rejected the output configuration", errors.New("rejected")
+		},
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("expected mixed sysfs+wayland proof to pass: %v", err)
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["verification_method"] != DRMVerifiedSysfsWayland {
+		t.Fatalf("verification_method: got %v want %s", d["verification_method"], DRMVerifiedSysfsWayland)
+	}
+	if d["hdr_wcg_unverified_warning"] != true {
+		t.Fatalf("HDR profile should record unverified HDR/WCG warning under mixed-source proof: %v", d)
+	}
+}
+
+func TestDRMDisplayValidate_KScreenDisabledSysfsDisabledFails(t *testing.T) {
+	deps := drmDeps(t)
+	deps.DryRun = false
+	sysfs := t.TempDir()
+	writeDRMConnector(t, sysfs, "card0", "DP-1", "connected", "disabled", []string{"3840x2160"})
+	ph := DRMDisplayValidate{
+		SysfsRoot:       sysfs,
+		KernelLogFn:     func(context.Context, *Deps) string { return "" },
+		WaylandSocketFn: func(string) bool { return true },
+		KWinDBusFn: func(context.Context, *Deps, string, string) (bool, string, error) {
+			return true, "introspect OK", nil
+		},
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        disabled
+        Modes: 1:3840x2160@60 2:3840x2160@120
+`, nil
+		},
+		KScreenApplyFn: func(context.Context, *Deps, string, string, []string) (string, error) {
+			return "applying config failed! The driver rejected the output configuration", errors.New("rejected")
+		},
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal when both KScreen and sysfs report disabled")
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["drm_error_category"] != DRMFailKScreenSysfsStateMismatch {
+		t.Fatalf("drm_error_category: got %v want %s", d["drm_error_category"], DRMFailKScreenSysfsStateMismatch)
+	}
+}
+
+func TestDRMDisplayValidate_DiscoversConnectedDP2WhenNoForcedConnector(t *testing.T) {
+	deps := drmDeps(t)
+	deps.Profile.Display.ForcedConnector = ""
+	deps.DryRun = false
+	sysfs := t.TempDir()
+	writeDRMConnector(t, sysfs, "card0", "DP-2", "connected", "enabled", []string{"3840x2160"})
+	ph := DRMDisplayValidate{
+		SysfsRoot:       sysfs,
+		KernelLogFn:     func(context.Context, *Deps) string { return "" },
+		WaylandSocketFn: func(string) bool { return true },
+		KWinDBusFn: func(context.Context, *Deps, string, string) (bool, string, error) {
+			return true, "introspect OK", nil
+		},
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 2 DP-2
+        enabled
+        Modes: 1:3840x2160@120*
+        HDR: enabled
+        Wide Color Gamut: enabled
+`, nil
+		},
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("expected DP-2 discovery to pass: %v", err)
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["selected_connector"] != "DP-2" {
+		t.Fatalf("selected_connector: got %v want DP-2", d["selected_connector"])
+	}
+}
+
 func TestDRMDisplayValidate_ExpectedModeMissingFailsFatal(t *testing.T) {
 	deps := drmDeps(t)
 	ph := DRMDisplayValidate{
@@ -278,6 +437,102 @@ func TestDRMDisplayValidate_ExpectedModeMissingFailsFatal(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "expected mode") {
 		t.Errorf("error should mention expected mode: %v", err)
+	}
+}
+
+func TestDRMDisplayValidate_StrictHDR4K120UnavailableBut4K60AvailableFails(t *testing.T) {
+	deps := drmDeps(t)
+	ph := DRMDisplayValidate{
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        enabled
+        Modes: 1:3840x2160@60*
+        HDR: enabled
+        Wide Color Gamut: enabled
+`, nil
+		},
+	}
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected strict profile to fail when 4K120 is unavailable")
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["drm_error_category"] != DRMFailExpectedModeMissing {
+		t.Fatalf("drm_error_category: got %v want %s", d["drm_error_category"], DRMFailExpectedModeMissing)
+	}
+}
+
+func TestDRMDisplayValidate_FlexibleFallback4K60RecordsFallback(t *testing.T) {
+	deps := drmDeps(t)
+	deps.Profile.Display.AllowFallback = true
+	deps.Profile.Display.AllowLowerRefreshFallback = true
+	ph := DRMDisplayValidate{
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        enabled
+        Modes: 1:3840x2160@60*
+        HDR: enabled
+        Wide Color Gamut: enabled
+`, nil
+		},
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("expected flexible lower-refresh fallback to pass: %v", err)
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["drm_error_category"] != DRMDisplayTargetFallbackApplied {
+		t.Fatalf("drm_error_category: got %v want %s", d["drm_error_category"], DRMDisplayTargetFallbackApplied)
+	}
+	if d["display_target_effective"] != "hdr_3840x2160_60" {
+		t.Fatalf("display_target_effective: got %v", d["display_target_effective"])
+	}
+}
+
+func TestDRMDisplayValidate_HDRMissingFlexibleSDRRecordsFallback(t *testing.T) {
+	deps := drmDeps(t)
+	deps.Profile.Display.AllowFallback = true
+	deps.Profile.Display.AllowSDRFallback = true
+	ph := DRMDisplayValidate{
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        enabled
+        Modes: 1:3840x2160@120*
+`, nil
+		},
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("expected flexible SDR fallback to pass: %v", err)
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["drm_error_category"] != DRMDisplayTargetFallbackApplied {
+		t.Fatalf("drm_error_category: got %v want %s", d["drm_error_category"], DRMDisplayTargetFallbackApplied)
+	}
+	if d["display_target_effective"] != "sdr_3840x2160_120" {
+		t.Fatalf("display_target_effective: got %v", d["display_target_effective"])
+	}
+}
+
+func TestDRMDisplayValidate_RecordsNvidiaDumbAllocationWarning(t *testing.T) {
+	deps := drmDeps(t)
+	ph := DRMDisplayValidate{
+		KernelLogFn: func(context.Context, *Deps) string {
+			return "NVRM: Failed to allocate NvKmsKapiMemory for dumb object of size 33177600"
+		},
+		KScreenFn: func(context.Context, *Deps, string, string) (string, error) {
+			return `Output: 1 DP-1
+        enabled
+        Modes: 1:3840x2160@120*
+        HDR: enabled
+        Wide Color Gamut: enabled
+`, nil
+		},
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("warning alone should not fail happy output: %v", err)
+	}
+	d := deps.State.Get(DRMDisplayValidateName).Details
+	if d["nvidia_dumb_create_alloc_warning"] != true {
+		t.Fatalf("expected nvidia dumb allocation warning detail: %v", d)
 	}
 }
 

@@ -132,6 +132,17 @@ type DisplayConfig struct {
 	Refresh         int    `yaml:"refresh"`
 	HDR             bool   `yaml:"hdr"`
 	ForcedConnector string `yaml:"forced_connector"`
+	// AllowFallback permits drm_display_validate to accept a lower
+	// display target only after the strict target has been tried and
+	// rejected. Default false: HDR/4K120 profiles are strict unless
+	// the operator opts into fallback.
+	AllowFallback bool `yaml:"allow_fallback"`
+	// AllowSDRFallback permits an HDR profile to fall back to an SDR
+	// target if HDR enablement is rejected by KScreen/KWin/NVIDIA.
+	AllowSDRFallback bool `yaml:"allow_sdr_fallback"`
+	// AllowLowerRefreshFallback permits refresh fallback, e.g.
+	// 3840x2160@120 -> 3840x2160@60. Default false.
+	AllowLowerRefreshFallback bool `yaml:"allow_lower_refresh_fallback"`
 	// Edid is the filename (under /lib/firmware/edid/) that the edid
 	// phase writes and that drm.edid_firmware= on the kernel cmdline
 	// references. drm_display_validate uses it to confirm the
