@@ -2325,6 +2325,10 @@ Resilient to in-progress apt upgrades that temporarily disable sudo.`,
 					if gates != "" {
 						fmt.Printf("kwin gates   : %s\n", gates)
 					}
+					dbus := monitorKWinDBusLine(ph.Details)
+					if dbus != "" {
+						fmt.Printf("kwin dbus    : %s\n", dbus)
+					}
 				}
 				if ph := st.Get("cuda"); ph != nil && ph.Details != nil && fmt.Sprint(ph.Details["cuda_status"]) == "degraded" {
 					fmt.Printf("cuda degraded/nonfatal: %s", evOrUnknown(fmt.Sprint(ph.Details["cuda_degraded_reason"])))
@@ -2559,6 +2563,44 @@ func monitorKWinGateLine(details map[string]any) string {
 		return ""
 	}
 	return strings.Join(parts, " ")
+}
+
+func monitorKWinDBusLine(details map[string]any) string {
+	if details == nil {
+		return ""
+	}
+	if available, ok := details["kwin_dbus_available"]; ok {
+		if fmt.Sprint(available) == "true" {
+			return "available"
+		}
+	}
+	if degraded, ok := details["kwin_dbus_degraded"]; ok && fmt.Sprint(degraded) == "true" {
+		msg := "missing/degraded"
+		for _, key := range []string{"kwin_dbus_warning", "dbus_kwin_error", "dbus_kwin_info"} {
+			if v, ok := details[key]; ok {
+				s := strings.TrimSpace(fmt.Sprint(v))
+				if s != "" && s != "<nil>" {
+					return msg + " (" + oneLineTruncate(s, 160) + ")"
+				}
+			}
+		}
+		return msg
+	}
+	if ok, present := details["dbus_kwin_ok"]; present {
+		if fmt.Sprint(ok) == "true" {
+			return "available"
+		}
+		return "missing/degraded"
+	}
+	return ""
+}
+
+func oneLineTruncate(s string, max int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if max > 0 && len(s) > max {
+		return s[:max] + "..."
+	}
+	return s
 }
 
 // -----------------------------------------------------------------------------

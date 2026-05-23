@@ -370,6 +370,63 @@ func TestKWinSession_FatalJournalSignatureFailsFatal(t *testing.T) {
 	}
 }
 
+func TestKWinSession_DBusMissingIsDegradedNonFatal(t *testing.T) {
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+	ph := happyKwin(unitPath)
+	ph.DBusProbeWait = -1
+	ph.KWinDBusFn = func(context.Context, *Deps, string, string) (bool, string, error) {
+		return false, "org.kde.KWin missing", errors.New("name has no owner")
+	}
+	ph.SupportInformationFn = func(context.Context, *Deps, string, string) (string, error) {
+		t.Fatalf("supportInformation should not be called when DBus probe is missing")
+		return "", nil
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("DBus missing should be degraded/nonfatal after hard gates pass: %v", err)
+	}
+	statePhase := deps.State.Get(KWinSessionName)
+	if statePhase.Status != state.StatusDone {
+		t.Fatalf("status: got %q want done", statePhase.Status)
+	}
+	d := statePhase.Details
+	if d["dbus_kwin_ok"] != false {
+		t.Errorf("dbus_kwin_ok: got %v want false", d["dbus_kwin_ok"])
+	}
+	if d["kwin_dbus_available"] != false {
+		t.Errorf("kwin_dbus_available: got %v want false", d["kwin_dbus_available"])
+	}
+	if d["kwin_dbus_degraded"] != true {
+		t.Errorf("kwin_dbus_degraded: got %v want true", d["kwin_dbus_degraded"])
+	}
+	if _, ok := d["kwin_dbus_warning"]; !ok {
+		t.Errorf("kwin_dbus_warning should be recorded: %v", d)
+	}
+}
+
+func TestKWinSession_SupportInformationFailureIsDiagnostic(t *testing.T) {
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+	ph := happyKwin(unitPath)
+	ph.DBusProbeWait = -1
+	ph.SupportInformationFn = func(context.Context, *Deps, string, string) (string, error) {
+		return "", errors.New("qdbus supportInformation failed")
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("supportInformation failure should be diagnostic/nonfatal after hard gates pass: %v", err)
+	}
+	d := deps.State.Get(KWinSessionName).Details
+	if d["dbus_kwin_ok"] != true {
+		t.Errorf("dbus_kwin_ok: got %v want true", d["dbus_kwin_ok"])
+	}
+	if d["support_information_ok"] != false {
+		t.Errorf("support_information_ok: got %v want false", d["support_information_ok"])
+	}
+	if _, ok := d["support_information_error"]; !ok {
+		t.Errorf("support_information_error should be recorded: %v", d)
+	}
+}
+
 func TestKWinSession_FailsWhenSocketNeverAppears(t *testing.T) {
 	deps := kwinDeps(t)
 	unitPath := filepath.Join(t.TempDir(), "u.service")

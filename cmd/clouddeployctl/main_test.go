@@ -171,6 +171,27 @@ func TestMonitorKWinGateLineFormatsPartialGateState(t *testing.T) {
 	}
 }
 
+func TestMonitorKWinDBusLineReportsDegraded(t *testing.T) {
+	d := map[string]any{
+		"kwin_dbus_available": false,
+		"kwin_dbus_degraded":  true,
+		"kwin_dbus_warning":   "org.kde.KWin not present on session bus after 60s",
+	}
+	got := monitorKWinDBusLine(d)
+	if !strings.Contains(got, "missing/degraded") {
+		t.Fatalf("monitorKWinDBusLine: got %q want missing/degraded", got)
+	}
+	if !strings.Contains(got, "org.kde.KWin") {
+		t.Fatalf("monitorKWinDBusLine should include diagnostic: %q", got)
+	}
+}
+
+func TestMonitorKWinDBusLineReportsAvailable(t *testing.T) {
+	if got := monitorKWinDBusLine(map[string]any{"kwin_dbus_available": true}); got != "available" {
+		t.Fatalf("monitorKWinDBusLine: got %q want available", got)
+	}
+}
+
 func TestFirstAssetURLReturnsEmptyOnRawTemplate(t *testing.T) {
 	html := `<!DOCTYPE html><html><head><%- header %></head><body><div id="app"></div><script src="src/main.ts"></script></body></html>`
 	got := firstAssetURL(html)

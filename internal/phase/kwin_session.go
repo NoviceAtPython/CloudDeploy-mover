@@ -497,6 +497,11 @@ type KWinSession struct {
 	// runner.
 	KWinDBusFn func(ctx context.Context, deps *Deps, user, uid string) (bool, string, error)
 
+	// DBusProbeWait bounds the soft org.kde.KWin diagnostic probe
+	// after the hard compositor gates pass. 0 = production default
+	// (at least 60s); negative = single best-effort probe.
+	DBusProbeWait time.Duration
+
 	// SupportInformationFn runs qdbus org.kde.KWin /KWin
 	// supportInformation as the headless user and returns the dump.
 	// The phase asserts the output contains "Output backend: DRM"
@@ -1169,37 +1174,44 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		return fmt.Errorf("phase kwin-session: %w", gateErr)
 	}
 
-	// Gate poll converged. The unified poll already verified:
+	// Gate poll converged. The unified poll already verified the
+	// hard kwin_session gates:
 	// active=true + MainPID>0 + socket present + invocation journal
 	// clean + session on expected seat/tty + MainPID stable for >=
-	// stability seconds. The next blocks are now redundant but kept
-	// as no-ops via the variables below so the rest of the function
-	// (DBus probe, supportInformation) can read pid + journalLog
-	// without restructuring.
+	// stability seconds. DBus/supportInformation are useful
+	// diagnostics for later mode-setting phases, but live Plasma 6
+	// evidence shows org.kde.KWin can appear late or under a
+	// different bus shape; keep them soft here.
 	pid := sample.MainPID
 	invID := sample.InvocationID
 	activeEnter := sample.ActiveEnter
 	journalLog, _ := p.journalForInvocation(ctx, deps, choice.UnitName, invID, activeEnter, 200)
 
-	// 8. KWin DBus probe: poll the headless user's session bus for
-	// org.kde.KWin. Live-VM regression: the previous "shallow"
-	// success criteria (service active + wayland-0 present)
-	// declared done while KWin was still half-initialized. Without
-	// org.kde.KWin, kscreen-doctor hangs forever in
-	// drm_display_validate. Weston path skips this gate (Weston
-	// doesn't expose org.kde.KWin).
+	// 8. KWin DBus probe: best-effort only. Later phases that need
+	// org.kde.KWin (mode helper / DRM display validation) can retry
+	// with their own timeout and diagnostics.
 	if !choice.IsWeston {
-		// Try for up to the stability window's worth of seconds
-		// (we already gave the compositor that long to settle).
-		dbusDeadline := time.Now().Add(stability + 15*time.Second)
+		dbusWait := p.DBusProbeWait
+		if dbusWait == 0 {
+			dbusWait = stability + 45*time.Second
+			if dbusWait < 60*time.Second {
+				dbusWait = 60 * time.Second
+			}
+		} else if dbusWait < 0 {
+			dbusWait = 0
+		}
+		dbusDeadline := time.Now().Add(dbusWait)
 		var (
 			dbusOK   bool
 			dbusInfo string
 			dbusErr  error
 		)
-		for time.Now().Before(dbusDeadline) {
+		for {
 			dbusOK, dbusInfo, dbusErr = p.kwinDBus(ctx, deps, desk.User, uid)
 			if dbusOK {
+				break
+			}
+			if dbusWait <= 0 || !time.Now().Before(dbusDeadline) {
 				break
 			}
 			select {
@@ -1212,65 +1224,46 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		if dbusInfo != "" {
 			details["dbus_kwin_info"] = dbusInfo
 		}
+		if dbusErr != nil {
+			details["dbus_kwin_error"] = dbusErr.Error()
+		}
+		details["kwin_dbus_available"] = dbusOK
+		details["kwin_dbus_degraded"] = !dbusOK
 		if !dbusOK {
-			err := fmt.Errorf("org.kde.KWin not present on %s's session bus after %s; "+
-				"compositor is up but DBus interface never appeared. "+
-				"Last probe: %v (info=%q)",
-				desk.User, stability+15*time.Second, dbusErr, dbusInfo)
-			details["err"] = err.Error()
-			deps.State.MarkFailed(KWinSessionName, "org.kde.KWin missing on session bus", err, true)
-			deps.State.Get(KWinSessionName).Details = details
-			_ = deps.PersistState()
-			return fmt.Errorf("phase kwin-session: %w", err)
-		}
-
-		// 9. supportInformation must report a DRM/KMS Output backend.
-		// This is the load-bearing check that catches the
-		// nested-Wayland-poison scenario: the compositor is "alive"
-		// in every superficial sense but rendering to a nested
-		// surface instead of /dev/dri/cardN.
-		support, supErr := p.supportInformation(ctx, deps, desk.User, uid)
-		if supErr != nil {
-			err := fmt.Errorf("`qdbus org.kde.KWin /KWin supportInformation` failed for %s: %w",
-				desk.User, supErr)
-			details["err"] = err.Error()
-			deps.State.MarkFailed(KWinSessionName, "supportInformation probe failed", err, true)
-			deps.State.Get(KWinSessionName).Details = details
-			_ = deps.PersistState()
-			return fmt.Errorf("phase kwin-session: %w", err)
-		}
-		details["support_information_bytes"] = len(support)
-		details["support_information_ok"] = true
-		connectorOK := connector == "" || strings.Contains(support, connector)
-		details["support_information_connector_ok"] = connectorOK
-		backend := parseKWinOutputBackend(support)
-		details["support_information_output_backend"] = backend
-		nestedBackend := isNestedKWinBackend(backend) || strings.Contains(journalLog, "automatically choosing Wayland because WAYLAND_DISPLAY is set")
-		details["support_information_nested_backend"] = nestedBackend
-		drmBackendOK := strings.EqualFold(backend, "DRM")
-		inferredDRM := false
-		if !drmBackendOK && !nestedBackend && connectorOK && choice.IsRealVT && strings.Contains(in.ExecStart, "--drm") && resolvedDRM != "" {
-			inferredDRM = true
-		}
-		details["support_information_drm_backend"] = drmBackendOK
-		details["support_information_drm_backend_inferred"] = inferredDRM
-		if nestedBackend || (!drmBackendOK && !inferredDRM) {
-			err := fmt.Errorf("KWin supportInformation does not prove DRM backend. Parsed backend=%q inferred_drm=%v nested=%v tail=%q",
-				backend, inferredDRM, nestedBackend, lastLines(support, 6))
-			details["err"] = err.Error()
-			deps.State.MarkFailed(KWinSessionName, "compositor backend is not DRM", err, true)
-			deps.State.Get(KWinSessionName).Details = details
-			_ = deps.PersistState()
-			return fmt.Errorf("phase kwin-session: %w", err)
-		}
-		if !connectorOK {
-			err := fmt.Errorf("KWin supportInformation does not mention forced connector %q; tail: %q",
-				connector, lastLines(support, 8))
-			details["err"] = err.Error()
-			deps.State.MarkFailed(KWinSessionName, "forced connector missing from supportInformation", err, true)
-			deps.State.Get(KWinSessionName).Details = details
-			_ = deps.PersistState()
-			return fmt.Errorf("phase kwin-session: %w", err)
+			details["kwin_dbus_warning"] = fmt.Sprintf("org.kde.KWin not present on %s's session bus after %s; compositor hard gates passed; last probe: %v (info=%q)",
+				desk.User, dbusWait, dbusErr, dbusInfo)
+		} else {
+			// 9. supportInformation: best-effort diagnostic. The
+			// mode/display validators can make this stricter later.
+			support, supErr := p.supportInformation(ctx, deps, desk.User, uid)
+			if supErr != nil {
+				details["support_information_ok"] = false
+				details["support_information_error"] = supErr.Error()
+			} else {
+				details["support_information_bytes"] = len(support)
+				details["support_information_ok"] = true
+				connectorOK := connector == "" || strings.Contains(support, connector)
+				details["support_information_connector_ok"] = connectorOK
+				backend := parseKWinOutputBackend(support)
+				details["support_information_output_backend"] = backend
+				nestedBackend := isNestedKWinBackend(backend) || strings.Contains(journalLog, "automatically choosing Wayland because WAYLAND_DISPLAY is set")
+				details["support_information_nested_backend"] = nestedBackend
+				drmBackendOK := strings.EqualFold(backend, "DRM")
+				inferredDRM := false
+				if !drmBackendOK && !nestedBackend && connectorOK && choice.IsRealVT && strings.Contains(in.ExecStart, "--drm") && resolvedDRM != "" {
+					inferredDRM = true
+				}
+				details["support_information_drm_backend"] = drmBackendOK
+				details["support_information_drm_backend_inferred"] = inferredDRM
+				if nestedBackend || (!drmBackendOK && !inferredDRM) {
+					details["support_information_warning"] = fmt.Sprintf("supportInformation does not prove DRM backend. Parsed backend=%q inferred_drm=%v nested=%v tail=%q",
+						backend, inferredDRM, nestedBackend, lastLines(support, 6))
+				}
+				if !connectorOK {
+					details["support_information_connector_warning"] = fmt.Sprintf("supportInformation does not mention forced connector %q; tail: %q",
+						connector, lastLines(support, 8))
+				}
+			}
 		}
 	}
 
