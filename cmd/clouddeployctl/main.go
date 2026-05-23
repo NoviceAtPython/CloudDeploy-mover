@@ -2321,6 +2321,10 @@ Resilient to in-progress apt upgrades that temporarily disable sudo.`,
 					if selected != "" {
 						fmt.Printf("kwin selected: %s\n", selected)
 					}
+					gates := monitorKWinGateLine(ph.Details)
+					if gates != "" {
+						fmt.Printf("kwin gates   : %s\n", gates)
+					}
 				}
 				if ph := st.Get("cuda"); ph != nil && ph.Details != nil && fmt.Sprint(ph.Details["cuda_status"]) == "degraded" {
 					fmt.Printf("cuda degraded/nonfatal: %s", evOrUnknown(fmt.Sprint(ph.Details["cuda_degraded_reason"])))
@@ -2480,6 +2484,79 @@ func monitorKWinSelectedLine(details map[string]any) string {
 		if s := strings.TrimSpace(fmt.Sprint(inv)); s != "" && s != "<nil>" {
 			parts = append(parts, "invocation="+s)
 		}
+	}
+	return strings.Join(parts, " ")
+}
+
+// monitorKWinGateLine formats the most recent kwin_session gate
+// sample. This is intentionally compact: during slow PAM/logind
+// starts the operator needs to see whether KWin itself is alive while
+// the socket/session gates are still catching up.
+func monitorKWinGateLine(details map[string]any) string {
+	if details == nil {
+		return ""
+	}
+	sample, _ := details["kwin_last_gate_sample"].(map[string]any)
+	get := func(keys ...string) string {
+		for _, key := range keys {
+			if v, ok := details[key]; ok {
+				s := strings.TrimSpace(fmt.Sprint(v))
+				if s != "" && s != "<nil>" {
+					return s
+				}
+			}
+			if sample != nil {
+				if v, ok := sample[key]; ok {
+					s := strings.TrimSpace(fmt.Sprint(v))
+					if s != "" && s != "<nil>" {
+						return s
+					}
+				}
+			}
+		}
+		return ""
+	}
+	active := get("service_active_state", "active_state")
+	sub := get("kwin_sub_state", "sub_state")
+	pid := get("kwin_pid", "main_pid")
+	stable := get("socket_stable_seconds", "stable_pid_for_seconds")
+	socket := get("wayland_socket_ok", "socket_present")
+	session := get("kwin_session_on_expected_seat_tty", "session_on_expected_seat_tty")
+	if session == "" && sample != nil {
+		session = get("session_on_expected_seat_tty")
+	}
+	fatalCount := ""
+	if hits, ok := details["journal_fatal_hits"].([]any); ok {
+		fatalCount = fmt.Sprint(len(hits))
+	} else if hits, ok := details["journal_fatal_hits"].([]string); ok {
+		fatalCount = fmt.Sprint(len(hits))
+	} else if sample != nil {
+		if hits, ok := sample["journal_fatal_hits"].([]any); ok {
+			fatalCount = fmt.Sprint(len(hits))
+		} else if hits, ok := sample["journal_fatal_hits"].([]string); ok {
+			fatalCount = fmt.Sprint(len(hits))
+		}
+	}
+	if fatalCount == "" {
+		fatalCount = "0"
+	}
+	parts := []string{}
+	add := func(k, v string) {
+		if v != "" && v != "<nil>" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	add("active", active)
+	add("sub", sub)
+	add("pid", pid)
+	if stable != "" {
+		add("stable", stable+"s")
+	}
+	add("socket", socket)
+	add("session", session)
+	add("fatals", fatalCount)
+	if len(parts) == 1 && parts[0] == "fatals=0" {
+		return ""
 	}
 	return strings.Join(parts, " ")
 }

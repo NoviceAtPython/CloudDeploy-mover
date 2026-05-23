@@ -143,6 +143,34 @@ func TestMonitorKWinSelectedLineEmptyForMissingDetails(t *testing.T) {
 	}
 }
 
+func TestMonitorKWinGateLineFormatsPartialGateState(t *testing.T) {
+	d := map[string]any{
+		"kwin_last_gate_sample": map[string]any{
+			"active_state":                 "active",
+			"sub_state":                    "running",
+			"main_pid":                     float64(7643),
+			"socket_present":               false,
+			"session_on_expected_seat_tty": false,
+			"stable_pid_for_seconds":       float64(118),
+			"journal_fatal_hits":           []any{},
+		},
+	}
+	got := monitorKWinGateLine(d)
+	for _, want := range []string{
+		"active=active",
+		"sub=running",
+		"pid=7643",
+		"stable=118s",
+		"socket=false",
+		"session=false",
+		"fatals=0",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("monitorKWinGateLine missing %q in %q", want, got)
+		}
+	}
+}
+
 func TestFirstAssetURLReturnsEmptyOnRawTemplate(t *testing.T) {
 	html := `<!DOCTYPE html><html><head><%- header %></head><body><div id="app"></div><script src="src/main.ts"></script></body></html>`
 	got := firstAssetURL(html)

@@ -382,10 +382,12 @@ func TestKWinSession_FailsWhenSocketNeverAppears(t *testing.T) {
 		t.Fatalf("expected fatal when socket never appears")
 	}
 	// The unified poll's error mentions socket=false in the last
-	// sample; the failure category should be wayland_socket_missing.
+	// sample; because the service itself was active/running with a
+	// stable MainPID and clean journal, the category should say the
+	// logind/socket gate was late instead of blaming KWin startup.
 	d := deps.State.Get(KWinSessionName).Details
-	if d["kwin_failure_category"] != KWinFailWaylandSocketMissing {
-		t.Errorf("kwin_failure_category: got %v want %s", d["kwin_failure_category"], KWinFailWaylandSocketMissing)
+	if d["kwin_failure_category"] != KWinFailSocketSessionLate {
+		t.Errorf("kwin_failure_category: got %v want %s", d["kwin_failure_category"], KWinFailSocketSessionLate)
 	}
 	if d["wayland_socket_ok"] != false {
 		t.Errorf("wayland_socket_ok: got %v want false", d["wayland_socket_ok"])
@@ -1122,8 +1124,9 @@ func TestAwaitKWinHealthy_LateSocketStillPasses(t *testing.T) {
 		return s
 	}
 	sample, err := awaitKWinHealthy(context.Background(), nil, probe,
+		nil,
 		"u", "cloudgamer", "1002", "seat0", "/dev/tty7",
-		2*time.Second, 5*time.Millisecond, 10, true)
+		2*time.Second, 0, 5*time.Millisecond, 10, true)
 	if err != nil {
 		t.Fatalf("late-socket scenario should succeed; got err=%v sample=%+v", err, sample)
 	}
@@ -1132,13 +1135,47 @@ func TestAwaitKWinHealthy_LateSocketStillPasses(t *testing.T) {
 	}
 }
 
+func TestAwaitKWinHealthy_ExtendsWhenServiceIsProgressing(t *testing.T) {
+	tick := 0
+	probe := func(ctx context.Context, deps *Deps, unit, user, uid, seat, tty string) KWinGateSample {
+		tick++
+		s := KWinGateSample{
+			ActiveState:  "active",
+			SubState:     "running",
+			MainPID:      7643,
+			InvocationID: "inv-slow",
+			StablePIDFor: tick,
+		}
+		// Socket/session appear only after the original 30ms window
+		// would have elapsed. The progress extension should keep
+		// polling and let this converge.
+		if tick >= 10 {
+			s.SocketPresent = true
+			s.SessionOnSeat = true
+			s.StablePIDFor = 20
+		}
+		return s
+	}
+	sample, err := awaitKWinHealthy(context.Background(), nil, probe,
+		nil,
+		"u", "cloudgamer", "1002", "seat0", "/dev/tty7",
+		30*time.Millisecond, 120*time.Millisecond, 5*time.Millisecond, 10, true)
+	if err != nil {
+		t.Fatalf("progressing slow-start should extend and pass; got err=%v sample=%+v", err, sample)
+	}
+	if !sample.WaitExtended {
+		t.Fatalf("expected gate wait to be extended before success; sample=%+v", sample)
+	}
+}
+
 func TestAwaitKWinHealthy_TimeoutReturnsLastSample(t *testing.T) {
 	probe := func(ctx context.Context, deps *Deps, unit, user, uid, seat, tty string) KWinGateSample {
 		return KWinGateSample{ActiveState: "activating", SubState: "start-pre"}
 	}
 	_, err := awaitKWinHealthy(context.Background(), nil, probe,
+		nil,
 		"u", "cloudgamer", "1002", "seat0", "/dev/tty7",
-		20*time.Millisecond, 5*time.Millisecond, 10, true)
+		20*time.Millisecond, 0, 5*time.Millisecond, 10, true)
 	if err == nil {
 		t.Fatalf("perpetually-bad probe should timeout")
 	}
@@ -1190,19 +1227,19 @@ func TestKWinSession_PersistsSelectedPathBeforeStart(t *testing.T) {
 	}
 }
 
-func TestKWinSession_DefaultWaitIsAtLeast120Seconds(t *testing.T) {
-	// The KWinSession zero-value MUST default SocketWait to >=120s.
+func TestKWinSession_DefaultWaitIsAtLeast360Seconds(t *testing.T) {
+	// The KWinSession zero-value MUST default SocketWait to >=360s.
 	// Live VM 2026-05-22: the previous 30s default fatal'd on a host
 	// where KWin took 35s to come up.
 	p := KWinSession{}
 	// The defaults are applied inside Run; we just check the
 	// documented intent via the constant.
-	got := 120 * time.Second
+	got := defaultKWinGateWait
 	if p.SocketWait == 0 {
-		got = 120 * time.Second // matches the in-code default
+		got = defaultKWinGateWait // matches the in-code default
 	}
-	if got < 120*time.Second {
-		t.Fatalf("default SocketWait must be >= 120s; got %s", got)
+	if got < 360*time.Second {
+		t.Fatalf("default SocketWait must be >= 360s; got %s", got)
 	}
 }
 

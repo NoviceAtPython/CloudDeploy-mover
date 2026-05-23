@@ -509,8 +509,14 @@ type KWinSession struct {
 	WaylandSocketFn func(uid string) bool
 
 	// SocketWait caps how long the phase waits for wayland-0 to
-	// first appear. 0 = 30s default.
+	// first appear. 0 = 360s default.
 	SocketWait time.Duration
+
+	// GateProgressExtension extends SocketWait once when KWin is
+	// active/running with a stable MainPID and a clean current
+	// journal, but PAM/logind or the wayland socket are late. 0 =
+	// 120s default for production-sized waits; negative disables.
+	GateProgressExtension time.Duration
 
 	// SocketStability is how long the socket must persist after
 	// first appearance. 0 = 10s default. v2 regression: a transient
@@ -544,6 +550,12 @@ type KWinSession struct {
 	// StablePIDInterval overrides how often requireStableMainPID
 	// re-samples. 0 = 2s default.
 	StablePIDInterval time.Duration
+
+	// LateAdoptionGrace controls the retry window after a gate-poll
+	// timeout. This is a final safety net for hosts where PAM/logind
+	// publishes the session just after the poll returns. 0 = 120s
+	// default for production-sized waits; negative disables.
+	LateAdoptionGrace time.Duration
 
 	// SkipAdoption disables the "is an existing kwin-realvt session
 	// already healthy?" probe at the top of Run. Tests that don't
@@ -944,7 +956,23 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	// of what we targeted, not just an "is socket present?" boolean.
 	wait := p.SocketWait
 	if wait == 0 {
-		wait = 120 * time.Second // bumped from 30s (live VM RTX 4090 2026-05-22)
+		wait = defaultKWinGateWait
+	}
+	progressExtension := p.GateProgressExtension
+	if progressExtension == 0 {
+		if wait >= 60*time.Second {
+			progressExtension = defaultKWinGateProgressExtension
+		}
+	} else if progressExtension < 0 {
+		progressExtension = 0
+	}
+	lateAdoptionGrace := p.LateAdoptionGrace
+	if lateAdoptionGrace == 0 {
+		if wait >= 60*time.Second {
+			lateAdoptionGrace = defaultKWinLateAdoptionGrace
+		}
+	} else if lateAdoptionGrace < 0 {
+		lateAdoptionGrace = 0
 	}
 	stability := p.SocketStability
 	if stability == 0 {
@@ -972,6 +1000,8 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	details["kwin_service"] = selected.Service
 	details["wayland_socket_path"] = socketPath
 	details["kwin_gate_wait_seconds"] = int(wait / time.Second)
+	details["kwin_gate_progress_extension_seconds"] = int(progressExtension / time.Second)
+	details["kwin_late_adoption_grace_seconds"] = int(lateAdoptionGrace / time.Second)
 	details["kwin_gate_stability_seconds"] = int(stability / time.Second)
 	deps.State.Get(KWinSessionName).Details = details
 	_ = deps.PersistState()
@@ -1006,28 +1036,24 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	if probe == nil {
 		probe = (&p).defaultHealthProbe
 	}
+	lastGatePersist := time.Time{}
+	observeGate := func(s KWinGateSample) {
+		recordKWinGateDetails(details, &selected, s)
+		// Persist periodically so `clouddeployctl monitor` can show
+		// slow-start progress while the phase is still running.
+		now := time.Now()
+		if lastGatePersist.IsZero() || now.Sub(lastGatePersist) >= 10*time.Second || s.WaitExtended {
+			deps.State.Get(KWinSessionName).Details = details
+			_ = deps.PersistState()
+			lastGatePersist = now
+		}
+	}
 	sample, gateErr := awaitKWinHealthy(
-		ctx, deps, probe,
+		ctx, deps, probe, observeGate,
 		choice.UnitName, desk.User, uid, selected.Seat, selected.TTY,
-		wait, probeInterval, stabilitySeconds, true,
+		wait, progressExtension, probeInterval, stabilitySeconds, true,
 	)
-	details["kwin_last_gate_sample"] = sample
-	details["wayland_socket_ok"] = sample.SocketPresent
-	details["service_active_state"] = sample.ActiveState
-	details["service_active"] = sample.ActiveState == "active"
-	details["socket_stable_seconds"] = sample.StablePIDFor
-	details["kwin_sub_state"] = sample.SubState
-	details["kwin_invocation_id"] = sample.InvocationID
-	if sample.MainPID > 0 {
-		details["kwin_pid"] = sample.MainPID
-		selected.MainPID = sample.MainPID
-		selected.InvocationID = sample.InvocationID
-		selected.ServiceStartTime = sample.ActiveEnter
-		details["kwin_selected"] = selected
-	}
-	if len(sample.JournalFatals) > 0 {
-		details["journal_fatal_hits"] = sample.JournalFatals
-	}
+	recordKWinGateDetails(details, &selected, sample)
 
 	if gateErr != nil {
 		// 5. Self-heal: the timed window elapsed without
@@ -1037,50 +1063,65 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		// This is the live VM RTX 4090 2026-05-22 fix: a 30s timeout
 		// failed even though the service became fully healthy at
 		// second 35.
-		log.Warn("phase kwin-session: gate poll timed out; trying late adoption", "err", gateErr)
-		adopt := p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 0)
-		details["kwin_late_adopt_active_state"] = adopt.ActiveState
-		details["kwin_late_adopt_sub_state"] = adopt.SubState
-		details["kwin_late_adopt_main_pid"] = adopt.MainPID
-		details["kwin_late_adopt_socket_present"] = adopt.SocketPresent
-		details["kwin_late_adopt_journal_fatals"] = adopt.JournalFatals
-		details["kwin_late_adopt_adoptable"] = adopt.Adoptable
-		// Late-adoption journal must be invocation-scoped or it
-		// inherits the pre-restart fatal markers we already saw.
-		if adopt.Adoptable {
-			invID := p.readUnitInvocationID(ctx, deps, choice.UnitName)
-			activeEnter := p.readUnitActiveEnterTimestamp(ctx, deps, choice.UnitName)
-			currJrn, _ := p.journalForInvocation(ctx, deps, choice.UnitName, invID, activeEnter, 200)
-			adopt.JournalFatals = scanFatalSignatures(currJrn)
-			if len(adopt.JournalFatals) > 0 {
-				adopt.Adoptable = false
-				details["kwin_late_adopt_invocation_fatals"] = adopt.JournalFatals
+		log.Warn("phase kwin-session: gate poll timed out; trying late adoption", "err", gateErr, "grace", lateAdoptionGrace)
+		var adopt KWinAdoptCheck
+		attempts := 0
+		lateDeadline := time.Now().Add(lateAdoptionGrace)
+		for {
+			attempts++
+			adopt = p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 0)
+			details["kwin_late_adopt_attempts"] = attempts
+			details["kwin_late_adopt_active_state"] = adopt.ActiveState
+			details["kwin_late_adopt_sub_state"] = adopt.SubState
+			details["kwin_late_adopt_main_pid"] = adopt.MainPID
+			details["kwin_late_adopt_socket_present"] = adopt.SocketPresent
+			details["kwin_late_adopt_journal_fatals"] = adopt.JournalFatals
+			details["kwin_late_adopt_adoptable"] = adopt.Adoptable
+			// Late-adoption journal must be invocation-scoped or it
+			// inherits the pre-restart fatal markers we already saw.
+			if adopt.Adoptable {
+				invID := p.readUnitInvocationID(ctx, deps, choice.UnitName)
+				activeEnter := p.readUnitActiveEnterTimestamp(ctx, deps, choice.UnitName)
+				currJrn, _ := p.journalForInvocation(ctx, deps, choice.UnitName, invID, activeEnter, 200)
+				adopt.JournalFatals = scanFatalSignatures(currJrn)
+				if len(adopt.JournalFatals) > 0 {
+					adopt.Adoptable = false
+					details["kwin_late_adopt_invocation_fatals"] = adopt.JournalFatals
+				}
 			}
-		}
-		// Restart-loop protection. The probe above only samples
-		// MainPID once. If the unit is restart-looping the PID
-		// will change between samples; verify by re-reading the
-		// PID after a short delay and refusing late adoption if
-		// they differ. The verification interval is the same as
-		// the gate-poll probe interval (default 2s) so the total
-		// added latency is bounded.
-		if adopt.Adoptable {
-			verifyInterval := probeInterval
-			if verifyInterval <= 0 {
-				verifyInterval = 2 * time.Second
+			// Restart-loop protection. The probe above only samples
+			// MainPID once. If the unit is restart-looping the PID
+			// will change between samples; verify by re-reading the
+			// PID after a short delay and refusing late adoption if
+			// they differ. The verification interval is the same as
+			// the gate-poll probe interval (default 2s) so the total
+			// added latency is bounded.
+			if adopt.Adoptable {
+				verifyInterval := probeInterval
+				if verifyInterval <= 0 {
+					verifyInterval = 2 * time.Second
+				}
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(verifyInterval):
+				}
+				second, err := p.mainPID(ctx, deps, choice.UnitName)
+				details["kwin_late_adopt_verify_pid"] = second
+				if err != nil || second != adopt.MainPID || second <= 0 {
+					adopt.Adoptable = false
+					details["kwin_late_adopt_restart_loop"] = true
+					log.Warn("phase kwin-session: late adopt rejected; MainPID changed between samples (restart loop)",
+						"first", adopt.MainPID, "second", second, "err", err)
+				}
+			}
+			if adopt.Adoptable || lateAdoptionGrace <= 0 || time.Now().After(lateDeadline) {
+				break
 			}
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(verifyInterval):
-			}
-			second, err := p.mainPID(ctx, deps, choice.UnitName)
-			details["kwin_late_adopt_verify_pid"] = second
-			if err != nil || second != adopt.MainPID || second <= 0 {
-				adopt.Adoptable = false
-				details["kwin_late_adopt_restart_loop"] = true
-				log.Warn("phase kwin-session: late adopt rejected; MainPID changed between samples (restart loop)",
-					"first", adopt.MainPID, "second", second, "err", err)
+			case <-time.After(probeInterval):
 			}
 		}
 		if adopt.Adoptable {
@@ -1102,15 +1143,27 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		// Late adoption also failed → produce a categorized error.
 		details["err"] = gateErr.Error()
 		details["kwin_failure_category"] = classifyKWinFailure(gateErr, strings.Join(sample.JournalFatals, "\n"), sample.SubState)
+		if sample.StartProgressing() {
+			details["kwin_failure_category"] = KWinFailSessionStartSlow
+			if !sample.SocketPresent || !sample.SessionOnSeat {
+				details["kwin_failure_category"] = KWinFailSocketSessionLate
+			}
+		}
 		// Specific category for the "service active but socket missing
 		// after window" shape, which is what the live VM hit.
-		if sample.ActiveState == "active" && sample.MainPID > 0 && !sample.SocketPresent {
+		if sample.ActiveState == "active" && sample.MainPID > 0 && !sample.SocketPresent && !sample.StartProgressing() {
 			details["kwin_failure_category"] = KWinFailWaylandSocketMissing
 		}
-		if sample.ActiveState == "active" && sample.MainPID > 0 && sample.SocketPresent && len(sample.JournalFatals) == 0 && !sample.SessionOnSeat {
+		if sample.ActiveState == "active" && sample.MainPID > 0 && sample.SocketPresent && len(sample.JournalFatals) == 0 && !sample.SessionOnSeat && !sample.StartProgressing() {
 			details["kwin_failure_category"] = KWinFailSessionNotOnSeatTTY
 		}
-		deps.State.MarkFailed(KWinSessionName, "kwin gate poll did not converge", gateErr, true)
+		reason := "kwin gate poll did not converge"
+		if details["kwin_failure_category"] == KWinFailSocketSessionLate {
+			reason = KWinFailSocketSessionLate
+		} else if details["kwin_failure_category"] == KWinFailSessionStartSlow {
+			reason = KWinFailSessionStartSlow
+		}
+		deps.State.MarkFailed(KWinSessionName, reason, gateErr, true)
 		deps.State.Get(KWinSessionName).Details = details
 		_ = deps.PersistState()
 		return fmt.Errorf("phase kwin-session: %w", gateErr)
@@ -1546,6 +1599,35 @@ func isNestedKWinBackend(backend string) bool {
 		return true
 	}
 	return false
+}
+
+func recordKWinGateDetails(details map[string]any, selected *KWinSelectedPath, sample KWinGateSample) {
+	if details == nil {
+		return
+	}
+	details["kwin_last_gate_sample"] = sample
+	details["wayland_socket_ok"] = sample.SocketPresent
+	details["service_active_state"] = sample.ActiveState
+	details["service_active"] = sample.ActiveState == "active"
+	details["socket_stable_seconds"] = sample.StablePIDFor
+	details["kwin_sub_state"] = sample.SubState
+	details["kwin_invocation_id"] = sample.InvocationID
+	details["kwin_gate_wait_extended"] = sample.WaitExtended
+	details["kwin_session_on_expected_seat_tty"] = sample.SessionOnSeat
+	details["kwin_pid"] = sample.MainPID
+	if sample.MainPID > 0 {
+		if selected != nil {
+			selected.MainPID = sample.MainPID
+			selected.InvocationID = sample.InvocationID
+			selected.ServiceStartTime = sample.ActiveEnter
+			details["kwin_selected"] = *selected
+		}
+	}
+	if len(sample.JournalFatals) > 0 {
+		details["journal_fatal_hits"] = sample.JournalFatals
+	} else {
+		delete(details, "journal_fatal_hits")
+	}
 }
 
 // resolveDRMDevice picks the /dev/dri/card* node the compositor

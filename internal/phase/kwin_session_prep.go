@@ -61,6 +61,14 @@ const (
 	KWinFailPIDUnstable               = "kwin_pid_unstable"
 	KWinFailWaylandSocketMissing      = "wayland_socket_missing"
 	KWinFailSessionNotOnSeatTTY       = "session_not_on_expected_seat_tty"
+	KWinFailSessionStartSlow          = "kwin_session_start_slow"
+	KWinFailSocketSessionLate         = "kwin_socket_session_late"
+)
+
+const (
+	defaultKWinGateWait              = 360 * time.Second
+	defaultKWinGateProgressExtension = 120 * time.Second
+	defaultKWinLateAdoptionGrace     = 120 * time.Second
 )
 
 // classifyKWinFailure maps an arbitrary error + the journal tail +
@@ -741,6 +749,7 @@ type KWinGateSample struct {
 	InvocationID    string    `json:"invocation_id"`
 	ActiveEnter     string    `json:"active_enter_timestamp"`
 	UnitInvocStable bool      `json:"invocation_stable"`
+	WaitExtended    bool      `json:"wait_extended,omitempty"`
 }
 
 // AllGatesPass reports whether this sample shows a fully-healthy
@@ -770,9 +779,24 @@ func (s KWinGateSample) AllGatesPass(stabilitySeconds int, requireSession bool) 
 	return true
 }
 
+// StartProgressing reports the live-VM shape where the compositor
+// process itself is healthy and stable, but PAM/logind has not yet
+// published the user session or KWin has not yet accepted on
+// wayland-0. On slow cloud hosts this should extend the gate wait,
+// not immediately fail as "socket missing".
+func (s KWinGateSample) StartProgressing() bool {
+	return s.ActiveState == "active" &&
+		(s.SubState == "" || s.SubState == "running") &&
+		s.MainPID > 0 &&
+		len(s.JournalFatals) == 0 &&
+		s.StablePIDFor > 0
+}
+
 // kwinHealthProbeFn is the per-tick probe signature used by
 // awaitKWinHealthy. Tests can inject a deterministic implementation.
 type kwinHealthProbeFn func(ctx context.Context, deps *Deps, unit, user, uid, seat, tty string) KWinGateSample
+
+type kwinGateSampleObserver func(KWinGateSample)
 
 // awaitKWinHealthy polls every probeInterval until either:
 //
@@ -780,9 +804,13 @@ type kwinHealthProbeFn func(ctx context.Context, deps *Deps, unit, user, uid, se
 //   - the overall deadline elapses → returns the LAST sample + a
 //     timeout error so the caller can still inspect what gates passed.
 //
-// The "wait" parameter is the WHOLE-flow deadline (default 120s);
+// The "wait" parameter is the WHOLE-flow deadline (default 360s);
 // the stability window must elapse INSIDE that deadline before we
-// declare success. ctx cancellation aborts immediately.
+// declare success. If progressExtension is positive and the last
+// sample shows an active/running stable KWin process with a clean
+// journal, the deadline is extended once so slow PAM/logind socket
+// publication does not become a false negative. ctx cancellation
+// aborts immediately.
 //
 // Live VM 2026-05-22: the old serial gate sequence (socket-wait →
 // stability → is-active → MainPID → journal) failed at socket-wait=30s
@@ -793,27 +821,47 @@ func awaitKWinHealthy(
 	ctx context.Context,
 	deps *Deps,
 	probe kwinHealthProbeFn,
+	observe kwinGateSampleObserver,
 	unit, user, uid, seat, tty string,
-	wait, probeInterval time.Duration,
+	wait, progressExtension, probeInterval time.Duration,
 	stabilitySeconds int,
 	requireSession bool,
 ) (KWinGateSample, error) {
 	if wait <= 0 {
-		wait = 120 * time.Second
+		wait = defaultKWinGateWait
 	}
 	if probeInterval <= 0 {
 		probeInterval = 2 * time.Second
 	}
-	deadline := time.Now().Add(wait)
+	start := time.Now()
+	deadline := start.Add(wait)
+	if progressExtension < 0 {
+		progressExtension = 0
+	}
 	var last KWinGateSample
+	extended := false
 	for {
 		last = probe(ctx, deps, unit, user, uid, seat, tty)
+		last.WaitExtended = extended
+		if observe != nil {
+			observe(last)
+		}
 		if last.AllGatesPass(stabilitySeconds, requireSession) {
 			return last, nil
 		}
 		if time.Now().After(deadline) {
+			if !extended && progressExtension > 0 && last.StartProgressing() {
+				extended = true
+				deadline = time.Now().Add(progressExtension)
+				last.WaitExtended = true
+				continue
+			}
+			elapsed := time.Since(start).Truncate(time.Second)
+			if elapsed <= 0 {
+				elapsed = wait
+			}
 			return last, fmt.Errorf("kwin gates did not all pass within %s (last: active=%s sub=%s pid=%d socket=%v session=%v stable=%ds fatals=%d)",
-				wait, last.ActiveState, last.SubState, last.MainPID, last.SocketPresent,
+				elapsed, last.ActiveState, last.SubState, last.MainPID, last.SocketPresent,
 				last.SessionOnSeat, last.StablePIDFor, len(last.JournalFatals))
 		}
 		select {
