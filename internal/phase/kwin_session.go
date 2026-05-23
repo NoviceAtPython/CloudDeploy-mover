@@ -91,9 +91,28 @@ const KWinUnitDefaultPath = "/etc/systemd/system/" + KWinUnitName
 // realVTUnitTemplate is the v2-parity body for the real-VT
 // plasma/kwin sessions. The unit takes ownership of /dev/tty<KwinVT>,
 // PAM logs the user in, and the compositor inherits the logind
-// session that owns DRM master on that VT - which is exactly what
-// the live VM was missing when it failed with "Failed to activate
-// login1 session" + "No suitable DRM devices have been found".
+// session that owns DRM master on that VT.
+//
+// IMPORTANT: this template intentionally contains NO ExecStartPre and
+// NO ExecStartPost lines. Live VM (2026-05-22) RTX 4090 evidence
+// proved every shape of pre/post hook wedges the unit:
+//
+//   - ExecStartPre=/bin/systemctl stop getty@ttyN.service       hangs
+//     systemd inside start-pre because systemctl-from-systemctl is a
+//     re-entrant transaction.
+//   - ExecStartPre=/bin/systemctl --no-block start user@UID.service
+//     still wedges once systemd is in a degraded transaction state.
+//   - ExecStartPre=/bin/mkdir / /bin/chown / /usr/bin/chvt also gets
+//     stuck the moment the unit is in any "start-pre" hold.
+//   - ExecStartPost=/usr/local/bin/clouddeploy-force-kwin-mode.sh
+//     hangs the unit in start-post the same way; the helper polls
+//     kscreen-doctor for up to 60s and systemd treats that as "not
+//     done starting".
+//
+// All of that work is now done in Go from KWinSession.Run with
+// bounded context timeouts BEFORE the systemctl start call. After
+// validation, the mode helper is invoked separately from Go (also
+// bounded) so it can never block service activation.
 const realVTUnitTemplate = `[Unit]
 Description={{ .Description }}
 After=systemd-logind.service systemd-user-sessions.service network-online.target
@@ -106,7 +125,6 @@ User={{ .User }}
 Group={{ .User }}
 SupplementaryGroups=video render input
 PAMName=login
-PermissionsStartOnly=true
 
 # Anchor the session to a real VT. This is the v2 ingredient that
 # makes logind hand DRM master to the compositor.
@@ -171,25 +189,19 @@ Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_plat
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
 {{ .PrivateHDREnv }}
 
-# Make sure /run/user/<uid> + linger are ready before we launch.
-# The leading dash swallows non-fatal failures (the unit doesn't own
-# the dirs - logind does - but a defensive mkdir is cheap).
-ExecStartPre=-/bin/systemctl stop getty@tty{{ .KwinVT }}.service
-ExecStartPre=-/bin/systemctl start user@{{ .UID }}.service
-ExecStartPre=/bin/mkdir -p /run/user/{{ .UID }}
-ExecStartPre=/bin/chown {{ .User }}:{{ .User }} /run/user/{{ .UID }}
-ExecStartPre=/bin/chmod 0700 /run/user/{{ .UID }}
-ExecStartPre=/usr/bin/chvt {{ .KwinVT }}
-ExecStartPre=/bin/sh -c 'i=0; while [ $i -lt 30 ]; do /usr/bin/nvidia-smi >/dev/null 2>&1 && exit 0; sleep 1; i=$((i+1)); done; echo "warning: nvidia-smi never became ready; proceeding" >&2; exit 0'
 ExecStart={{ .ExecStart }}
 
-# Best-effort: force the configured DP-1 mode after KWin is up. The
-# helper is installed by the kwin_session phase. A missing helper is
-# logged but not fatal.
-ExecStartPost=-/usr/local/bin/clouddeploy-force-kwin-mode.sh
-
-Restart=on-failure
-RestartSec=5
+# Restart=no by design (live VM RTX 4090, 2026-05-22). The previous
+# Restart=on-failure masked the underlying logind/DRM error behind a
+# restart loop, which re-created /run/user/<uid>/wayland-0 transiently
+# and produced false-positive "socket present" signals. With
+# Restart=no, an actual KWin crash surfaces as "is-active" reporting
+# "failed" and clouddeployctl monitor highlights it immediately.
+# Operators who want a restart policy can override via:
+#     systemctl edit kwin-realvt.service
+Restart=no
+TimeoutStartSec=30
+KillMode=control-group
 
 [Install]
 WantedBy=multi-user.target
@@ -508,6 +520,33 @@ type KWinSession struct {
 	// HelperPath overrides /usr/local/bin/clouddeploy-force-kwin-mode.sh
 	// for tests.
 	HelperPath string
+
+	// StablePIDWindow overrides how long requireStableMainPID samples
+	// the unit's MainPID before declaring the compositor stable.
+	// 0 means "30s floor or SocketStability, whichever is larger".
+	// Tests inject a short duration so the 30s minimum doesn't
+	// dominate the test run.
+	StablePIDWindow time.Duration
+
+	// StablePIDInterval overrides how often requireStableMainPID
+	// re-samples. 0 = 2s default.
+	StablePIDInterval time.Duration
+
+	// SkipAdoption disables the "is an existing kwin-realvt session
+	// already healthy?" probe at the top of Run. Tests that don't
+	// stub the runner for `systemctl show ... ActiveEnterTimestamp`
+	// can set this true to skip the probe entirely.
+	SkipAdoption bool
+
+	// SkipExternalPrep disables the in-Go prep step that used to be
+	// ExecStartPre. Tests set this true so they don't need to stub
+	// every prep command (loginctl/udevadm/chvt/...).
+	SkipExternalPrep bool
+
+	// SkipModeHelper disables the post-validation
+	// clouddeploy-force-kwin-mode.sh invocation. Tests that don't
+	// install the helper script set this true.
+	SkipModeHelper bool
 }
 
 // Name implements Phase.
@@ -786,7 +825,38 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		}
 	}
 
-	// 2. Stale-config cleanup. Live VM evidence (2026-05-21): a
+	// 2. Adoption check. Live VM evidence (2026-05-22 RTX 4090): an
+	// operator who manually built a healthy kwin-realvt unit out-of-
+	// band wants the phase to keep that running, not tear it down
+	// and regenerate the brittle template. We adopt only when the
+	// unit is active, MainPID > 0, the socket exists, the journal
+	// has no fatal markers, AND the unit has been active for at
+	// least 30s.
+	if !deps.DryRun && choice.IsRealVT && !p.SkipAdoption {
+		adopt := p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 30*time.Second)
+		details["kwin_adopt_active_state"] = adopt.ActiveState
+		details["kwin_adopt_sub_state"] = adopt.SubState
+		details["kwin_adopt_main_pid"] = adopt.MainPID
+		details["kwin_adopt_socket_present"] = adopt.SocketPresent
+		details["kwin_adopt_uptime_seconds"] = adopt.UptimeSeconds
+		details["kwin_adopt_journal_fatals"] = adopt.JournalFatals
+		details["kwin_adopt_adoptable"] = adopt.Adoptable
+		if adopt.Adoptable {
+			log.Info("phase kwin-session: adopting existing healthy kwin session; skipping unit regeneration",
+				"unit", choice.UnitName, "main_pid", adopt.MainPID,
+				"uptime_s", adopt.UptimeSeconds)
+			details["kwin_pid"] = adopt.MainPID
+			details["service_active"] = true
+			details["wayland_socket_ok"] = true
+			details["wayland_socket_path"] = waylandSocketPath(uid)
+			details["adopted_existing_session"] = true
+			deps.State.MarkDone(KWinSessionName, details)
+			_ = deps.PersistState()
+			return nil
+		}
+	}
+
+	// 3. Stale-config cleanup. Live VM evidence (2026-05-21): a
 	// rerun of the deploy started KWin, plasmashell, and Sunshine,
 	// but wayland-info reported "no monitors available" because the
 	// previous boot's KScreen/output config had pinned DP-1 to a
@@ -799,7 +869,31 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		details["stale_kde_config_removed"] = cleaned
 	}
 
-	// 3. daemon-reload + enable + start.
+	// 4. External prep. Every step that used to be ExecStartPre runs
+	// here, in Go, with a per-step context timeout. Live VM evidence
+	// (2026-05-22): blocking systemctl/chvt/mkdir lines inside the
+	// unit wedge it; the same commands run from outside the unit
+	// finish in milliseconds.
+	if !deps.DryRun && choice.IsRealVT && !p.SkipExternalPrep {
+		disc := KWinSessionDiscovery{
+			User:            desk.User,
+			UID:             uid,
+			HomeDir:         "/home/" + desk.User,
+			XDGRuntimeDir:   "/run/user/" + uid,
+			DRMCard:         resolvedDRM,
+			DRMCardReason:   drmReason,
+			RenderNode:      RenderNodeForCard(resolvedDRM),
+			TTY:             fmt.Sprintf("/dev/tty%d", desk.KwinVT),
+			TTYReason:       fmt.Sprintf("profile.desktop.kwin_vt=%d", desk.KwinVT),
+			Seat:            "seat0",
+			ForcedConnector: connector,
+		}
+		details["kwin_session_discovery"] = disc
+		prep := kwinExternalPrep(ctx, deps, disc, log)
+		details["kwin_external_prep"] = prep
+	}
+
+	// 5. daemon-reload + enable + start.
 	steps := []struct {
 		name string
 		args []string
@@ -817,6 +911,7 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		if err := p.systemctl(ctx, deps, s.args...); err != nil {
 			details["err"] = err.Error()
 			details["failed_step"] = s.name
+			details["kwin_failure_category"] = classifyKWinFailure(err, "", p.showSubState(ctx, deps, choice.UnitName))
 			deps.State.MarkFailed(KWinSessionName, "systemctl "+s.name, err, true)
 			deps.State.Get(KWinSessionName).Details = details
 			_ = deps.PersistState()
@@ -854,6 +949,10 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		err := fmt.Errorf("wayland socket %s did not appear within %s after `systemctl start %s`", socketPath, wait, choice.UnitName)
 		details["err"] = err.Error()
 		details["wayland_socket_ok"] = false
+		details["kwin_sub_state"] = p.showSubState(ctx, deps, choice.UnitName)
+		jrn, _ := p.journalRecent(ctx, deps, choice.UnitName, 200)
+		details["journal_tail"] = lastLines(jrn, 30)
+		details["kwin_failure_category"] = classifyKWinFailure(err, jrn, fmt.Sprint(details["kwin_sub_state"]))
 		deps.State.MarkFailed(KWinSessionName, "wayland socket missing", err, true)
 		deps.State.Get(KWinSessionName).Details = details
 		_ = deps.PersistState()
@@ -910,16 +1009,37 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	}
 	details["service_active"] = true
 
-	// 6. MainPID must be a real, alive process.
-	pid, perr := p.mainPID(ctx, deps, choice.UnitName)
+	// 6. MainPID must be a real, alive process AND must stay the
+	// same for at least the stability window. The previous "read
+	// once" check let the live VM's openvt restart-loop slip
+	// through because the read happened to land between two
+	// crashes; requireStableMainPID samples every 2s.
+	stablePIDWindow := p.StablePIDWindow
+	if stablePIDWindow == 0 {
+		stablePIDWindow = stability
+		if stablePIDWindow < 30*time.Second {
+			stablePIDWindow = 30 * time.Second
+		}
+	}
+	stablePIDInterval := p.StablePIDInterval
+	if stablePIDInterval == 0 {
+		stablePIDInterval = 2 * time.Second
+	}
+	pid, perr := p.requireStableMainPID(ctx, deps, choice.UnitName, stablePIDWindow, stablePIDInterval)
 	details["kwin_pid"] = pid
+	details["kwin_pid_stable_window_s"] = int(stablePIDWindow / time.Second)
 	if perr != nil {
-		log.Warn("phase kwin-session: could not read MainPID (non-fatal)",
-			"unit", choice.UnitName, "err", perr)
+		details["err"] = perr.Error()
+		details["kwin_failure_category"] = KWinFailPIDUnstable
+		deps.State.MarkFailed(KWinSessionName, "compositor MainPID unstable", perr, true)
+		deps.State.Get(KWinSessionName).Details = details
+		_ = deps.PersistState()
+		return fmt.Errorf("phase kwin-session: %w", perr)
 	}
 	if pid <= 0 {
 		err := fmt.Errorf("systemd reports MainPID=%d for %s after the stability window", pid, choice.UnitName)
 		details["err"] = err.Error()
+		details["kwin_failure_category"] = KWinFailSocketAppearedKWinExited
 		deps.State.MarkFailed(KWinSessionName, "compositor process missing after start", err, true)
 		deps.State.Get(KWinSessionName).Details = details
 		_ = deps.PersistState()
@@ -1037,6 +1157,18 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 			_ = deps.PersistState()
 			return fmt.Errorf("phase kwin-session: %w", err)
 		}
+	}
+
+	// 10. Run the mode helper from Go (NOT via ExecStartPost). At
+	// this point the service is validated; if the helper hangs, we
+	// kill it after 90s and mark mode-helper-timeout but DO NOT
+	// fail the phase. Live VM evidence (2026-05-22): an
+	// ExecStartPost mode helper hung the unit in start-post; running
+	// it from here can never block service activation.
+	if choice.IsRealVT && !p.SkipModeHelper {
+		modeOK, modeInfo := p.runModeHelperBounded(ctx, deps, log)
+		details["mode_helper_ok"] = modeOK
+		details["mode_helper_info"] = modeInfo
 	}
 
 	deps.State.MarkDone(KWinSessionName, details)

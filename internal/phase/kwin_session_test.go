@@ -55,6 +55,14 @@ func happyKwin(unitPath string) KWinSession {
 		},
 		SocketWait:      2 * time.Second,
 		SocketStability: 100 * time.Millisecond,
+		// Test-only overrides. The production defaults (30s+ stable-
+		// PID window, plus running every external prep step) would
+		// blow the test budget on the runner stub.
+		StablePIDWindow:   200 * time.Millisecond,
+		StablePIDInterval: 50 * time.Millisecond,
+		SkipAdoption:      false, // exercise adoption probe (it falls through to "not adoptable" without stubs)
+		SkipExternalPrep:  true,  // adoption + start use SystemctlFn; prep would hit the real runner
+		SkipModeHelper:    true,  // no helper script on disk in tests
 	}
 }
 
@@ -83,9 +91,12 @@ func TestRenderUnitText_RealVTKWinIsTheDefault(t *testing.T) {
 		"GBM_BACKEND=nvidia-drm",
 		"__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
 		"__GLX_VENDOR_LIBRARY_NAME=nvidia",
-		"chvt 7",
 		"kwin_wayland --drm --socket wayland-0 --no-lockscreen",
-		"clouddeploy-force-kwin-mode.sh",
+		// Validation-time restart policy + bounded start. Both are
+		// new in the post-2026-05-22 RTX-4090-debug rewrite.
+		"Restart=no",
+		"TimeoutStartSec=30",
+		"KillMode=control-group",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("rendered unit missing %q in:\n%s", want, out)
@@ -96,6 +107,22 @@ func TestRenderUnitText_RealVTKWinIsTheDefault(t *testing.T) {
 	}
 	if strings.Contains(out, "{{") || strings.Contains(out, "}}") {
 		t.Errorf("rendered unit still contains template placeholders:\n%s", out)
+	}
+	// Live VM RTX 4090 (2026-05-22): the unit MUST NOT carry any
+	// ExecStartPre or ExecStartPost line. Blocking prep belongs in
+	// the Go phase, not in systemd.
+	for _, bad := range []string{
+		"ExecStartPre=",
+		"ExecStartPost=",
+		// And specifically the two start-pre lines that wedged
+		// live VMs:
+		"/bin/systemctl stop getty",
+		"/bin/systemctl start user@",
+		"clouddeploy-force-kwin-mode.sh",
+	} {
+		if strings.Contains(out, bad) {
+			t.Errorf("rendered unit must not contain %q (live VM regression):\n%s", bad, out)
+		}
 	}
 }
 
@@ -271,9 +298,12 @@ func TestKWinSession_TransientSocketFailsFatal(t *testing.T) {
 	ph.SocketStability = 3 * time.Second
 	ph.WaylandSocketFn = func(string) bool {
 		socketChecks++
-		// First probe true (waitForSocket); subsequent stability
-		// checks return false to simulate KWin's restart loop.
-		return socketChecks <= 1
+		// Call #1 = adoption probe (returns true, but uptime=0 so
+		// the unit is NOT adopted).
+		// Call #2 = post-start waitForSocket (returns true).
+		// Call #3+ = stability checks (return false to simulate
+		// KWin's restart loop).
+		return socketChecks <= 2
 	}
 
 	err := ph.Run(context.Background(), deps)
@@ -767,4 +797,238 @@ func equalStrings(a, b []string) bool {
 		}
 	}
 	return true
+}
+
+// -----------------------------------------------------------------------------
+// Live VM RTX 4090 (2026-05-22) regression coverage:
+//   - generated service must have no ExecStartPre / ExecStartPost
+//   - socket alone is NOT success when MainPID changes (restart loop)
+//   - fatal journal markers fail the phase
+//   - existing healthy session is adopted, not regenerated
+//   - failure categories are recorded in state.Details
+//   - prep happens outside the unit
+// -----------------------------------------------------------------------------
+
+func TestRealVTUnitHasNoExecStartPreOrPost(t *testing.T) {
+	out := RenderUnitText("cloudgamer", "1001")
+	for _, bad := range []string{
+		"ExecStartPre=",
+		"ExecStartPost=",
+		"/bin/systemctl stop getty",
+		"/bin/systemctl start user@",
+		"/bin/mkdir -p /run/user/",
+		"/usr/bin/chvt",
+		"clouddeploy-force-kwin-mode.sh",
+	} {
+		if strings.Contains(out, bad) {
+			t.Errorf("rendered unit must not contain %q (live VM regression):\n%s", bad, out)
+		}
+	}
+	for _, want := range []string{
+		"Restart=no",
+		"TimeoutStartSec=30",
+		"KillMode=control-group",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("rendered unit missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestKWinSession_RestartLoopFailsFatal(t *testing.T) {
+	// Simulates a restart loop: socket appears, but MainPID keeps
+	// changing across stable-PID samples. The phase must fail with
+	// kwin_failure_category=kwin_pid_unstable, not declare success.
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+
+	calls := 0
+	ph := happyKwin(unitPath)
+	ph.SystemctlShowMainPIDFn = func(context.Context, *Deps, string) (int, error) {
+		calls++
+		// Different PID on every sample = restart loop.
+		return 1000 + calls, nil
+	}
+
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal when MainPID changes inside the stability window")
+	}
+	if !strings.Contains(err.Error(), "MainPID changed") {
+		t.Errorf("error should mention MainPID change: %v", err)
+	}
+	d := deps.State.Get(KWinSessionName).Details
+	if d["kwin_failure_category"] != KWinFailPIDUnstable {
+		t.Errorf("kwin_failure_category: got %v want %s", d["kwin_failure_category"], KWinFailPIDUnstable)
+	}
+}
+
+func TestKWinSession_FatalJournalSignatureCategorizedAsLogind(t *testing.T) {
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+	ph := happyKwin(unitPath)
+	ph.JournalRecentFn = func(context.Context, *Deps, string, int) (string, error) {
+		return "kwin_core: Failed to activate /org/freedesktop/login1/session/c1\n", nil
+	}
+
+	err := ph.Run(context.Background(), deps)
+	if err == nil {
+		t.Fatalf("expected fatal when journal contains logind activation failure")
+	}
+	d := deps.State.Get(KWinSessionName).Details
+	if hits, _ := d["journal_fatal_hits"].([]string); len(hits) == 0 {
+		t.Errorf("journal_fatal_hits should be populated; details=%v", d)
+	}
+}
+
+func TestProbeKWinAdoption_HappyAdoption(t *testing.T) {
+	// Simulates: existing unit is active + MainPID alive +
+	// socket present + no fatal markers + uptime >= 30s.
+	// Adoption should return Adoptable=true.
+	ph := happyKwin("")
+	ph.WaylandSocketFn = func(string) bool { return true }
+	ph.SystemctlIsActiveFn = func(context.Context, *Deps, string) (string, error) {
+		return "active", nil
+	}
+	ph.SystemctlShowMainPIDFn = func(context.Context, *Deps, string) (int, error) {
+		return 4242, nil
+	}
+	ph.JournalRecentFn = func(context.Context, *Deps, string, int) (string, error) {
+		return "", nil
+	}
+	deps := kwinDeps(t)
+	// unitActiveSeconds uses a real runner; on test machines that
+	// returns 0. To exercise the "uptime ok" branch, pass 0 min
+	// uptime: probe still applies the active/pid/socket/journal gates.
+	got := ph.probeKWinAdoption(context.Background(), deps, "kwin-realvt.service", "1001", 0)
+	if !got.Adoptable {
+		t.Fatalf("expected Adoptable=true; got %+v", got)
+	}
+}
+
+func TestProbeKWinAdoption_NotAdoptableWhenFatalMarker(t *testing.T) {
+	ph := happyKwin("")
+	ph.JournalRecentFn = func(context.Context, *Deps, string, int) (string, error) {
+		return "kwin_wayland_drm: No suitable DRM devices have been found\n", nil
+	}
+	deps := kwinDeps(t)
+	got := ph.probeKWinAdoption(context.Background(), deps, "kwin-realvt.service", "1001", 0)
+	if got.Adoptable {
+		t.Fatalf("must not adopt when journal has fatal marker; got %+v", got)
+	}
+	if len(got.JournalFatals) == 0 {
+		t.Errorf("expected JournalFatals to be populated; got %+v", got)
+	}
+}
+
+func TestProbeKWinAdoption_NotAdoptableWhenInactive(t *testing.T) {
+	ph := happyKwin("")
+	ph.SystemctlIsActiveFn = func(context.Context, *Deps, string) (string, error) {
+		return "failed", nil
+	}
+	deps := kwinDeps(t)
+	got := ph.probeKWinAdoption(context.Background(), deps, "kwin-realvt.service", "1001", 0)
+	if got.Adoptable {
+		t.Fatalf("must not adopt when unit is not active; got %+v", got)
+	}
+}
+
+func TestClassifyKWinFailure_LiveVMSignatures(t *testing.T) {
+	for _, c := range []struct {
+		name     string
+		err      error
+		journal  string
+		subState string
+		want     string
+	}{
+		{"no-suitable-drm", nil, "kwin_wayland_drm: No suitable DRM devices have been found", "running", KWinFailNoSuitableDRMDevices},
+		{"failed-to-open-drm", nil, "kwin_wayland_drm: failed to open drm device at /dev/dri/card0", "failed", KWinFailDRMOpenFailed},
+		{"logind-activation", nil, "kwin_core: Failed to activate /org/freedesktop/login1/session/c1 session", "running", KWinFailLogindActivationFailed},
+		{"start-pre", nil, "", "start-pre", KWinFailServiceStuckExecStartPre},
+		{"start-post", nil, "", "start-post", KWinFailServiceStuckExecStartPost},
+		{"socket-missing", nil, "wayland-0 did not appear in 30s", "running", KWinFailWaylandSocketMissing},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			got := classifyKWinFailure(c.err, c.journal, c.subState)
+			if got != c.want {
+				t.Fatalf("got %q want %q", got, c.want)
+			}
+		})
+	}
+}
+
+func TestSelectKWinDRMCard_HonorsExplicitPath(t *testing.T) {
+	card, reason, err := selectKWinDRMCard("/dev/dri/card2", "", "", "")
+	if err != nil {
+		t.Fatalf("err=%v", err)
+	}
+	if card != "/dev/dri/card2" {
+		t.Errorf("card: got %q want /dev/dri/card2", card)
+	}
+	if !strings.Contains(reason, "explicitly pinned") {
+		t.Errorf("reason should mention explicit pin: %q", reason)
+	}
+}
+
+func TestSelectKWinDRMCard_NoCardsReturnsError(t *testing.T) {
+	emptySys := t.TempDir()
+	emptyDev := t.TempDir()
+	_, _, err := selectKWinDRMCard("", "", emptySys, emptyDev)
+	if err == nil {
+		t.Fatalf("expected error when /sys/class/drm has no card*")
+	}
+	if !strings.Contains(err.Error(), KWinFailNoCandidateDRMCard) {
+		t.Errorf("error should carry the no_candidate_drm_card category: %v", err)
+	}
+}
+
+func TestSelectKWinTTY_HonorsExplicit(t *testing.T) {
+	tty, reason := selectKWinTTY(8)
+	if tty != "/dev/tty8" {
+		t.Errorf("tty: got %q want /dev/tty8", tty)
+	}
+	if !strings.Contains(reason, "explicit") {
+		t.Errorf("reason should say explicit: %q", reason)
+	}
+}
+
+func TestSelectKWinTTY_DefaultIsTty7(t *testing.T) {
+	tty, _ := selectKWinTTY(0)
+	if tty != "/dev/tty7" {
+		t.Errorf("tty: got %q want /dev/tty7 (default candidate)", tty)
+	}
+}
+
+func TestDiscoverKWinSession_RoundsUpHomeAndUID(t *testing.T) {
+	disc, err := discoverKWinSession(
+		"cloudgamer",
+		"",     // no explicit DRM
+		7,      // explicit TTY
+		"DP-1", // forced connector
+		"",     // default sysfs
+		"",     // default devdri
+		func(u string) (string, string, bool) {
+			return "1001", "/home/cloudgamer", true
+		},
+	)
+	if err == nil && disc.DRMCard == "" {
+		// On Windows there's no /dev/dri; the helper falls through to
+		// "no /dev/dri/card* present". Accept either path.
+		// fall through
+	}
+	if disc.User != "cloudgamer" || disc.UID != "1001" {
+		t.Errorf("user/uid: got %s/%s want cloudgamer/1001", disc.User, disc.UID)
+	}
+	if disc.HomeDir != "/home/cloudgamer" {
+		t.Errorf("HomeDir: got %q want /home/cloudgamer", disc.HomeDir)
+	}
+	if disc.XDGRuntimeDir != "/run/user/1001" {
+		t.Errorf("XDGRuntimeDir: got %q want /run/user/1001", disc.XDGRuntimeDir)
+	}
+	if disc.TTY != "/dev/tty7" {
+		t.Errorf("TTY: got %q want /dev/tty7", disc.TTY)
+	}
+	if disc.Seat != "seat0" {
+		t.Errorf("Seat: got %q want seat0", disc.Seat)
+	}
 }
