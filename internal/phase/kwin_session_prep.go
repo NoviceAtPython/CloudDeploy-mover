@@ -671,6 +671,419 @@ func (p KWinSession) requireStableMainPID(ctx context.Context, deps *Deps, unitN
 }
 
 // -----------------------------------------------------------------------------
+// selected runtime tuple + unified gate poll + self-heal
+// -----------------------------------------------------------------------------
+
+// KWinSelectedPath is the concrete runtime tuple the phase committed
+// to BEFORE starting (or adopting) the compositor. Persisted to
+// state.Details["kwin_selected"] so monitor / state-show / doctor can
+// display the exact path CloudDeploy chose. Fields are filled in as
+// they get resolved; values may be empty when the phase short-
+// circuits early (e.g. dry-run).
+//
+// Live VM 2026-05-22 (RTX 4090) motivation: after a fatal
+// "socket missing" the operator had to grep state.Details to figure
+// out which card/tty/seat CloudDeploy had been targeting. Persisting
+// the tuple up front makes the chosen path the FIRST thing visible
+// in `clouddeployctl monitor`.
+type KWinSelectedPath struct {
+	User             string `json:"user"`
+	UID              string `json:"uid"`
+	Seat             string `json:"seat"`
+	TTY              string `json:"tty"`
+	DRMCard          string `json:"drm_card"`
+	RenderNode       string `json:"render_node,omitempty"`
+	Socket           string `json:"socket"`
+	Service          string `json:"service"`
+	MainPID          int    `json:"main_pid,omitempty"`
+	ServiceStartTime string `json:"service_start_time,omitempty"`
+	InvocationID     string `json:"invocation_id,omitempty"`
+}
+
+// String renders the tuple as a one-line summary for monitor /
+// state-show. Empty fields are skipped so a partially-resolved
+// tuple still produces a readable line.
+func (s KWinSelectedPath) String() string {
+	parts := []string{}
+	add := func(k, v string) {
+		if strings.TrimSpace(v) != "" {
+			parts = append(parts, k+"="+v)
+		}
+	}
+	add("user", s.User)
+	add("uid", s.UID)
+	add("seat", s.Seat)
+	add("tty", s.TTY)
+	add("drm", s.DRMCard)
+	add("render", s.RenderNode)
+	add("socket", s.Socket)
+	add("service", s.Service)
+	if s.MainPID > 0 {
+		add("pid", fmt.Sprintf("%d", s.MainPID))
+	}
+	add("invocation", s.InvocationID)
+	return strings.Join(parts, " ")
+}
+
+// KWinGateSample is what awaitKWinHealthy records on every poll
+// tick. We surface only the last sample in state.Details (older
+// samples are summarized in a hit/miss counter) so the persisted
+// blob stays bounded.
+type KWinGateSample struct {
+	At              time.Time `json:"at"`
+	ActiveState     string    `json:"active_state"`
+	SubState        string    `json:"sub_state"`
+	MainPID         int       `json:"main_pid"`
+	SocketPresent   bool      `json:"socket_present"`
+	SessionOnSeat   bool      `json:"session_on_expected_seat_tty"`
+	JournalFatals   []string  `json:"journal_fatal_hits,omitempty"`
+	StablePIDFor    int       `json:"stable_pid_for_seconds"`
+	InvocationID    string    `json:"invocation_id"`
+	ActiveEnter     string    `json:"active_enter_timestamp"`
+	UnitInvocStable bool      `json:"invocation_stable"`
+}
+
+// AllGatesPass reports whether this sample shows a fully-healthy
+// compositor: service active, MainPID alive, socket present, journal
+// clean for THIS invocation, MainPID stable for at least the
+// stability window, and (when expected seat/tty are provided)
+// loginctl session on the right tty.
+func (s KWinGateSample) AllGatesPass(stabilitySeconds int, requireSession bool) bool {
+	if s.ActiveState != "active" {
+		return false
+	}
+	if s.MainPID <= 0 {
+		return false
+	}
+	if !s.SocketPresent {
+		return false
+	}
+	if len(s.JournalFatals) > 0 {
+		return false
+	}
+	if s.StablePIDFor < stabilitySeconds {
+		return false
+	}
+	if requireSession && !s.SessionOnSeat {
+		return false
+	}
+	return true
+}
+
+// kwinHealthProbeFn is the per-tick probe signature used by
+// awaitKWinHealthy. Tests can inject a deterministic implementation.
+type kwinHealthProbeFn func(ctx context.Context, deps *Deps, unit, user, uid, seat, tty string) KWinGateSample
+
+// awaitKWinHealthy polls every probeInterval until either:
+//
+//   - a sample reports AllGatesPass(stabilitySeconds, requireSession) → returns it, nil
+//   - the overall deadline elapses → returns the LAST sample + a
+//     timeout error so the caller can still inspect what gates passed.
+//
+// The "wait" parameter is the WHOLE-flow deadline (default 120s);
+// the stability window must elapse INSIDE that deadline before we
+// declare success. ctx cancellation aborts immediately.
+//
+// Live VM 2026-05-22: the old serial gate sequence (socket-wait →
+// stability → is-active → MainPID → journal) failed at socket-wait=30s
+// even when the service became healthy 5s later. The unified poll
+// fixes that by re-sampling every gate together; if the socket
+// shows up at second 35 the next tick adopts the now-healthy state.
+func awaitKWinHealthy(
+	ctx context.Context,
+	deps *Deps,
+	probe kwinHealthProbeFn,
+	unit, user, uid, seat, tty string,
+	wait, probeInterval time.Duration,
+	stabilitySeconds int,
+	requireSession bool,
+) (KWinGateSample, error) {
+	if wait <= 0 {
+		wait = 120 * time.Second
+	}
+	if probeInterval <= 0 {
+		probeInterval = 2 * time.Second
+	}
+	deadline := time.Now().Add(wait)
+	var last KWinGateSample
+	for {
+		last = probe(ctx, deps, unit, user, uid, seat, tty)
+		if last.AllGatesPass(stabilitySeconds, requireSession) {
+			return last, nil
+		}
+		if time.Now().After(deadline) {
+			return last, fmt.Errorf("kwin gates did not all pass within %s (last: active=%s sub=%s pid=%d socket=%v session=%v stable=%ds fatals=%d)",
+				wait, last.ActiveState, last.SubState, last.MainPID, last.SocketPresent,
+				last.SessionOnSeat, last.StablePIDFor, len(last.JournalFatals))
+		}
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err()
+		case <-time.After(probeInterval):
+		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// invocation-scoped journal scanning
+// -----------------------------------------------------------------------------
+
+// readUnitInvocationID returns the unit's current InvocationID
+// (matches journalctl's _SYSTEMD_INVOCATION_ID= field). Empty string
+// when the unit is inactive or systemctl errors.
+func (p KWinSession) readUnitInvocationID(ctx context.Context, deps *Deps, unit string) string {
+	if deps == nil || deps.Runner == nil {
+		return ""
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"systemctl", "show", unit, "-p", "InvocationID", "--value"},
+		LogFile: "-",
+		Timeout: 8 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	return strings.TrimSpace(strings.Split(res.Stdout, "\n")[0])
+}
+
+// readUnitActiveEnterTimestamp returns the unit's last
+// ActiveEnterTimestamp as a string suitable for `journalctl --since=`.
+// Empty when the unit never went active.
+func (p KWinSession) readUnitActiveEnterTimestamp(ctx context.Context, deps *Deps, unit string) string {
+	if deps == nil || deps.Runner == nil {
+		return ""
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"systemctl", "show", unit, "-p", "ActiveEnterTimestamp", "--value"},
+		LogFile: "-",
+		Timeout: 8 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	return strings.TrimSpace(strings.Split(res.Stdout, "\n")[0])
+}
+
+// journalForInvocation returns the unit's journal scoped to the
+// current InvocationID. Falls back to `journalctl --since
+// <ActiveEnterTimestamp>` when InvocationID is empty (e.g. older
+// systemd). Final fallback: the most recent N lines.
+//
+// Live VM 2026-05-22 motivation: an unscoped `journalctl -u
+// kwin-realvt.service -n 200` picked up a "No suitable DRM devices"
+// line from the previous failed boot and fatal'd the phase even
+// though the CURRENT KWin invocation was healthy.
+func (p KWinSession) journalForInvocation(ctx context.Context, deps *Deps, unit, invocationID, activeEnter string, lines int) (string, error) {
+	// Always prefer the test-injected JournalRecentFn when the
+	// caller didn't get an InvocationID or ActiveEnter from systemd
+	// (which is the case on Windows under unit tests, and the case
+	// on older systemd that doesn't report InvocationID). This keeps
+	// the test contract from the previous serial-gate version
+	// working.
+	if p.JournalRecentFn != nil && invocationID == "" && activeEnter == "" {
+		return p.JournalRecentFn(ctx, deps, unit, lines)
+	}
+	if deps == nil || deps.Runner == nil {
+		if p.JournalRecentFn != nil {
+			return p.JournalRecentFn(ctx, deps, unit, lines)
+		}
+		return "", nil
+	}
+	var argv []string
+	switch {
+	case invocationID != "":
+		argv = []string{"journalctl", "_SYSTEMD_INVOCATION_ID=" + invocationID,
+			"-u", unit, "-n", fmt.Sprintf("%d", lines), "--no-pager"}
+	case activeEnter != "" && !strings.EqualFold(activeEnter, "n/a"):
+		argv = []string{"journalctl", "-u", unit, "--since", activeEnter,
+			"-n", fmt.Sprintf("%d", lines), "--no-pager"}
+	default:
+		// Final fallback: the most recent N lines (old behaviour).
+		argv = []string{"journalctl", "-u", unit, "-n", fmt.Sprintf("%d", lines), "--no-pager"}
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    argv,
+		LogFile: "-",
+		Timeout: 15 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	if res.Err != nil {
+		return res.Stdout, fmt.Errorf("journalctl invocation-scoped: %w", res.Err)
+	}
+	return res.Stdout, nil
+}
+
+// -----------------------------------------------------------------------------
+// loginctl session probe
+// -----------------------------------------------------------------------------
+
+// loginctlSessionMatchesSeatTTY returns true when `loginctl
+// list-sessions --no-legend` has a row for the headless user on the
+// expected seat AND tty (or "n/a" tty when caller didn't pin one).
+//
+// loginctl output shape:
+//
+//	$ loginctl list-sessions --no-legend
+//	c1 1002 cloudgamer seat0 tty7
+//	c2 0    root       seat0
+//
+// We accept "tty7" or "/dev/tty7" interchangeably from the caller
+// (we compare against the last column trimmed of "/dev/").
+func (p KWinSession) loginctlSessionMatchesSeatTTY(ctx context.Context, deps *Deps, user, seat, tty string) bool {
+	if deps == nil || deps.Runner == nil {
+		return false
+	}
+	if p.LoginctlSessionsFn != nil {
+		out, err := p.LoginctlSessionsFn(ctx, deps)
+		if err != nil {
+			return false
+		}
+		return loginctlSessionsContainsUserSeatTTY(out, user, seat, tty)
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"loginctl", "list-sessions", "--no-legend"},
+		LogFile: "-",
+		Timeout: 8 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	if res.Err != nil {
+		return false
+	}
+	return loginctlSessionsContainsUserSeatTTY(res.Stdout, user, seat, tty)
+}
+
+// defaultHealthProbe samples every gate (systemctl is-active /
+// SubState / MainPID / ActiveEnter / InvocationID, socket existence,
+// loginctl seat+tty session, invocation-scoped journal) and tracks
+// MainPID stability across calls. It is the production
+// implementation of kwinHealthProbeFn; tests can inject their own.
+//
+// Stability is approximated as "consecutive successful samples where
+// MainPID equals the FIRST observed positive PID". The helper keeps
+// state via the closure returned by newDefaultHealthProbe; the
+// "default" method here is a thin adapter that calls that closure.
+// We attach the closure to the phase struct so a freshly-constructed
+// KWinSession resets stability counters between Run invocations.
+//
+// Live VM 2026-05-22: this probe is what unifies the previous
+// serial gates (socket-wait → stability → is-active → MainPID →
+// journal). When the live VM's KWin became healthy 5s after the
+// 30s socket-wait window, the next sample tick adopted it.
+func (p *KWinSession) defaultHealthProbe(ctx context.Context, deps *Deps, unit, user, uid, seat, tty string) KWinGateSample {
+	if p.healthProbeState == nil {
+		p.healthProbeState = &kwinHealthProbeState{}
+	}
+	sample := KWinGateSample{At: time.Now()}
+	if state, err := p.isActive(ctx, deps, unit); err == nil {
+		sample.ActiveState = state
+	}
+	sample.SubState = p.showSubState(ctx, deps, unit)
+	if pid, err := p.mainPID(ctx, deps, unit); err == nil {
+		sample.MainPID = pid
+	}
+	sample.SocketPresent = p.socketExists(uid)
+	sample.InvocationID = p.readUnitInvocationID(ctx, deps, unit)
+	sample.ActiveEnter = p.readUnitActiveEnterTimestamp(ctx, deps, unit)
+	// Invocation-scoped journal -- if InvocationID is empty AND
+	// activeEnter is empty (unit never went active), we still scan
+	// the recent tail so a "Failed to activate logind" failure
+	// shows up. The scope is conservative on purpose.
+	jrn, _ := p.journalForInvocation(ctx, deps, unit, sample.InvocationID, sample.ActiveEnter, 200)
+	sample.JournalFatals = scanFatalSignatures(jrn)
+	probeUser := strings.TrimSpace(user)
+	if probeUser == "" {
+		probeUser = p.healthProbeState.expectedUser(uid)
+	}
+	sample.SessionOnSeat = p.loginctlSessionMatchesSeatTTY(ctx, deps, probeUser, seat, tty)
+
+	// Stability counter. Resets whenever MainPID changes or drops
+	// to zero (compositor restart). When InvocationID is available
+	// we ALSO require it to match across samples (so a same-PID
+	// reuse across restarts of the unit gets caught); when it's
+	// empty (older systemd or in tests where the runner can't reach
+	// systemctl show) we fall back to pure MainPID equality.
+	pidStable := sample.MainPID > 0 && sample.MainPID == p.healthProbeState.lastMainPID
+	invocStable := sample.InvocationID == "" || sample.InvocationID == p.healthProbeState.lastInvocationID
+	if pidStable && invocStable {
+		p.healthProbeState.consecutiveStableSamples++
+		sample.UnitInvocStable = true
+	} else {
+		p.healthProbeState.consecutiveStableSamples = 1
+		p.healthProbeState.lastMainPID = sample.MainPID
+		p.healthProbeState.lastInvocationID = sample.InvocationID
+		sample.UnitInvocStable = false
+	}
+	// One probe tick == StablePIDInterval (default 2s) wall-clock.
+	// Multiply consecutive samples by the probe interval to get an
+	// approximate seconds-of-stable PID. We floor the per-tick
+	// contribution at 1 so sub-second test intervals still
+	// accumulate (otherwise stability would never reach 1 and the
+	// caller's `stabilitySeconds >= 1` floor would never fire).
+	interval := p.StablePIDInterval
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	tickSeconds := int(interval / time.Second)
+	if tickSeconds < 1 {
+		tickSeconds = 1
+	}
+	sample.StablePIDFor = p.healthProbeState.consecutiveStableSamples * tickSeconds
+	return sample
+}
+
+// kwinHealthProbeState carries the cross-tick stability counters
+// the unified gate poll needs. Lives on KWinSession so the
+// production code keeps the same probe instance for the whole
+// Run; tests construct fresh values.
+type kwinHealthProbeState struct {
+	consecutiveStableSamples int
+	lastMainPID              int
+	lastInvocationID         string
+	userOverride             string
+}
+
+func (s *kwinHealthProbeState) expectedUser(uid string) string {
+	if s.userOverride != "" {
+		return s.userOverride
+	}
+	// Best-effort: caller has the user on the KWinSession struct.
+	// We don't have direct access here; the loginctl probe gets the
+	// user from the surrounding closure in defaultHealthProbe (via
+	// p), so this method is only consulted when nothing else set it.
+	return ""
+}
+
+// loginctlSessionsContainsUserSeatTTY is the pure-function half of
+// the loginctl probe, exposed for unit tests.
+func loginctlSessionsContainsUserSeatTTY(listOut, user, seat, tty string) bool {
+	if strings.TrimSpace(listOut) == "" {
+		return false
+	}
+	wantTTY := strings.TrimPrefix(strings.TrimSpace(tty), "/dev/")
+	wantUser := strings.TrimSpace(user)
+	wantSeat := strings.TrimSpace(seat)
+	for _, raw := range strings.Split(listOut, "\n") {
+		fields := strings.Fields(strings.TrimRight(raw, "\r"))
+		if len(fields) < 4 {
+			continue
+		}
+		// session_id uid user seat [tty]
+		gotUser := fields[2]
+		gotSeat := fields[3]
+		gotTTY := ""
+		if len(fields) >= 5 {
+			gotTTY = fields[4]
+		}
+		if wantUser != "" && gotUser != wantUser {
+			continue
+		}
+		if wantSeat != "" && gotSeat != wantSeat {
+			continue
+		}
+		if wantTTY == "" || gotTTY == wantTTY {
+			return true
+		}
+	}
+	return false
+}
+
+// -----------------------------------------------------------------------------
 // mode helper - run from Go, NEVER as ExecStartPost.
 // -----------------------------------------------------------------------------
 

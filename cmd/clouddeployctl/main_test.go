@@ -99,6 +99,50 @@ func TestMonitorCurrentPhaseEmptyWhenAllDone(t *testing.T) {
 	}
 }
 
+func TestMonitorKWinSelectedLineFormatsTuple(t *testing.T) {
+	d := map[string]any{
+		"kwin_user":          "cloudgamer",
+		"kwin_uid":           "1002",
+		"kwin_seat":          "seat0",
+		"kwin_tty":           "/dev/tty7",
+		"kwin_drm_card":      "/dev/dri/card0",
+		"kwin_render_node":   "/dev/dri/renderD128",
+		"kwin_socket":        "/run/user/1002/wayland-0",
+		"kwin_service":       "kwin-realvt.service",
+		"kwin_pid":           6437,
+		"kwin_invocation_id": "abc123",
+	}
+	got := monitorKWinSelectedLine(d)
+	for _, want := range []string{
+		"user=cloudgamer", "uid=1002", "seat=seat0",
+		"tty=/dev/tty7", "drm=/dev/dri/card0",
+		"render=/dev/dri/renderD128",
+		"socket=/run/user/1002/wayland-0",
+		"service=kwin-realvt.service",
+		"pid=6437", "invocation=abc123",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("monitorKWinSelectedLine missing %q in %q", want, got)
+		}
+	}
+}
+
+func TestMonitorKWinSelectedLineEmptyForMissingDetails(t *testing.T) {
+	if got := monitorKWinSelectedLine(nil); got != "" {
+		t.Errorf("nil details should produce empty line; got %q", got)
+	}
+	if got := monitorKWinSelectedLine(map[string]any{}); got != "" {
+		t.Errorf("empty details should produce empty line; got %q", got)
+	}
+	// Pid=0 must not show "pid=0".
+	got := monitorKWinSelectedLine(map[string]any{
+		"kwin_user": "cloudgamer", "kwin_pid": 0,
+	})
+	if strings.Contains(got, "pid=") {
+		t.Errorf("pid=0 must not appear: %q", got)
+	}
+}
+
 func TestFirstAssetURLReturnsEmptyOnRawTemplate(t *testing.T) {
 	html := `<!DOCTYPE html><html><head><%- header %></head><body><div id="app"></div><script src="src/main.ts"></script></body></html>`
 	got := firstAssetURL(html)

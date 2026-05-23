@@ -2312,6 +2312,16 @@ Resilient to in-progress apt upgrades that temporarily disable sudo.`,
 				} else {
 					fmt.Printf("current phase: (none; all phases terminal-done)\n")
 				}
+				// KWin selected runtime tuple. Persisted by the
+				// kwin_session phase BEFORE it tries to start the
+				// service, so an operator scanning monitor output
+				// sees the exact path CloudDeploy committed to.
+				if ph := st.Get(phase.KWinSessionName); ph != nil && ph.Details != nil {
+					selected := monitorKWinSelectedLine(ph.Details)
+					if selected != "" {
+						fmt.Printf("kwin selected: %s\n", selected)
+					}
+				}
 				if ph := st.Get("cuda"); ph != nil && ph.Details != nil && fmt.Sprint(ph.Details["cuda_status"]) == "degraded" {
 					fmt.Printf("cuda degraded/nonfatal: %s", evOrUnknown(fmt.Sprint(ph.Details["cuda_degraded_reason"])))
 					if elapsed := strings.TrimSpace(fmt.Sprint(ph.Details["smoke_run_elapsed"])); elapsed != "" && elapsed != "<nil>" {
@@ -2433,6 +2443,45 @@ func monitorCurrentPhase(st *state.State) (string, string, string) {
 		}
 	}
 	return bestName, bestStatus, bestReason
+}
+
+// monitorKWinSelectedLine formats the kwin_selected tuple persisted
+// by the kwin_session phase as a one-line summary for `monitor`.
+// Returns "" when no tuple is present (older deploys / dry-run /
+// pre-#48 schema). The values come from state.Details so we don't
+// have to import the phase package's struct type here.
+func monitorKWinSelectedLine(details map[string]any) string {
+	if details == nil {
+		return ""
+	}
+	parts := []string{}
+	add := func(k, key string) {
+		if v, ok := details[key]; ok {
+			s := strings.TrimSpace(fmt.Sprint(v))
+			if s != "" && s != "<nil>" {
+				parts = append(parts, k+"="+s)
+			}
+		}
+	}
+	add("user", "kwin_user")
+	add("uid", "kwin_uid")
+	add("seat", "kwin_seat")
+	add("tty", "kwin_tty")
+	add("drm", "kwin_drm_card")
+	add("render", "kwin_render_node")
+	add("socket", "kwin_socket")
+	add("service", "kwin_service")
+	if pid, ok := details["kwin_pid"]; ok {
+		if pidS := strings.TrimSpace(fmt.Sprint(pid)); pidS != "" && pidS != "0" && pidS != "<nil>" {
+			parts = append(parts, "pid="+pidS)
+		}
+	}
+	if inv, ok := details["kwin_invocation_id"]; ok {
+		if s := strings.TrimSpace(fmt.Sprint(inv)); s != "" && s != "<nil>" {
+			parts = append(parts, "invocation="+s)
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 // -----------------------------------------------------------------------------

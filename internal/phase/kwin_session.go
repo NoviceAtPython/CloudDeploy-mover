@@ -521,6 +521,19 @@ type KWinSession struct {
 	// for tests.
 	HelperPath string
 
+	// LoginctlSessionsFn overrides the `loginctl list-sessions
+	// --no-legend` call used by the unified gate poll to verify the
+	// headless user has an active session on the expected seat+tty.
+	// nil = real runner call. Tests inject deterministic output.
+	LoginctlSessionsFn func(ctx context.Context, deps *Deps) (string, error)
+
+	// HealthProbeFn overrides the per-tick probe inside
+	// awaitKWinHealthy. nil = the production probe that combines
+	// systemctl is-active / show MainPID + ActiveEnter / journalForInvocation /
+	// loginctlSessionMatchesSeatTTY / socketExists. Tests use this to
+	// simulate "socket appears at tick 5".
+	HealthProbeFn kwinHealthProbeFn
+
 	// StablePIDWindow overrides how long requireStableMainPID samples
 	// the unit's MainPID before declaring the compositor stable.
 	// 0 means "30s floor or SocketStability, whichever is larger".
@@ -547,6 +560,11 @@ type KWinSession struct {
 	// clouddeploy-force-kwin-mode.sh invocation. Tests that don't
 	// install the helper script set this true.
 	SkipModeHelper bool
+
+	// healthProbeState carries cross-tick stability counters for the
+	// unified gate poll. Initialized lazily inside defaultHealthProbe;
+	// unexported so callers don't touch it directly.
+	healthProbeState *kwinHealthProbeState
 }
 
 // Name implements Phase.
@@ -921,17 +939,42 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	details["systemctl_enabled"] = true
 	details["systemctl_started"] = true
 
-	// 3. First socket appearance.
+	// 3. Selected runtime tuple. Persisted BEFORE the unified
+	// gate poll so a failure leaves the operator a complete record
+	// of what we targeted, not just an "is socket present?" boolean.
 	wait := p.SocketWait
 	if wait == 0 {
-		wait = 30 * time.Second
+		wait = 120 * time.Second // bumped from 30s (live VM RTX 4090 2026-05-22)
 	}
 	stability := p.SocketStability
 	if stability == 0 {
 		stability = 10 * time.Second
 	}
 	socketPath := waylandSocketPath(uid)
+	selected := KWinSelectedPath{
+		User:       desk.User,
+		UID:        uid,
+		Seat:       "seat0",
+		TTY:        fmt.Sprintf("/dev/tty%d", desk.KwinVT),
+		DRMCard:    resolvedDRM,
+		RenderNode: RenderNodeForCard(resolvedDRM),
+		Socket:     socketPath,
+		Service:    choice.UnitName,
+	}
+	details["kwin_selected"] = selected
+	details["kwin_user"] = selected.User
+	details["kwin_uid"] = selected.UID
+	details["kwin_seat"] = selected.Seat
+	details["kwin_tty"] = selected.TTY
+	details["kwin_drm_card"] = selected.DRMCard
+	details["kwin_render_node"] = selected.RenderNode
+	details["kwin_socket"] = selected.Socket
+	details["kwin_service"] = selected.Service
 	details["wayland_socket_path"] = socketPath
+	details["kwin_gate_wait_seconds"] = int(wait / time.Second)
+	details["kwin_gate_stability_seconds"] = int(stability / time.Second)
+	deps.State.Get(KWinSessionName).Details = details
+	_ = deps.PersistState()
 
 	if deps.DryRun {
 		details["wayland_socket_ok"] = true
@@ -945,126 +988,119 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		return nil
 	}
 
-	if ok := p.waitForSocket(ctx, uid, wait); !ok {
-		err := fmt.Errorf("wayland socket %s did not appear within %s after `systemctl start %s`", socketPath, wait, choice.UnitName)
-		details["err"] = err.Error()
-		details["wayland_socket_ok"] = false
-		details["kwin_sub_state"] = p.showSubState(ctx, deps, choice.UnitName)
-		jrn, _ := p.journalRecent(ctx, deps, choice.UnitName, 200)
-		details["journal_tail"] = lastLines(jrn, 30)
-		details["kwin_failure_category"] = classifyKWinFailure(err, jrn, fmt.Sprint(details["kwin_sub_state"]))
-		deps.State.MarkFailed(KWinSessionName, "wayland socket missing", err, true)
-		deps.State.Get(KWinSessionName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", err)
+	// 4. Unified gate poll. Replaces the old serial sequence
+	// (waitForSocket → stability → is-active → MainPID → journal),
+	// which fatal'd on socket-wait=30s when the live VM's KWin
+	// became healthy at second 35. The unified loop polls every
+	// gate together every probeInterval and only declares failure
+	// when the WHOLE window elapses without all gates passing.
+	probeInterval := p.StablePIDInterval
+	if probeInterval == 0 {
+		probeInterval = 2 * time.Second
+	}
+	stabilitySeconds := int(stability / time.Second)
+	if stabilitySeconds < 1 {
+		stabilitySeconds = 1
+	}
+	probe := p.HealthProbeFn
+	if probe == nil {
+		probe = (&p).defaultHealthProbe
+	}
+	sample, gateErr := awaitKWinHealthy(
+		ctx, deps, probe,
+		choice.UnitName, desk.User, uid, selected.Seat, selected.TTY,
+		wait, probeInterval, stabilitySeconds, true,
+	)
+	details["kwin_last_gate_sample"] = sample
+	details["wayland_socket_ok"] = sample.SocketPresent
+	details["service_active_state"] = sample.ActiveState
+	details["service_active"] = sample.ActiveState == "active"
+	details["socket_stable_seconds"] = sample.StablePIDFor
+	details["kwin_sub_state"] = sample.SubState
+	details["kwin_invocation_id"] = sample.InvocationID
+	if sample.MainPID > 0 {
+		details["kwin_pid"] = sample.MainPID
+		selected.MainPID = sample.MainPID
+		selected.InvocationID = sample.InvocationID
+		selected.ServiceStartTime = sample.ActiveEnter
+		details["kwin_selected"] = selected
+	}
+	if len(sample.JournalFatals) > 0 {
+		details["journal_fatal_hits"] = sample.JournalFatals
 	}
 
-	// 4. Stability window: the socket has to STAY there. Live VM
-	// regression: KWin briefly created the socket and then died in
-	// a restart loop because the user-session backend couldn't open
-	// /dev/dri/card*. We poll once per second; if the socket
-	// disappears OR is-active stops reporting "active", we fail.
-	deadline := time.Now().Add(stability)
-	stableStart := time.Now()
-	for time.Now().Before(deadline) {
-		if !p.socketExists(uid) {
-			err := fmt.Errorf("wayland socket %s disappeared during the %s stability window (compositor restart loop?)",
-				socketPath, stability)
-			details["err"] = err.Error()
-			details["wayland_socket_ok"] = false
-			details["socket_stable_seconds"] = int(time.Since(stableStart) / time.Second)
-			deps.State.MarkFailed(KWinSessionName, "wayland socket transient", err, true)
-			deps.State.Get(KWinSessionName).Details = details
+	if gateErr != nil {
+		// 5. Self-heal: the timed window elapsed without
+		// AllGatesPass, but the machine may have become healthy
+		// JUST after we gave up. Re-run adoption with min uptime 0;
+		// if it now says "adoptable", mark done instead of failing.
+		// This is the live VM RTX 4090 2026-05-22 fix: a 30s timeout
+		// failed even though the service became fully healthy at
+		// second 35.
+		log.Warn("phase kwin-session: gate poll timed out; trying late adoption", "err", gateErr)
+		adopt := p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 0)
+		details["kwin_late_adopt_active_state"] = adopt.ActiveState
+		details["kwin_late_adopt_sub_state"] = adopt.SubState
+		details["kwin_late_adopt_main_pid"] = adopt.MainPID
+		details["kwin_late_adopt_socket_present"] = adopt.SocketPresent
+		details["kwin_late_adopt_journal_fatals"] = adopt.JournalFatals
+		details["kwin_late_adopt_adoptable"] = adopt.Adoptable
+		// Late-adoption journal must be invocation-scoped or it
+		// inherits the pre-restart fatal markers we already saw.
+		if adopt.Adoptable {
+			invID := p.readUnitInvocationID(ctx, deps, choice.UnitName)
+			activeEnter := p.readUnitActiveEnterTimestamp(ctx, deps, choice.UnitName)
+			currJrn, _ := p.journalForInvocation(ctx, deps, choice.UnitName, invID, activeEnter, 200)
+			adopt.JournalFatals = scanFatalSignatures(currJrn)
+			if len(adopt.JournalFatals) > 0 {
+				adopt.Adoptable = false
+				details["kwin_late_adopt_invocation_fatals"] = adopt.JournalFatals
+			}
+		}
+		if adopt.Adoptable {
+			log.Info("phase kwin-session: late adoption succeeded after slow start",
+				"unit", choice.UnitName, "main_pid", adopt.MainPID, "socket_present", adopt.SocketPresent)
+			selected.MainPID = adopt.MainPID
+			selected.InvocationID = p.readUnitInvocationID(ctx, deps, choice.UnitName)
+			selected.ServiceStartTime = p.readUnitActiveEnterTimestamp(ctx, deps, choice.UnitName)
+			details["kwin_selected"] = selected
+			details["kwin_pid"] = adopt.MainPID
+			details["service_active"] = true
+			details["wayland_socket_ok"] = true
+			details["adopted_after_late_start"] = true
+			details["kwin_failure_category"] = ""
+			deps.State.MarkDone(KWinSessionName, details)
 			_ = deps.PersistState()
-			return fmt.Errorf("phase kwin-session: %w", err)
+			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(1 * time.Second):
+		// Late adoption also failed → produce a categorized error.
+		details["err"] = gateErr.Error()
+		details["kwin_failure_category"] = classifyKWinFailure(gateErr, strings.Join(sample.JournalFatals, "\n"), sample.SubState)
+		// Specific category for the "service active but socket missing
+		// after window" shape, which is what the live VM hit.
+		if sample.ActiveState == "active" && sample.MainPID > 0 && !sample.SocketPresent {
+			details["kwin_failure_category"] = KWinFailWaylandSocketMissing
 		}
-	}
-	details["wayland_socket_ok"] = true
-	details["socket_stable_seconds"] = int(stability / time.Second)
-
-	// 5. systemctl is-active must say "active".
-	state, err := p.isActive(ctx, deps, choice.UnitName)
-	details["service_active_state"] = state
-	if err != nil {
-		details["service_active"] = false
-		details["err"] = err.Error()
-		deps.State.MarkFailed(KWinSessionName, "systemctl is-active failed", err, true)
-		deps.State.Get(KWinSessionName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", err)
-	}
-	if state != "active" {
-		err := fmt.Errorf("`systemctl is-active %s` returned %q (want active); the compositor is in a restart loop", choice.UnitName, state)
-		details["service_active"] = false
-		details["err"] = err.Error()
-		deps.State.MarkFailed(KWinSessionName, "service not active after stability window", err, true)
-		deps.State.Get(KWinSessionName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", err)
-	}
-	details["service_active"] = true
-
-	// 6. MainPID must be a real, alive process AND must stay the
-	// same for at least the stability window. The previous "read
-	// once" check let the live VM's openvt restart-loop slip
-	// through because the read happened to land between two
-	// crashes; requireStableMainPID samples every 2s.
-	stablePIDWindow := p.StablePIDWindow
-	if stablePIDWindow == 0 {
-		stablePIDWindow = stability
-		if stablePIDWindow < 30*time.Second {
-			stablePIDWindow = 30 * time.Second
+		if sample.ActiveState == "active" && sample.MainPID > 0 && sample.SocketPresent && len(sample.JournalFatals) == 0 && !sample.SessionOnSeat {
+			details["kwin_failure_category"] = KWinFailSessionNotOnSeatTTY
 		}
-	}
-	stablePIDInterval := p.StablePIDInterval
-	if stablePIDInterval == 0 {
-		stablePIDInterval = 2 * time.Second
-	}
-	pid, perr := p.requireStableMainPID(ctx, deps, choice.UnitName, stablePIDWindow, stablePIDInterval)
-	details["kwin_pid"] = pid
-	details["kwin_pid_stable_window_s"] = int(stablePIDWindow / time.Second)
-	if perr != nil {
-		details["err"] = perr.Error()
-		details["kwin_failure_category"] = KWinFailPIDUnstable
-		deps.State.MarkFailed(KWinSessionName, "compositor MainPID unstable", perr, true)
+		deps.State.MarkFailed(KWinSessionName, "kwin gate poll did not converge", gateErr, true)
 		deps.State.Get(KWinSessionName).Details = details
 		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", perr)
-	}
-	if pid <= 0 {
-		err := fmt.Errorf("systemd reports MainPID=%d for %s after the stability window", pid, choice.UnitName)
-		details["err"] = err.Error()
-		details["kwin_failure_category"] = KWinFailSocketAppearedKWinExited
-		deps.State.MarkFailed(KWinSessionName, "compositor process missing after start", err, true)
-		deps.State.Get(KWinSessionName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", err)
+		return fmt.Errorf("phase kwin-session: %w", gateErr)
 	}
 
-	// 7. Scan the recent journal for fatal signatures. Even if the
-	// socket survived + is-active is good, a restart loop in
-	// progress might still show "Failed to activate login1 session"
-	// in the last few seconds.
-	journalLog, jerr := p.journalRecent(ctx, deps, choice.UnitName, 200)
-	if jerr != nil {
-		log.Warn("phase kwin-session: could not read journal (non-fatal)",
-			"unit", choice.UnitName, "err", jerr)
-	}
-	if hits := scanFatalSignatures(journalLog); len(hits) > 0 {
-		err := fmt.Errorf("recent journal for %s contains fatal signature(s): %v",
-			choice.UnitName, hits)
-		details["err"] = err.Error()
-		details["journal_fatal_hits"] = hits
-		deps.State.MarkFailed(KWinSessionName, "fatal journal signature after start", err, true)
-		deps.State.Get(KWinSessionName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase kwin-session: %w", err)
-	}
+	// Gate poll converged. The unified poll already verified:
+	// active=true + MainPID>0 + socket present + invocation journal
+	// clean + session on expected seat/tty + MainPID stable for >=
+	// stability seconds. The next blocks are now redundant but kept
+	// as no-ops via the variables below so the rest of the function
+	// (DBus probe, supportInformation) can read pid + journalLog
+	// without restructuring.
+	pid := sample.MainPID
+	invID := sample.InvocationID
+	activeEnter := sample.ActiveEnter
+	journalLog, _ := p.journalForInvocation(ctx, deps, choice.UnitName, invID, activeEnter, 200)
 
 	// 8. KWin DBus probe: poll the headless user's session bus for
 	// org.kde.KWin. Live-VM regression: the previous "shallow"
