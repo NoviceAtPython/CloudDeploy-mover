@@ -1192,11 +1192,48 @@ func TestLoginctlSessionsContainsUserSeatTTY(t *testing.T) {
 	if !loginctlSessionsContainsUserSeatTTY(out, "cloudgamer", "seat0", "/dev/tty7") {
 		t.Fatalf("should accept /dev/tty7 form")
 	}
+	if !loginctlSessionsContainsUserSeatTTY("c1 1002 cloudgamer seat0 /dev/tty7\n", "cloudgamer", "seat0", "tty7") {
+		t.Fatalf("should accept loginctl TTY with /dev prefix")
+	}
+	if !loginctlSessionsContainsUserSeatTTY("c1 1002 cloudgamer seat0 /dev/pts/2\n", "cloudgamer", "seat0", "pts/2") {
+		t.Fatalf("should normalize /dev/pts/N to pts/N")
+	}
 	if loginctlSessionsContainsUserSeatTTY(out, "cloudgamer", "seat0", "tty8") {
 		t.Errorf("wrong tty should not match")
 	}
 	if loginctlSessionsContainsUserSeatTTY(out, "different", "seat0", "tty7") {
 		t.Errorf("wrong user should not match")
+	}
+}
+
+func TestLoginctlSessionsContainsUserSeatTTY_LiveVastShape(t *testing.T) {
+	out := "32 1002 cloudgamer seat0 9669 user tty7 no -\n"
+	if !loginctlSessionsContainsUserSeatTTY(out, "cloudgamer", "seat0", "/dev/tty7") {
+		t.Fatalf("should match live loginctl shape with LEADER/CLASS before TTY")
+	}
+	if !loginctlSessionsContainsUserSeatTTYAndLeader(out, "cloudgamer", "1002", "seat0", "/dev/tty7", 9669) {
+		t.Fatalf("should match live loginctl shape with matching leader pid")
+	}
+	if loginctlSessionsContainsUserSeatTTYAndLeader(out, "cloudgamer", "1002", "seat0", "/dev/tty7", 1234) {
+		t.Fatalf("should reject live loginctl shape with wrong leader pid")
+	}
+}
+
+func TestLoginctlShowSessionMatchesNormalizesTTYAndLeader(t *testing.T) {
+	out := strings.Join([]string{
+		"Name=cloudgamer",
+		"User=1002",
+		"Seat=seat0",
+		"TTY=tty7",
+		"Class=user",
+		"Active=yes",
+		"Leader=9669",
+	}, "\n")
+	if !loginctlShowSessionMatches(out, "cloudgamer", "1002", "seat0", "/dev/tty7", 9669) {
+		t.Fatalf("show-session output should match user/uid/seat/normalized tty/leader")
+	}
+	if loginctlShowSessionMatches(out, "cloudgamer", "1002", "seat0", "/dev/tty8", 9669) {
+		t.Fatalf("show-session output should reject wrong tty")
 	}
 }
 

@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -970,10 +971,10 @@ func (p KWinSession) journalForInvocation(ctx context.Context, deps *Deps, unit,
 //	$ loginctl list-sessions --no-legend
 //	c1 1002 cloudgamer seat0 tty7
 //	c2 0    root       seat0
+//	32 1002 cloudgamer seat0 9669 user tty7 no -
 //
-// We accept "tty7" or "/dev/tty7" interchangeably from the caller
-// (we compare against the last column trimmed of "/dev/").
-func (p KWinSession) loginctlSessionMatchesSeatTTY(ctx context.Context, deps *Deps, user, seat, tty string) bool {
+// We accept "tty7" or "/dev/tty7" interchangeably from the caller.
+func (p KWinSession) loginctlSessionMatchesSeatTTY(ctx context.Context, deps *Deps, user, uid, seat, tty string, leaderPID int) bool {
 	if deps == nil || deps.Runner == nil {
 		return false
 	}
@@ -982,7 +983,7 @@ func (p KWinSession) loginctlSessionMatchesSeatTTY(ctx context.Context, deps *De
 		if err != nil {
 			return false
 		}
-		return loginctlSessionsContainsUserSeatTTY(out, user, seat, tty)
+		return loginctlSessionsContainsUserSeatTTYAndLeader(out, user, uid, seat, tty, leaderPID)
 	}
 	res := deps.Runner.Exec(ctx, runner.CommandSpec{
 		Argv:    []string{"loginctl", "list-sessions", "--no-legend"},
@@ -993,7 +994,23 @@ func (p KWinSession) loginctlSessionMatchesSeatTTY(ctx context.Context, deps *De
 	if res.Err != nil {
 		return false
 	}
-	return loginctlSessionsContainsUserSeatTTY(res.Stdout, user, seat, tty)
+	if loginctlSessionsContainsUserSeatTTYAndLeader(res.Stdout, user, uid, seat, tty, leaderPID) {
+		return true
+	}
+	for _, sessionID := range loginctlSessionIDs(res.Stdout) {
+		show := deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv: []string{"loginctl", "show-session", sessionID,
+				"-p", "Name", "-p", "User", "-p", "Seat", "-p", "TTY",
+				"-p", "Class", "-p", "Active", "-p", "Leader"},
+			LogFile: "-",
+			Timeout: 8 * time.Second,
+			DryRun:  deps.DryRun,
+		})
+		if show.Err == nil && loginctlShowSessionMatches(show.Stdout, user, uid, seat, tty, leaderPID) {
+			return true
+		}
+	}
+	return false
 }
 
 // defaultHealthProbe samples every gate (systemctl is-active /
@@ -1038,7 +1055,7 @@ func (p *KWinSession) defaultHealthProbe(ctx context.Context, deps *Deps, unit, 
 	if probeUser == "" {
 		probeUser = p.healthProbeState.expectedUser(uid)
 	}
-	sample.SessionOnSeat = p.loginctlSessionMatchesSeatTTY(ctx, deps, probeUser, seat, tty)
+	sample.SessionOnSeat = p.loginctlSessionMatchesSeatTTY(ctx, deps, probeUser, uid, seat, tty, sample.MainPID)
 
 	// Stability counter. Resets whenever MainPID changes or drops
 	// to zero (compositor restart). When InvocationID is available
@@ -1111,31 +1128,135 @@ func (s *kwinHealthProbeState) expectedUser(uid string) string {
 // loginctlSessionsContainsUserSeatTTY is the pure-function half of
 // the loginctl probe, exposed for unit tests.
 func loginctlSessionsContainsUserSeatTTY(listOut, user, seat, tty string) bool {
+	return loginctlSessionsContainsUserSeatTTYAndLeader(listOut, user, "", seat, tty, 0)
+}
+
+func loginctlSessionsContainsUserSeatTTYAndLeader(listOut, user, uid, seat, tty string, leaderPID int) bool {
 	if strings.TrimSpace(listOut) == "" {
 		return false
 	}
-	wantTTY := strings.TrimPrefix(strings.TrimSpace(tty), "/dev/")
+	wantTTY := normalizeLoginctlTTY(tty)
 	wantUser := strings.TrimSpace(user)
+	wantUID := strings.TrimSpace(uid)
 	wantSeat := strings.TrimSpace(seat)
+	wantLeader := ""
+	if leaderPID > 0 {
+		wantLeader = fmt.Sprintf("%d", leaderPID)
+	}
 	for _, raw := range strings.Split(listOut, "\n") {
 		fields := strings.Fields(strings.TrimRight(raw, "\r"))
 		if len(fields) < 4 {
 			continue
 		}
-		// session_id uid user seat [tty]
+		// Old shape: session_id uid user seat [tty]
+		// Newer shape: session_id uid user seat leader class tty idle since
 		gotUser := fields[2]
+		gotUID := fields[1]
 		gotSeat := fields[3]
-		gotTTY := ""
-		if len(fields) >= 5 {
-			gotTTY = fields[4]
-		}
-		if wantUser != "" && gotUser != wantUser {
+		if (wantUser != "" || wantUID != "") && gotUser != wantUser && gotUID != wantUID {
 			continue
 		}
 		if wantSeat != "" && gotSeat != wantSeat {
 			continue
 		}
-		if wantTTY == "" || gotTTY == wantTTY {
+		if wantLeader != "" && loginctlSessionLineHasLeader(fields, wantLeader) && !loginctlSessionLineLeaderMatches(fields, wantLeader) {
+			continue
+		}
+		if wantTTY == "" || loginctlSessionLineHasTTY(fields, wantTTY) {
+			return true
+		}
+	}
+	return false
+}
+
+func loginctlSessionIDs(listOut string) []string {
+	var ids []string
+	seen := map[string]bool{}
+	for _, raw := range strings.Split(listOut, "\n") {
+		fields := strings.Fields(strings.TrimRight(raw, "\r"))
+		if len(fields) == 0 {
+			continue
+		}
+		id := strings.TrimSpace(fields[0])
+		if id == "" || seen[id] {
+			continue
+		}
+		seen[id] = true
+		ids = append(ids, id)
+	}
+	return ids
+}
+
+func loginctlShowSessionMatches(showOut, user, uid, seat, tty string, leaderPID int) bool {
+	fields := map[string]string{}
+	for _, raw := range strings.Split(showOut, "\n") {
+		raw = strings.TrimSpace(strings.TrimRight(raw, "\r"))
+		if raw == "" || !strings.Contains(raw, "=") {
+			continue
+		}
+		parts := strings.SplitN(raw, "=", 2)
+		fields[parts[0]] = parts[1]
+	}
+	wantUser := strings.TrimSpace(user)
+	wantUID := strings.TrimSpace(uid)
+	if wantUser != "" || wantUID != "" {
+		if fields["Name"] != wantUser && fields["User"] != wantUID && fields["User"] != wantUser {
+			return false
+		}
+	}
+	if wantSeat := strings.TrimSpace(seat); wantSeat != "" && fields["Seat"] != wantSeat {
+		return false
+	}
+	if wantTTY := normalizeLoginctlTTY(tty); wantTTY != "" && normalizeLoginctlTTY(fields["TTY"]) != wantTTY {
+		return false
+	}
+	if leaderPID > 0 {
+		wantLeader := fmt.Sprintf("%d", leaderPID)
+		if gotLeader := strings.TrimSpace(fields["Leader"]); gotLeader != "" && gotLeader != wantLeader {
+			return false
+		}
+	}
+	return true
+}
+
+func normalizeLoginctlTTY(tty string) string {
+	s := strings.TrimSpace(strings.ReplaceAll(tty, "\\", "/"))
+	s = strings.TrimPrefix(s, "/dev/")
+	s = strings.TrimPrefix(s, "/")
+	return s
+}
+
+func loginctlSessionLineHasTTY(fields []string, wantTTY string) bool {
+	wantTTY = normalizeLoginctlTTY(wantTTY)
+	if wantTTY == "" {
+		return true
+	}
+	for _, field := range fields[4:] {
+		if normalizeLoginctlTTY(field) == wantTTY {
+			return true
+		}
+	}
+	return false
+}
+
+func loginctlSessionLineHasLeader(fields []string, wantLeader string) bool {
+	if wantLeader == "" {
+		return false
+	}
+	for _, field := range fields[4:] {
+		if _, err := strconv.Atoi(field); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
+func loginctlSessionLineLeaderMatches(fields []string, wantLeader string) bool {
+	if wantLeader == "" {
+		return true
+	}
+	for _, field := range fields[4:] {
+		if field == wantLeader {
 			return true
 		}
 	}
