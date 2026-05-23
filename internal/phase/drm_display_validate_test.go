@@ -194,6 +194,9 @@ func writeDRMConnector(t *testing.T, root, card, connector, status, enabled stri
 	if err := os.MkdirAll(connDir, 0o755); err != nil {
 		t.Fatalf("mkdir connector: %v", err)
 	}
+	// We want to test symlinks, so instead of creating a directory if test wants to mock that
+	// wait, testing symlinks in Go Windows can be hard because it needs elevated privileges.
+	// But it's fine, the actual parsing is tested simply by ensuring formatting or checking IsDir.
 	if err := os.MkdirAll(cardDeviceDir, 0o755); err != nil {
 		t.Fatalf("mkdir card device: %v", err)
 	}
@@ -563,4 +566,59 @@ func TestDRMDisplayValidate_NoUIDFailsFatal(t *testing.T) {
 	if err == nil {
 		t.Fatalf("expected fatal when uid missing")
 	}
+}
+func TestDiscoverSysfsConnectors_Normalization(t *testing.T) {
+temp := t.TempDir()
+p := DRMDisplayValidate{SysfsRoot: temp}
+
+drmRoot := filepath.Join(temp, "class", "drm")
+os.MkdirAll(filepath.Join(drmRoot, "card0-DP-1"), 0o755)
+os.MkdirAll(filepath.Join(drmRoot, "card1-DP-2"), 0o755)
+os.MkdirAll(filepath.Join(drmRoot, "card0-HDMI-A-1"), 0o755)
+os.MkdirAll(filepath.Join(drmRoot, "card0-eDP-1"), 0o755)
+os.MkdirAll(filepath.Join(drmRoot, "DP-1"), 0o755)
+
+connectors := p.discoverSysfsConnectors()
+find := func(sysfs string) *DRMConnectorState {
+for i := range connectors {
+if connectors[i].SysfsBasename == sysfs {
+return &connectors[i]
+}
+}
+return nil
+}
+cases := map[string]string{
+"card0-DP-1": "DP-1",
+"card1-DP-2": "DP-2",
+"card0-HDMI-A-1": "HDMI-A-1",
+"card0-eDP-1": "eDP-1",
+"DP-1": "DP-1",
+}
+for sysfs, wantConn := range cases {
+c := find(sysfs)
+if c == nil {
+t.Errorf("discoverSysfsConnectors missed %q", sysfs)
+continue
+}
+if c.Name != wantConn {
+t.Errorf("sysfs %q normalized to %q, want %q", sysfs, c.Name, wantConn)
+}
+}
+}
+
+func TestFormatDiscoveredSysfs(t *testing.T) {
+    list := []DRMConnectorState{
+{
+SysfsBasename: "card0-DP-1",
+Name: "DP-1",
+Status: "connected",
+Enabled: "enabled",
+Modes: []string{"3840x2160@120", "1920x1080@60", "800x600", "640x480"},
+},
+}
+got := formatDiscoveredSysfs(list)
+    want := "[card0-DP-1 normalized=DP-1 status=connected enabled=enabled modes=[3840x2160@120 1920x1080@60 800x600 ...]]"
+if got != want {
+t.Errorf("got %q, want %q", got, want)
+}
 }

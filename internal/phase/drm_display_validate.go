@@ -32,15 +32,16 @@ const (
 )
 
 type DRMConnectorState struct {
-	Card      string   `json:"card"`
-	Name      string   `json:"name"`
-	Path      string   `json:"path"`
-	Status    string   `json:"status"`
-	Enabled   string   `json:"enabled"`
-	Modes     []string `json:"modes"`
-	NVIDIA    bool     `json:"nvidia"`
-	Connected bool     `json:"connected"`
-	IsEnabled bool     `json:"is_enabled"`
+	Card          string   `json:"drm_card"`
+	Name          string   `json:"connector_name"`
+	Path          string   `json:"sysfs_path"`
+	SysfsBasename string   `json:"sysfs_basename"`
+	Status        string   `json:"status"`
+	Enabled       string   `json:"enabled"`
+	Modes         []string `json:"modes"`
+	NVIDIA        bool     `json:"nvidia"`
+	Connected     bool     `json:"connected"`
+	IsEnabled     bool     `json:"is_enabled"`
 }
 
 type displayTarget struct {
@@ -524,14 +525,22 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 			if sys.IsEnabled {
 				category = DRMFailSysfsEnabledKScreenDisabled
 			}
+			err := fmt.Errorf("kscreen-doctor did not report selected connector %q and usable output could not be proven (kscreen=%v sysfs=%+v)", connector, connectorNames(parsed), sys)
+			details["err"] = err.Error()
+			details["drm_error_category"] = category
+			deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
+		} else {
+			err := fmt.Errorf("kscreen-doctor did not report selected connector %q and usable output could not be proven (kscreen=%v sysfs=<nil> discovered=%s)", connector, connectorNames(parsed), formatDiscoveredSysfs(sysfsConnectors))
+			details["err"] = err.Error()
+			details["drm_error_category"] = category
+			deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
+			deps.State.Get(DRMDisplayValidateName).Details = details
+			_ = deps.PersistState()
+			return fmt.Errorf("phase drm-display-validate: %w", err)
 		}
-		err := fmt.Errorf("kscreen-doctor did not report selected connector %q and usable output could not be proven (kscreen=%v sysfs=%+v)", connector, connectorNames(parsed), sys)
-		details["err"] = err.Error()
-		details["drm_error_category"] = category
-		deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
-		deps.State.Get(DRMDisplayValidateName).Details = details
-		_ = deps.PersistState()
-		return fmt.Errorf("phase drm-display-validate: %w", err)
 	}
 	details["enabled"] = conn.Enabled
 	details["selected_mode"] = conn.CurrentMode
@@ -544,11 +553,16 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 			details["drm_error_category"] = DRMVerifiedSysfsWayland
 			details["verification_method"] = DRMVerifiedSysfsWayland
 		} else {
+			var err error
 			category := DRMFailKScreenSysfsStateMismatch
-			if sys != nil && sys.IsEnabled {
-				category = DRMFailSysfsEnabledKScreenDisabled
+			if sys != nil {
+				if sys.IsEnabled {
+					category = DRMFailSysfsEnabledKScreenDisabled
+				}
+				err = fmt.Errorf("connector %q is disabled in kscreen-doctor and usable output could not be proven (sysfs=%+v)", connector, sys)
+			} else {
+				err = fmt.Errorf("connector %q is disabled in kscreen-doctor and usable output could not be proven (sysfs=<nil> discovered=%s)", connector, formatDiscoveredSysfs(sysfsConnectors))
 			}
-			err := fmt.Errorf("connector %q is disabled in kscreen-doctor and usable output could not be proven (sysfs=%+v)", connector, sys)
 			details["err"] = err.Error()
 			details["drm_error_category"] = category
 			deps.State.MarkFailed(DRMDisplayValidateName, category, err, true)
@@ -766,20 +780,30 @@ func (p DRMDisplayValidate) discoverSysfsConnectors() []DRMConnectorState {
 	var out []DRMConnectorState
 	for _, e := range entries {
 		name := e.Name()
-		if e.IsDir() && strings.HasPrefix(name, "card") && strings.Contains(name, "-") {
+		isDirOrSym := e.IsDir() || (e.Type()&os.ModeSymlink != 0)
+		if isDirOrSym && strings.Contains(name, "-") {
 			full := filepath.Join(base, name)
-			parts := strings.SplitN(name, "-", 2)
-			if len(parts) != 2 {
-				continue
+			var cardName, connName string
+			if strings.HasPrefix(name, "card") {
+				parts := strings.SplitN(name, "-", 2)
+				if len(parts) != 2 {
+					continue
+				}
+				cardName = parts[0]
+				connName = parts[1]
+			} else {
+				cardName = ""
+				connName = name
 			}
 			st := DRMConnectorState{
-				Card:    filepath.Join("/dev/dri", parts[0]),
-				Name:    parts[1],
-				Path:    full,
-				Status:  strings.TrimSpace(readFileString(filepath.Join(full, "status"))),
-				Enabled: strings.TrimSpace(readFileString(filepath.Join(full, "enabled"))),
-				Modes:   readLines(filepath.Join(full, "modes")),
-				NVIDIA:  sysfsConnectorIsNVIDIA(full),
+				Card:          cardName,
+				Name:          connName,
+				Path:          full,
+				SysfsBasename: name,
+				Status:        strings.TrimSpace(readFileString(filepath.Join(full, "status"))),
+				Enabled:       strings.TrimSpace(readFileString(filepath.Join(full, "enabled"))),
+				Modes:         readLines(filepath.Join(full, "modes")),
+				NVIDIA:        sysfsConnectorIsNVIDIA(full),
 			}
 			st.Connected = st.Status == "connected"
 			st.IsEnabled = st.Enabled == "enabled"
@@ -921,6 +945,24 @@ func sysfsConnectorNames(list []DRMConnectorState) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+func formatDiscoveredSysfs(list []DRMConnectorState) string {
+	if len(list) == 0 {
+		return "[]"
+	}
+	var out []string
+	for _, s := range list {
+		modes := s.Modes
+		if len(modes) > 3 {
+			modesCloned := make([]string, 3)
+			copy(modesCloned, modes[:3])
+			modes = append(modesCloned, "...")
+		}
+		modesStr := "[" + strings.Join(modes, " ") + "]"
+		out = append(out, fmt.Sprintf("%s normalized=%s status=%s enabled=%s modes=%s", s.SysfsBasename, s.Name, s.Status, s.Enabled, modesStr))
+	}
+	return "[" + strings.Join(out, ", ") + "]"
 }
 
 func modeListHasKScreenMode(modes []string, mode string) bool {
