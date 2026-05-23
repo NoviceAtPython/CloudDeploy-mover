@@ -64,6 +64,7 @@ const (
 	KWinFailSessionNotOnSeatTTY       = "session_not_on_expected_seat_tty"
 	KWinFailSessionStartSlow          = "kwin_session_start_slow"
 	KWinFailSocketSessionLate         = "kwin_socket_session_late"
+	KWinFailSocketUnlinked            = "kwin_socket_unlinked"
 )
 
 const (
@@ -593,6 +594,9 @@ func (p KWinSession) showSubState(ctx context.Context, deps *Deps, unitName stri
 // unitActiveSeconds returns floor((now - ActiveEnterTimestampMonotonic)
 // / 1e6) seconds. 0 means "not active" or "could not read".
 func (p KWinSession) unitActiveSeconds(ctx context.Context, deps *Deps, unitName string) int {
+	if p.UnitActiveSecondsFn != nil {
+		return p.UnitActiveSecondsFn(ctx, deps, unitName)
+	}
 	if deps == nil || deps.Runner == nil {
 		return 0
 	}

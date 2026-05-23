@@ -578,6 +578,15 @@ type KWinSession struct {
 	// install the helper script set this true.
 	SkipModeHelper bool
 
+	// KillKWinFn overrides the best-effort pkill used only during
+	// recovery from an active KWin whose wayland socket was unlinked.
+	// nil = production runner call.
+	KillKWinFn func(ctx context.Context, deps *Deps, user string) error
+
+	// UnitActiveSecondsFn overrides the systemd ActiveEnter monotonic
+	// probe used by the adoption check. nil = runner.
+	UnitActiveSecondsFn func(ctx context.Context, deps *Deps, unit string) int
+
 	// healthProbeState carries cross-tick stability counters for the
 	// unified gate poll. Initialized lazily inside defaultHealthProbe;
 	// unexported so callers don't touch it directly.
@@ -834,9 +843,57 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		Refresh:       refresh,
 		HDR:           hdr,
 	}
+
+	socketPath := waylandSocketPath(uid)
+	selected := KWinSelectedPath{
+		User:       desk.User,
+		UID:        uid,
+		Seat:       "seat0",
+		TTY:        fmt.Sprintf("/dev/tty%d", desk.KwinVT),
+		DRMCard:    resolvedDRM,
+		RenderNode: RenderNodeForCard(resolvedDRM),
+		Socket:     socketPath,
+		Service:    choice.UnitName,
+	}
+	recordKWinSelectedDetails(details, selected)
+
+	// 1. Adoption/recovery BEFORE any unit rewrite, helper rewrite,
+	// or stale socket cleanup. Live VM regression: removing
+	// /run/user/<uid>/wayland-0 while kwin_wayland was already
+	// running left KWin alive on DBus with only wayland-0.lock
+	// (deleted) open, so new clients could never connect.
+	if !deps.DryRun && choice.IsRealVT && !p.SkipAdoption {
+		adopt := p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 30*time.Second)
+		recordKWinAdoptionDetails(details, "kwin_adopt", adopt)
+		if adopt.Adoptable {
+			log.Info("phase kwin-session: adopting existing healthy kwin session; skipping unit regeneration",
+				"unit", choice.UnitName, "main_pid", adopt.MainPID,
+				"uptime_s", adopt.UptimeSeconds)
+			selected.MainPID = adopt.MainPID
+			recordKWinSelectedDetails(details, selected)
+			details["kwin_pid"] = adopt.MainPID
+			details["service_active"] = true
+			details["wayland_socket_ok"] = true
+			details["adopted_existing_session"] = true
+			deps.State.MarkDone(KWinSessionName, details)
+			_ = deps.PersistState()
+			return nil
+		}
+		if p.shouldRecoverUnlinkedKWinSocket(ctx, deps, choice.UnitName, desk.User, uid, selected.TTY, adopt, details) {
+			details["kwin_failure_category"] = KWinFailSocketUnlinked
+			details["kwin_socket_unlinked"] = true
+			recovery := p.recoverUnlinkedKWinSocket(ctx, deps, choice.UnitName, desk.User, uid, log)
+			details["kwin_socket_unlinked_recovery"] = recovery
+			if recovery.Err != "" {
+				log.Warn("phase kwin-session: unlinked socket recovery reported warning",
+					"unit", choice.UnitName, "err", recovery.Err)
+			}
+		}
+	}
+
 	unitBody := in.apply(tplBody)
 
-	// 1. Write the unit (and the force-kwin-mode helper for real-VT).
+	// 2. Write the unit (and the force-kwin-mode helper for real-VT).
 	unitPath := p.unitPath(choice.UnitName)
 	details["unit_path"] = unitPath
 	details["unit_bytes"] = len(unitBody)
@@ -860,37 +917,6 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 		}
 	}
 
-	// 2. Adoption check. Live VM evidence (2026-05-22 RTX 4090): an
-	// operator who manually built a healthy kwin-realvt unit out-of-
-	// band wants the phase to keep that running, not tear it down
-	// and regenerate the brittle template. We adopt only when the
-	// unit is active, MainPID > 0, the socket exists, the journal
-	// has no fatal markers, AND the unit has been active for at
-	// least 30s.
-	if !deps.DryRun && choice.IsRealVT && !p.SkipAdoption {
-		adopt := p.probeKWinAdoption(ctx, deps, choice.UnitName, uid, 30*time.Second)
-		details["kwin_adopt_active_state"] = adopt.ActiveState
-		details["kwin_adopt_sub_state"] = adopt.SubState
-		details["kwin_adopt_main_pid"] = adopt.MainPID
-		details["kwin_adopt_socket_present"] = adopt.SocketPresent
-		details["kwin_adopt_uptime_seconds"] = adopt.UptimeSeconds
-		details["kwin_adopt_journal_fatals"] = adopt.JournalFatals
-		details["kwin_adopt_adoptable"] = adopt.Adoptable
-		if adopt.Adoptable {
-			log.Info("phase kwin-session: adopting existing healthy kwin session; skipping unit regeneration",
-				"unit", choice.UnitName, "main_pid", adopt.MainPID,
-				"uptime_s", adopt.UptimeSeconds)
-			details["kwin_pid"] = adopt.MainPID
-			details["service_active"] = true
-			details["wayland_socket_ok"] = true
-			details["wayland_socket_path"] = waylandSocketPath(uid)
-			details["adopted_existing_session"] = true
-			deps.State.MarkDone(KWinSessionName, details)
-			_ = deps.PersistState()
-			return nil
-		}
-	}
-
 	// 3. Stale-config cleanup. Live VM evidence (2026-05-21): a
 	// rerun of the deploy started KWin, plasmashell, and Sunshine,
 	// but wayland-info reported "no monitors available" because the
@@ -899,7 +925,9 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	// ~/.local/share/kscreen and the orphan wayland socket(s) was
 	// the fix. Idempotent and gated on "first launch OR previous
 	// failure" so an operator's hand-tuned kwinrc survives.
-	cleaned := cleanStaleKDEConfigIfNeeded(deps, desk.User, uid)
+	protectWaylandSockets := p.activeMainPID(ctx, deps, choice.UnitName) > 0
+	details["stale_wayland_socket_cleanup_protected"] = protectWaylandSockets
+	cleaned := cleanStaleKDEConfigIfNeeded(deps, desk.User, uid, protectWaylandSockets)
 	if len(cleaned) > 0 {
 		details["stale_kde_config_removed"] = cleaned
 	}
@@ -983,27 +1011,7 @@ func (p KWinSession) Run(ctx context.Context, deps *Deps) error {
 	if stability == 0 {
 		stability = 10 * time.Second
 	}
-	socketPath := waylandSocketPath(uid)
-	selected := KWinSelectedPath{
-		User:       desk.User,
-		UID:        uid,
-		Seat:       "seat0",
-		TTY:        fmt.Sprintf("/dev/tty%d", desk.KwinVT),
-		DRMCard:    resolvedDRM,
-		RenderNode: RenderNodeForCard(resolvedDRM),
-		Socket:     socketPath,
-		Service:    choice.UnitName,
-	}
-	details["kwin_selected"] = selected
-	details["kwin_user"] = selected.User
-	details["kwin_uid"] = selected.UID
-	details["kwin_seat"] = selected.Seat
-	details["kwin_tty"] = selected.TTY
-	details["kwin_drm_card"] = selected.DRMCard
-	details["kwin_render_node"] = selected.RenderNode
-	details["kwin_socket"] = selected.Socket
-	details["kwin_service"] = selected.Service
-	details["wayland_socket_path"] = socketPath
+	recordKWinSelectedDetails(details, selected)
 	details["kwin_gate_wait_seconds"] = int(wait / time.Second)
 	details["kwin_gate_progress_extension_seconds"] = int(progressExtension / time.Second)
 	details["kwin_late_adoption_grace_seconds"] = int(lateAdoptionGrace / time.Second)
@@ -1623,6 +1631,135 @@ func recordKWinGateDetails(details map[string]any, selected *KWinSelectedPath, s
 	}
 }
 
+func recordKWinSelectedDetails(details map[string]any, selected KWinSelectedPath) {
+	if details == nil {
+		return
+	}
+	details["kwin_selected"] = selected
+	details["kwin_user"] = selected.User
+	details["kwin_uid"] = selected.UID
+	details["kwin_seat"] = selected.Seat
+	details["kwin_tty"] = selected.TTY
+	details["kwin_drm_card"] = selected.DRMCard
+	details["kwin_render_node"] = selected.RenderNode
+	details["kwin_socket"] = selected.Socket
+	details["kwin_service"] = selected.Service
+	details["wayland_socket_path"] = selected.Socket
+	if selected.MainPID > 0 {
+		details["kwin_pid"] = selected.MainPID
+	}
+	if selected.InvocationID != "" {
+		details["kwin_invocation_id"] = selected.InvocationID
+	}
+}
+
+func recordKWinAdoptionDetails(details map[string]any, prefix string, adopt KWinAdoptCheck) {
+	if details == nil {
+		return
+	}
+	if prefix == "" {
+		prefix = "kwin_adopt"
+	}
+	details[prefix+"_active_state"] = adopt.ActiveState
+	details[prefix+"_sub_state"] = adopt.SubState
+	details[prefix+"_main_pid"] = adopt.MainPID
+	details[prefix+"_socket_present"] = adopt.SocketPresent
+	details[prefix+"_uptime_seconds"] = adopt.UptimeSeconds
+	details[prefix+"_journal_fatals"] = adopt.JournalFatals
+	details[prefix+"_adoptable"] = adopt.Adoptable
+}
+
+type KWinSocketRecovery struct {
+	StopAttempted      bool     `json:"stop_attempted"`
+	StopErr            string   `json:"stop_err,omitempty"`
+	KillAttempted      bool     `json:"kill_attempted"`
+	KillErr            string   `json:"kill_err,omitempty"`
+	RemovedSocketPaths []string `json:"removed_socket_paths,omitempty"`
+	Err                string   `json:"err,omitempty"`
+}
+
+func (p KWinSession) shouldRecoverUnlinkedKWinSocket(ctx context.Context, deps *Deps, unit, user, uid, tty string, adopt KWinAdoptCheck, details map[string]any) bool {
+	if adopt.ActiveState != "active" || adopt.MainPID <= 0 || adopt.SocketPresent || len(adopt.JournalFatals) > 0 {
+		return false
+	}
+	if adopt.SubState != "" && adopt.SubState != "running" {
+		return false
+	}
+	sessionOK := p.loginctlSessionMatchesSeatTTY(ctx, deps, user, uid, "seat0", tty, adopt.MainPID)
+	dbusOK, dbusInfo, dbusErr := p.kwinDBus(ctx, deps, user, uid)
+	if details != nil {
+		details["kwin_socket_unlinked_candidate"] = true
+		details["kwin_socket_unlinked_session_ok"] = sessionOK
+		details["kwin_socket_unlinked_dbus_ok"] = dbusOK
+		if dbusInfo != "" {
+			details["kwin_socket_unlinked_dbus_info"] = dbusInfo
+		}
+		if dbusErr != nil {
+			details["kwin_socket_unlinked_dbus_error"] = dbusErr.Error()
+		}
+	}
+	return sessionOK && dbusOK
+}
+
+func (p KWinSession) recoverUnlinkedKWinSocket(ctx context.Context, deps *Deps, unit, user, uid string, log *slog.Logger) KWinSocketRecovery {
+	out := KWinSocketRecovery{}
+	out.StopAttempted = true
+	if err := p.systemctl(ctx, deps, "stop", unit); err != nil {
+		out.StopErr = err.Error()
+		out.Err = err.Error()
+	}
+	out.KillAttempted = true
+	if err := p.killKWin(ctx, deps, user); err != nil {
+		out.KillErr = err.Error()
+		if out.Err == "" {
+			out.Err = err.Error()
+		}
+	}
+	out.RemovedSocketPaths = cleanWaylandRuntimeSockets(filepath.Join("/run/user", uid), false)
+	if log != nil {
+		log.Warn("phase kwin-session: recovered active KWin with unlinked wayland socket",
+			"unit", unit, "user", user, "uid", uid,
+			"stop_err", out.StopErr, "kill_err", out.KillErr,
+			"removed", out.RemovedSocketPaths)
+	}
+	return out
+}
+
+func (p KWinSession) killKWin(ctx context.Context, deps *Deps, user string) error {
+	if p.KillKWinFn != nil {
+		return p.KillKWinFn(ctx, deps, user)
+	}
+	if p.SystemctlFn != nil {
+		return nil
+	}
+	if deps == nil || deps.Runner == nil {
+		return nil
+	}
+	res := deps.Runner.Exec(ctx, runner.CommandSpec{
+		Argv:    []string{"pkill", "-u", user, "-x", "kwin_wayland"},
+		Sudo:    true,
+		LogFile: "-",
+		Timeout: 10 * time.Second,
+		DryRun:  deps.DryRun,
+	})
+	if res.Err != nil && res.ExitCode != 1 {
+		return res.Err
+	}
+	return nil
+}
+
+func (p KWinSession) activeMainPID(ctx context.Context, deps *Deps, unit string) int {
+	state, err := p.isActive(ctx, deps, unit)
+	if err != nil || state != "active" {
+		return 0
+	}
+	pid, err := p.mainPID(ctx, deps, unit)
+	if err != nil || pid <= 0 {
+		return 0
+	}
+	return pid
+}
+
 // resolveDRMDevice picks the /dev/dri/card* node the compositor
 // should bind to.
 //
@@ -1722,7 +1859,7 @@ var staleKDEConfigPaths = []string{
 // Returns the list of paths actually removed (for state.Details).
 // Idempotent and best-effort: errors are swallowed so a missing path
 // never prevents the start.
-func cleanStaleKDEConfigIfNeeded(deps *Deps, user, uid string) []string {
+func cleanStaleKDEConfigIfNeeded(deps *Deps, user, uid string, protectWaylandSockets bool) []string {
 	if deps == nil || deps.DryRun {
 		return nil
 	}
@@ -1747,17 +1884,25 @@ func cleanStaleKDEConfigIfNeeded(deps *Deps, user, uid string) []string {
 	// will recreate wayland-0 the moment it owns DRM master; an
 	// orphan socket with no listener confuses Sunshine + wayland-info.
 	if uid != "" {
-		runtimeDir := "/run/user/" + uid
-		entries, _ := os.ReadDir(runtimeDir)
-		for _, e := range entries {
-			name := e.Name()
-			if !strings.HasPrefix(name, "wayland-") {
-				continue
-			}
-			full := filepath.Join(runtimeDir, name)
-			if err := os.Remove(full); err == nil {
-				removed = append(removed, full)
-			}
+		removed = append(removed, cleanWaylandRuntimeSockets(filepath.Join("/run/user", uid), protectWaylandSockets)...)
+	}
+	return removed
+}
+
+func cleanWaylandRuntimeSockets(runtimeDir string, protectWaylandSockets bool) []string {
+	if protectWaylandSockets {
+		return nil
+	}
+	var removed []string
+	entries, _ := os.ReadDir(runtimeDir)
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasPrefix(name, "wayland-") {
+			continue
+		}
+		full := filepath.Join(runtimeDir, name)
+		if err := os.Remove(full); err == nil {
+			removed = append(removed, full)
 		}
 	}
 	return removed

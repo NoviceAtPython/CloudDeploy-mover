@@ -848,6 +848,87 @@ func TestCleanStaleKDEConfig_PreservesKwinrc(t *testing.T) {
 	}
 }
 
+func TestCleanWaylandRuntimeSockets_ProtectsWhenKWinAlive(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"wayland-0", "wayland-0.lock"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("x"), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	if got := cleanWaylandRuntimeSockets(dir, true); len(got) != 0 {
+		t.Fatalf("protected cleanup should remove nothing; got %v", got)
+	}
+	for _, name := range []string{"wayland-0", "wayland-0.lock"} {
+		if _, err := os.Stat(filepath.Join(dir, name)); err != nil {
+			t.Fatalf("%s should still exist while protected: %v", name, err)
+		}
+	}
+	got := cleanWaylandRuntimeSockets(dir, false)
+	if len(got) != 2 {
+		t.Fatalf("unprotected cleanup removed %d paths, want 2: %v", len(got), got)
+	}
+}
+
+func TestKWinSession_AdoptsBeforeUnitRewriteOrCleanup(t *testing.T) {
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+	ph := happyKwin(unitPath)
+	ph.UnitActiveSecondsFn = func(context.Context, *Deps, string) int { return 60 }
+
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	d := deps.State.Get(KWinSessionName).Details
+	if d["adopted_existing_session"] != true {
+		t.Fatalf("expected existing session adoption before rewrite; details=%v", d)
+	}
+	if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unit should not be rewritten when adoption succeeds; stat err=%v", err)
+	}
+}
+
+func TestKWinSession_RecoversActiveKWinWithUnlinkedSocket(t *testing.T) {
+	deps := kwinDeps(t)
+	unitPath := filepath.Join(t.TempDir(), "u.service")
+	ph := happyKwin(unitPath)
+	ph.UnitActiveSecondsFn = func(context.Context, *Deps, string) int { return 60 }
+	socketPresent := false
+	stopCalled := false
+	killCalled := false
+	ph.WaylandSocketFn = func(string) bool { return socketPresent }
+	ph.SystemctlFn = func(_ context.Context, _ *Deps, args ...string) error {
+		if len(args) > 0 && args[0] == "stop" {
+			stopCalled = true
+			socketPresent = true
+		}
+		return nil
+	}
+	ph.KillKWinFn = func(context.Context, *Deps, string) error {
+		killCalled = true
+		return nil
+	}
+	ph.LoginctlSessionsFn = func(context.Context, *Deps) (string, error) {
+		return "32 1001 cloudgamer seat0 42 user tty7 no -\n", nil
+	}
+
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run should recover unlinked socket and continue: %v", err)
+	}
+	if !stopCalled || !killCalled {
+		t.Fatalf("expected controlled restart stop+kill; stop=%v kill=%v", stopCalled, killCalled)
+	}
+	d := deps.State.Get(KWinSessionName).Details
+	if d["kwin_failure_category"] != KWinFailSocketUnlinked {
+		t.Fatalf("kwin_failure_category: got %v want %s", d["kwin_failure_category"], KWinFailSocketUnlinked)
+	}
+	if d["kwin_socket_unlinked"] != true {
+		t.Fatalf("kwin_socket_unlinked detail missing: %v", d)
+	}
+	if d["wayland_socket_ok"] != true {
+		t.Fatalf("wayland_socket_ok: got %v want true", d["wayland_socket_ok"])
+	}
+}
+
 func TestParseKWinOutputBackendAcceptsPlasma64SectionStyleDRM(t *testing.T) {
 	support := `KWin Support Information
 
