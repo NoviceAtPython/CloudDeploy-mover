@@ -315,6 +315,10 @@ type SunshineConfig struct {
 	ForkCommit              string   `yaml:"fork_commit"`
 	Encoder                 string   `yaml:"encoder"`
 	Capture                 string   `yaml:"capture"`
+	Gamepad                 string   `yaml:"gamepad"`
+	MotionAsDS4             bool     `yaml:"motion_as_ds4"`
+	TouchpadAsDS4           bool     `yaml:"touchpad_as_ds4"`
+	DS4BackAsTouchpadClick  bool     `yaml:"ds4_back_as_touchpad_click"`
 	HevcMode                *int     `yaml:"hevc_mode"`
 	Av1Mode                 *int     `yaml:"av1_mode"`
 	ForceAV1HDR10           bool     `yaml:"force_av1_hdr10"`
@@ -372,6 +376,7 @@ const DefaultSunshineInstallBin = "/usr/local/bin/sunshine-clouddeploy"
 const DefaultSunshineConfigName = "sunshine.conf"
 const DefaultSunshineBuildJobs = 2
 const DefaultSunshineEnableCUDA = "auto"
+const DefaultSunshineGamepad = "xone"
 const DefaultDoxygenVersion = "1.17.0"
 const DefaultDoxygenURL = "https://www.doxygen.nl/files/doxygen-1.17.0.linux.bin.tar.gz"
 const DefaultDoxygenSHA256 = "75419ef4f446fc1c24ef12514b574e66e898ee6f527c6ae2ad84f91a905823c2"
@@ -391,6 +396,7 @@ func (p *Profile) EffectiveSunshine() SunshineConfig {
 	if strings.TrimSpace(out.Capture) == "" {
 		out.Capture = "kms"
 	}
+	out.Gamepad = out.GamepadValue()
 	if strings.TrimSpace(out.BuildDir) == "" {
 		out.BuildDir = DefaultSunshineBuildDir
 	}
@@ -416,6 +422,14 @@ func (p *Profile) EffectiveSunshine() SunshineConfig {
 		out.DoxygenInstallDir = DefaultDoxygenInstallDir
 	}
 	return out
+}
+
+func (s SunshineConfig) GamepadValue() string {
+	mode := strings.ToLower(strings.TrimSpace(s.Gamepad))
+	if mode == "" {
+		return DefaultSunshineGamepad
+	}
+	return mode
 }
 
 // TailscaleConfig controls the optional network overlay phase.
@@ -907,6 +921,12 @@ func ValidateProfile(p *Profile) error {
 		// ok
 	default:
 		return fmt.Errorf("config: profile %q: sunshine.enable_cuda must be auto/true/false, got %q", p.Profile, p.Sunshine.EnableCUDA)
+	}
+	switch p.Sunshine.GamepadValue() {
+	case "auto", "xone", "ds5", "switch":
+		// ok
+	default:
+		return fmt.Errorf("config: profile %q: sunshine.gamepad must be empty/auto/xone/ds5/switch, got %q", p.Profile, p.Sunshine.Gamepad)
 	}
 	if p.Deploy.MaxAutoReboots < 0 {
 		return fmt.Errorf("config: profile %q: deploy.max_auto_reboots must be >= 0", p.Profile)

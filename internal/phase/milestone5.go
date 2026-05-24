@@ -714,6 +714,7 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	// consistent.
 	av1Mode := fmt.Sprintf("%d", cfg.Av1ModeValue())
 	hevcMode := fmt.Sprintf("%d", cfg.HevcModeValue())
+	gamepad := cfg.GamepadValue()
 	var b strings.Builder
 	b.WriteString("min_log_level = debug\n")
 	b.WriteString("capture = " + capture + "\n")
@@ -734,6 +735,13 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	b.WriteString("ping_timeout = 60000\n")
 	b.WriteString("hevc_mode = " + hevcMode + "\n")
 	b.WriteString("av1_mode = " + av1Mode + "\n")
+	b.WriteString("gamepad = " + gamepad + "\n")
+	b.WriteString(fmt.Sprintf("motion_as_ds4 = %t\n", cfg.MotionAsDS4))
+	b.WriteString(fmt.Sprintf("touchpad_as_ds4 = %t\n", cfg.TouchpadAsDS4))
+	b.WriteString(fmt.Sprintf("ds4_back_as_touchpad_click = %t\n", cfg.DS4BackAsTouchpadClick))
+	b.WriteString("controller = enabled\n")
+	b.WriteString("keyboard = enabled\n")
+	b.WriteString("mouse = enabled\n")
 	if len(origins) > 0 {
 		b.WriteString("csrf_allowed_origins = " + strings.Join(origins, ",") + "\n")
 	}

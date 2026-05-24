@@ -39,6 +39,10 @@ sunshine:
   fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
   encoder: nvenc
   capture: kms
+  gamepad: xone
+  motion_as_ds4: false
+  touchpad_as_ds4: false
+  ds4_back_as_touchpad_click: false
   hevc_mode: 3
   av1_mode: 3
   force_av1_hdr10: true

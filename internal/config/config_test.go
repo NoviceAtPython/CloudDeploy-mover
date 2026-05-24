@@ -560,6 +560,9 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			bad := -1
 			p.Sunshine.Av1Mode = &bad
 		}, "sunshine.av1_mode"},
+		{"bad sunshine gamepad", func(p *Profile) {
+			p.Sunshine.Gamepad = "dualshock3"
+		}, "sunshine.gamepad"},
 		{"fork without repo", func(p *Profile) { p.Sunshine.ForkRepo = "" }, "sunshine.fork_repo"},
 		{"hdr without fork commit", func(p *Profile) {
 			p.Display.HDR = true

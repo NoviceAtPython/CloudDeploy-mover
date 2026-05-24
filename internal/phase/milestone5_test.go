@@ -62,6 +62,13 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		// the SunshineConfig validator.
 		"av1_mode = 3",
 		"hevc_mode = 3",
+		"gamepad = xone",
+		"motion_as_ds4 = false",
+		"touchpad_as_ds4 = false",
+		"ds4_back_as_touchpad_click = false",
+		"controller = enabled",
+		"keyboard = enabled",
+		"mouse = enabled",
 		"csrf_allowed_origins = https://localhost:47990",
 	} {
 		if !strings.Contains(body, want) {
@@ -73,6 +80,9 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 	}
 	if strings.Contains(body, "hevc_mode = 0") {
 		t.Errorf("sunshine.conf still uses the buggy hevc_mode=0 auto-probe default:\n%s", body)
+	}
+	if strings.Contains(body, "gamepad = auto") {
+		t.Errorf("sunshine.conf still uses client-reported auto gamepad mode:\n%s", body)
 	}
 }
 
@@ -86,6 +96,28 @@ func TestRenderSunshineConfig_HonorsExplicitProfileCodecModes(t *testing.T) {
 	}
 	if !strings.Contains(body, "av1_mode = 1") {
 		t.Errorf("explicit av1_mode=1 not rendered:\n%s", body)
+	}
+}
+
+func TestRenderSunshineConfig_HonorsExplicitGamepadMode(t *testing.T) {
+	cfg := config.SunshineConfig{
+		Encoder:                "nvenc",
+		Capture:                "kms",
+		Gamepad:                "ds5",
+		MotionAsDS4:            true,
+		TouchpadAsDS4:          true,
+		DS4BackAsTouchpadClick: true,
+	}
+	body := renderSunshineConfig(cfg, "/dev/dri/card1", nil)
+	for _, want := range []string{
+		"gamepad = ds5",
+		"motion_as_ds4 = true",
+		"touchpad_as_ds4 = true",
+		"ds4_back_as_touchpad_click = true",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("sunshine.conf missing explicit gamepad setting %q:\n%s", want, body)
+		}
 	}
 }
 
