@@ -17,6 +17,7 @@
 Description=Sunshine on CloudDeploy NVIDIA Wayland KMS (v3 template)
 After={{.CompositorService}} network-online.target tailscaled.service
 Wants=network-online.target tailscaled.service {{.CompositorService}}
+StartLimitIntervalSec=0
 
 [Service]
 User={{.HeadlessUser}}
@@ -36,8 +37,8 @@ Environment=DBUS_SESSION_BUS_ADDRESS=unix:path={{.RuntimeDir}}/bus
 Environment={{.}}
 {{- end}}
 ExecStart={{.SunshineRuntimeBin}} {{.HomeDir}}/.config/sunshine/sunshine.conf
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 

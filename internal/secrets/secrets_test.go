@@ -92,7 +92,7 @@ func TestWrite_AtomicAnd0600OnUnix(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "secrets.env")
 	err := Write(path, map[string]string{
-		"TAILSCALE_AUTHKEY": "fixture-authkey-fixture",
+		"TAILSCALE_AUTHKEY": "fixture-authkey",
 	})
 	if err != nil {
 		t.Fatalf("Write: %v", err)

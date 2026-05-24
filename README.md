@@ -1,205 +1,231 @@
 # CloudDeploy
 
-## Branches at a glance
+CloudDeploy is an experimental Ubuntu cloud-gaming VM deployer for NVIDIA
+GPUs. The current v3 path builds a headless KDE/KWin Wayland desktop,
+patched Sunshine, Tailscale access, PipeWire 7.1 audio, Steam/Proton, and
+optional desktop gaming apps for Moonlight streaming.
 
-| Branch | Status | What it deploys |
-| --- | --- | --- |
-| [`v2`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v2) | **Production. Validated.** | `CloudDeploy-wayland.sh` monolith. Reaches Moonlight `AV1 10-bit HDR` on the live VM as of v2 commit `7d850e9`. Pinned Sunshine fork `464bccf1`. |
-| [`v3`](https://github.com/NoviceAtPython/CloudDeploy-mover/tree/v3) | **Milestone 5 in progress — Ubuntu-only experimental end-to-end attempt.** | `clouddeployctl` Go orchestrator. Real through patched direct KWin real-VT validation plus first-pass Sunshine fork build/config, Tailscale, PipeWire, streaming service, stream validation, optional apps, and unattended reboot/resume. **See [`docs/V2-V3-PARITY.md`](docs/V2-V3-PARITY.md) for the full audit.** |
+The proven target is specific: **4K, 120 Hz, HDR, AV1, Sunshine/Moonlight**
+on an Ada/RTX 40-class NVIDIA GPU. This project is still beta. It was
+developed by one person against specific Vast.ai hardware, and it may need
+fixes on other hosts, images, client GPUs, or Moonlight clients.
 
-> **`clouddeployctl apply` is now the v3 Milestone 5 fresh-VM attempt.**
-> It can drive bootstrap through patched KWin, direct KWin real-VT,
-> Sunshine fork build/config, Tailscale, PipeWire, runtime services, and
-> stream substrate validation. v2 remains the stable fallback until a
-> paid fresh-VM run proves v3 end-to-end with Moonlight.
->
-> For the already-validated deploy that reaches Moonlight `AV1 10-bit
-> HDR`, keep using v2:
->
-> ```bash
-> sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
-> ```
->
-> v3 is **Ubuntu-only**; see
-> [`docs/UBUNTU-ONLY.md`](docs/UBUNTU-ONLY.md).
-> The full v2 → v3 capability audit is in
-> [`docs/V2-V3-PARITY.md`](docs/V2-V3-PARITY.md). The remaining
-> milestone work is in
-> [`docs/V3-ROADMAP.md`](docs/V3-ROADMAP.md) and
-> [`docs/V3-DEPLOYMENT-READINESS.md`](docs/V3-DEPLOYMENT-READINESS.md).
+## Current Status
 
-v3 design rationale (single-binary Go orchestrator, no Ansible) is in
-[`docs/ADR-0001-orchestrator-language.md`](docs/ADR-0001-orchestrator-language.md)
-and
-[`docs/ADR-0002-ansible-vs-native-go.md`](docs/ADR-0002-ansible-vs-native-go.md).
+Validated on a live Vast.ai RTX 4090 VM:
 
-GPU compatibility expectations (which families v3 prefers per
-architecture, where AV1/HDR is supported and where it isn't) live in
-[`docs/GPU-COMPATIBILITY.md`](docs/GPU-COMPATIBILITY.md).
+- 3840x2160 at 120 Hz
+- HDR through the CloudDeploy KWin/Sunshine path
+- AV1 10-bit HDR in Moonlight
+- Sunshine starts as a systemd service and is enabled at boot
+- 7.1 output audio through the persistent `clouddeploy-surround71` sink
+- DualSense/PlayStation controller handling through Sunshine `gamepad=auto`
+  and HIDRAW access
+- Xbox controllers should be selected when the Moonlight client reports an
+  Xbox controller
 
----
+Known gaps:
 
-## This is an automated deployment script for spinning up a headless NVIDIA Linux cloud gaming VM with **KDE Plasma**, **X11**, **Sunshine**, and **Tailscale**.
+- Microphone input has not been tested and probably does not work yet.
+- This is not a general-purpose Linux desktop installer.
+- Some cloud GPU hosts expose broken PCIe/MSI topology; `nvidia-smi` can work
+  while NVENC hangs. Pick VM-capable hosts with sane GPU passthrough.
+- RTX 30-series cards do not have AV1 NVENC. They can only offer HEVC for this
+  class of HDR stream, and the tested laptop/client did not handle that path.
+  Your client decoder hardware matters.
 
-This project is aimed at making fresh cloud instances usable in minutes instead of hours of manual setup and installs.
+## Hardware Expectations
 
-## What this project is
+Recommended GPUs:
 
-`CloudDeploy.sh` is a bootstrap/deployment script for Ubuntu-based cloud VMs that prepares a machine for remote desktop/game streaming with NVIDIA hardware.
+- RTX 4090 / 4080 / 4070 Ti / 4070
+- L4
+- L40 / L40S
+- RTX 6000 Ada
 
-The current focus is:
+Avoid RTX 30-series unless you know your Moonlight client supports the HEVC
+HDR path you want. The main tested path here assumes an AV1-capable client
+decoder and an AV1-capable NVIDIA encoder.
 
-- headless NVIDIA X11 setup
-- KDE Plasma desktop
-- Sunshine for game streaming
-- Tailscale for private remote access
-- Desktop/gaming app installs
-- Fast, repeatable setup on fresh cloud instances
+For Vast.ai, prefer:
 
-## Current status
+- VM/KVM-capable offers, not plain Docker-only offers
+- `vms_enabled=true`
+- direct SSH port available
+- high reliability
+- datacenter hosts when possible
+- Ada/40-series GPU under $1/hr when available
 
-### Phase 1: Working baseline
-The current script successfully automates a working baseline for:
+## What It Installs
 
-- Ubuntu cloud VM
-- NVIDIA GPU
-- headless X11 session
-- KDE Plasma desktop
-- Sunshine startup
-- Tailscale connectivity
-- remote desktop access through Moonlight
+Core stack:
 
-This is the version that turned a long, failure-prone manual setup process into something quick.
+- NVIDIA driver/tooling
+- KDE Plasma/KWin Wayland session for headless capture
+- patched KWin HDR path
+- patched Sunshine fork
+- Tailscale
+- PipeWire/WirePlumber
+- persistent 7.1 virtual audio sink
+- Sunshine systemd service and watchdog
+- PlayStation HIDRAW and Xbox/PlayStation controller permissions
 
-### Phase 2: In progress
-The next stage is focused on improving the streaming stack for modern gaming goals such as:
+Optional app stack:
 
-- AV1
-- HDR
-- higher refresh rates
-- better 4K / 120 Hz behavior
-- improved capture/encoding path for newer displays
+- Steam
+- Google Chrome
+- Discord
+- Heroic Games Launcher
+- Lutris
+- Bottles
+- Prism Launcher
+- ProtonUp-Qt
+- Wine / Winetricks and 32-bit graphics libraries for Proton
 
-## What the script does
+## Host Machine Prerequisites
 
-Depending on configuration, the script can:
+On your laptop or desktop:
 
-- install required system packages
-- configure NVIDIA/Xorg for headless use
-- create a Plasma X11 session startup path
-- configure Sunshine
-- configure and enable systemd services
-- install and connect Tailscale
-- install optional desktop applications and game launchers
-- reduce the amount of manual post-deploy repair work
+- Git
+- SSH client
+- Moonlight
+- Tailscale account and client
+- Vast.ai account, if using Vast
+- Python launcher on Windows (`py`) if using the Vast CLI
+- Go only if you want to build `clouddeployctl` locally instead of on the VM
 
-## Intended use case
+Install and authenticate the Vast CLI on Windows PowerShell:
 
-This project is for users who want to launch a fresh cloud VM and quickly turn it into a remotely accessible Linux gaming/desktop machine.
-
-Typical target scenario:
-
-- rent a cloud GPU VM
-- run `CloudDeploy.sh`
-- connect over Tailscale
-- log into Sunshine
-- pair Moonlight
-- use the machine as a remote gaming/desktop box
-
-## Requirements
-
-At minimum, you should expect to need:
-
-- Ubuntu-based VM
-- NVIDIA GPU
-- sudo/root access
-- internet access on the VM
-- Moonlight on the client side
-- a Tailscale account if using the private-network workflow
-
-## Quick start
-
-Clone the repo and run the script:
-
-```bash
-git clone <your-repo-url>
-cd <your-repo-folder>
-chmod +x CloudDeploy.sh
-sudo bash ./CloudDeploy.sh
+```powershell
+py -3 -m pip install --upgrade vastai
+vastai --help
+vastai set api-key <YOUR_VAST_API_KEY>
 ```
 
-## Recommended run command — do NOT pass secrets on the command line
+Create or upload an SSH key before renting a VM:
 
-`sudo env SUNSHINE_PASS=... TAILSCALE_AUTHKEY=... ./CloudDeploy-wayland.sh`
-exposes secrets in `ps`. The script supports a root-owned, mode-600 env
-file instead. On the target VM, as root:
-
-```bash
-install -d -m 0700 /root
-install -m 0600 /dev/null /root/clouddeploy-v2.env
-${EDITOR:-nano} /root/clouddeploy-v2.env
+```powershell
+if (!(Test-Path "$env:USERPROFILE\.ssh\id_ed25519.pub")) {
+    ssh-keygen -t ed25519 -f "$env:USERPROFILE\.ssh\id_ed25519" -N ""
+}
+vastai create ssh-key "$env:USERPROFILE\.ssh\id_ed25519.pub"
 ```
 
-Example `/root/clouddeploy-v2.env`:
+## Quick Start On A Fresh VM
+
+SSH into the Ubuntu VM as root, then create a root-owned secrets file:
 
 ```bash
-SUNSHINE_PASS=your-sunshine-password
-TAILSCALE_AUTHKEY=your-single-line-tailscale-auth-key
-ENABLE_HDR=1
-CLOUDDEPLOY_AUTO_DIST_UPGRADE=1
-CLOUDDEPLOY_ACCEPT_NON_LTS=1
-INSTALL_OPTIONAL_APPS=0
+install -d -m 0700 /etc/clouddeploy
+install -m 0600 /dev/null /etc/clouddeploy/secrets.env
+nano /etc/clouddeploy/secrets.env
 ```
 
-Then run:
+Example `/etc/clouddeploy/secrets.env`:
 
 ```bash
-sudo bash ./CloudDeploy-wayland.sh
+SUNSHINE_USER=user
+SUNSHINE_PASS=change-this-password
+TAILSCALE_AUTHKEY=<YOUR_TAILSCALE_AUTHKEY>
 ```
 
-`CloudDeploy-wayland.sh` sources `/root/clouddeploy-v2.env` (or whatever
-path you put in `CLOUDDEPLOY_USER_ENV_FILE`) before any default is
-evaluated, but only if the file is owned by root and mode 600 or 400.
-Files with looser permissions or non-root owners are skipped with a
-warning.
-
-A flock at `/run/clouddeploy-wayland.lock` refuses to start a second
-CloudDeploy run while one is in progress, so accidentally invoking the
-script twice won't corrupt apt/dpkg state.
-
-## Rootless Cloud VM Recovery Launch
-
-Some cloud images ship with the default user outside sudo, no root password,
-and no `pkexec`, while polkit still permits `systemd-run`. If `sudo` says
-`user is not in the sudoers file`, create a private env file instead of
-pasting secrets into the shell command:
+Run the v3 bootstrap:
 
 ```bash
-mkdir -p ~/.config/clouddeploy
-chmod 700 ~/.config/clouddeploy
-install -m 0600 /dev/null ~/.config/clouddeploy/env
-editor ~/.config/clouddeploy/env
+curl -fsSL https://raw.githubusercontent.com/NoviceAtPython/CloudDeploy-mover/v3/bootstrap.sh \
+  | PROFILE=hdr-4k120-cuda-auto-unattended-optional CLOUDDEPLOY_UNATTENDED=1 bash
 ```
 
-Example `~/.config/clouddeploy/env`:
+The recommended profile enables unattended reboot/resume and optional apps.
+Reboots during deployment are expected.
+
+If the repo is already cloned on the VM:
 
 ```bash
-SUNSHINE_PASS=your-sunshine-password
-TAILSCALE_AUTHKEY=your-single-line-tailscale-auth-key
-INSTALL_OPTIONAL_APPS=0
+git clone -b v3 https://github.com/NoviceAtPython/CloudDeploy-mover.git
+cd CloudDeploy-mover
+PROFILE=hdr-4k120-cuda-auto-unattended-optional CLOUDDEPLOY_UNATTENDED=1 ./bootstrap.sh
 ```
 
-Then launch the deploy as a transient root service:
+## After Deployment
+
+Check service state:
 
 ```bash
-./clouddeploy-run-rootless-systemd.sh
+systemctl status sunshine-headless.service --no-pager
+systemctl is-enabled sunshine-headless.service
+clouddeployctl state show
+clouddeployctl doctor sunshine
 ```
 
-Follow a failed transient run with:
+Pair Moonlight using the Sunshine web UI or Sunshine's pairing flow. Connect
+over the VM's Tailscale IP/hostname when possible.
+
+Steam should be launched from the desktop icon or application menu so the
+CloudDeploy PlayStation HIDRAW environment is applied. If Steam was already
+running before a controller fix, fully exit Steam and relaunch it.
+
+## Audio And Controller Notes
+
+Audio output is routed through a persistent 7.1 PipeWire sink named
+`clouddeploy-surround71`. Sunshine is pinned to capture that sink so rebooting
+or restarting Sunshine does not revert to the silent default.
+
+Controller support is intentionally metadata-driven:
+
+- PlayStation/DualSense clients should be exposed as a virtual DualSense.
+- Xbox clients should be exposed as Xbox.
+- Third-party or ambiguous controllers may fall back to Xbox-style handling.
+
+The important regression guard is `/dev/hidraw*` access. Without it,
+Steam/SDL/Proton silently fall back to evdev-only PlayStation handling, which
+can cause duplicated or scrambled input.
+
+## Useful Commands
+
+Resume after a manual reboot:
 
 ```bash
-journalctl -u clouddeploy-manual-rerun.service -n 300 --no-pager -l
+clouddeployctl resume --profile hdr-4k120-cuda-auto-unattended-optional
 ```
 
-`TAILSCALE_AUTHKEY` must be a single line. If a key was pasted with line
-breaks during debugging, rotate it before rerunning.
+Collect logs for debugging:
+
+```bash
+clouddeployctl collect-logs
+```
+
+Restart Sunshine:
+
+```bash
+systemctl restart sunshine-headless.service
+```
+
+Reset Sunshine credentials:
+
+```bash
+SUNSHINE_USER=user SUNSHINE_PASS=new-password \
+  clouddeployctl sunshine reset-credentials --profile hdr-4k120-cuda-auto-unattended-optional
+systemctl restart sunshine-headless.service
+```
+
+## Repository Layout
+
+- `cmd/clouddeployctl/` - CLI entrypoint
+- `internal/phase/` - deployment phases
+- `config/profiles/` - deploy profiles
+- `patches/` - KWin patch assets
+- `docs/` - engineering notes, compatibility notes, and validation history
+- `bootstrap.sh` - VM-side bootstrap wrapper
+- `CloudDeploy-wayland.sh` - older monolithic v2 script kept for history/fallback
+
+## License
+
+MIT License. See [`LICENSE`](LICENSE).
+
+## Beta Notice
+
+This project is public so other people can inspect, learn from, and improve
+the work. It is not a polished commercial product. Expect rough edges, and
+verify the VM, GPU, client decoder, audio, controller, and network path before
+depending on it for a long gaming session.

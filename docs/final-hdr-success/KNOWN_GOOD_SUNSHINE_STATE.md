@@ -16,21 +16,20 @@ moving silently is enough to break HDR with no other symptom.
 | --- | --- |
 | Repo | `https://github.com/NoviceAtPython/Sunshine` |
 | Branch | `codex/sunshine-pairing-diagnostics` |
-| Commit (pinned) | `464bccf1b6e33bf35138136c6138fd9851e6d906` |
+| Commit (pinned) | `ec7f60fb8a31042fe03a638bdafcdb3bfe096b87` |
 | Optional permanent target | `clouddeploy-av1-hdr-success` (suggested; not auto-created) |
 
-CloudDeploy's `install_sunshine_from_fork_if_requested` hard-resets the
-working tree to `SUNSHINE_FORK_COMMIT` after `git fetch`/`git checkout`
-of the branch. The pin variable is defined at the top of
-`CloudDeploy-wayland.sh`:
+CloudDeploy v3 hard-resets the Sunshine working tree to the profile
+`sunshine.fork_commit` after `git fetch`/`git checkout` of the branch.
+The current v3 profiles pin:
 
 ```bash
-SUNSHINE_FORK_COMMIT="${SUNSHINE_FORK_COMMIT:-464bccf1b6e33bf35138136c6138fd9851e6d906}"
+sunshine.fork_commit: ec7f60fb8a31042fe03a638bdafcdb3bfe096b87
 ```
 
-Set `SUNSHINE_FORK_COMMIT=""` to disable the pin and follow the branch
-tip; bump the value to a newer commit only after you have re-verified
-the success criteria below end-to-end.
+The older `CloudDeploy-wayland.sh` v2 script may still reference the
+historical `464bccf1` pin. Bump any pin only after you have re-verified the
+success criteria below end-to-end.
 
 ## Required env vars (Sunshine side)
 

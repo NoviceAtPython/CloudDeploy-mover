@@ -45,7 +45,7 @@ demonstrably replaced each phase end-to-end. The migration is
 incremental and described in [MIGRATION.md](MIGRATION.md).
 
 v3 does **not** regress the HDR success state. The Sunshine fork pin
-(`464bccf1b6e33bf35138136c6138fd9851e6d906`), the patched KWin
+(`ec7f60fb8a31042fe03a638bdafcdb3bfe096b87`), the patched KWin
 NVIDIA private HDR path, and the
 `SUNSHINE_FORCE_AV1_HDR10` / `SUNSHINE_SYNTHESIZE_HDR10_METADATA` env
 vars all move forward verbatim. The architectural rules in
@@ -190,7 +190,7 @@ canonical source of truth for "what has been done on this VM."
     "kwin_patch": { "status": "pending" },
     "sunshine_build": {
       "status": "pending",
-      "commit": "464bccf1b6e33bf35138136c6138fd9851e6d906"
+      "commit": "ec7f60fb8a31042fe03a638bdafcdb3bfe096b87"
     },
     "validation": { "status": "pending_moonlight_connect" }
   }
@@ -324,7 +324,7 @@ sunshine:
   source: fork
   fork_repo: https://github.com/NoviceAtPython/Sunshine
   fork_branch: codex/sunshine-pairing-diagnostics
-  fork_commit: 464bccf1b6e33bf35138136c6138fd9851e6d906
+  fork_commit: ec7f60fb8a31042fe03a638bdafcdb3bfe096b87
   encoder: nvenc
   capture: kms
   force_av1_hdr10: true

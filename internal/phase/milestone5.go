@@ -1851,6 +1851,9 @@ func renderSunshineServiceForCompositor(user, uid, bin, conf string, cfg config.
 Description=CloudDeploy Sunshine Wayland/KMS/NVENC
 Wants=network-online.target %s clouddeploy-plasmashell.service
 After=network-online.target %s clouddeploy-plasmashell.service
+# Sunshine must come back without operator action if it exits cleanly,
+# crashes, or starts before the compositor is fully settled.
+StartLimitIntervalSec=0
 
 [Service]
 User=%s
@@ -1884,8 +1887,8 @@ Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
 %sExecStart=%s %s
-Restart=on-failure
-RestartSec=5
+Restart=always
+RestartSec=3
 StandardOutput=journal
 StandardError=journal
 
@@ -2008,15 +2011,18 @@ systemctl --no-pager --full status kwin-realvt.service clouddeploy-plasmashell.s
 	return os.WriteFile("/usr/local/bin/clouddeploy-reset-streaming", []byte(body), 0o755)
 }
 
-func writeSunshineWatchdog() error {
-	svc := `[Unit]
-Description=CloudDeploy Sunshine watchdog
+func renderSunshineWatchdogService() string {
+	return `[Unit]
+Description=CloudDeploy Sunshine availability watchdog
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl restart sunshine-headless.service
+ExecStart=/bin/systemctl start sunshine-headless.service
 `
-	timer := `[Unit]
+}
+
+func renderSunshineWatchdogTimer() string {
+	return `[Unit]
 Description=CloudDeploy Sunshine watchdog timer
 
 [Timer]
@@ -2027,6 +2033,11 @@ Unit=clouddeploy-watch-streaming.service
 [Install]
 WantedBy=timers.target
 `
+}
+
+func writeSunshineWatchdog() error {
+	svc := renderSunshineWatchdogService()
+	timer := renderSunshineWatchdogTimer()
 	if err := os.WriteFile("/etc/systemd/system/clouddeploy-watch-streaming.service", []byte(svc), 0o644); err != nil {
 		return err
 	}

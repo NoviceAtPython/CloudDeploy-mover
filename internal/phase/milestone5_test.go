@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -230,7 +231,10 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 	for _, want := range []string{
 		"Wants=network-online.target kwin-realvt.service",
 		"After=network-online.target kwin-realvt.service",
+		"StartLimitIntervalSec=0",
 		"ExecStart=/usr/local/bin/sunshine-clouddeploy /home/cloudgamer/.config/sunshine/sunshine.conf",
+		"Restart=always",
+		"RestartSec=3",
 		"Environment=WAYLAND_DISPLAY=wayland-0",
 		"AmbientCapabilities=CAP_SYS_ADMIN CAP_SYS_NICE",
 		"CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SYS_NICE CAP_NET_BIND_SERVICE",
@@ -251,9 +255,32 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 			t.Errorf("sunshine service missing %q:\n%s", want, unit)
 		}
 	}
-	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service", "DeviceAllow=/dev/uinput", "DevicePolicy="} {
+	for _, bad := range []string{"plasma-realvt.service", "Requires=kwin-realvt.service", "DeviceAllow=/dev/uinput", "DevicePolicy=", "Restart=on-failure"} {
 		if strings.Contains(unit, bad) {
 			t.Errorf("sunshine service should not contain %q:\n%s", bad, unit)
+		}
+	}
+}
+
+func TestSunshineWatchdogStartsOnlyWhenDown(t *testing.T) {
+	svc := renderSunshineWatchdogService()
+	for _, want := range []string{
+		"Description=CloudDeploy Sunshine availability watchdog",
+		"Type=oneshot",
+		"ExecStart=/bin/systemctl start sunshine-headless.service",
+	} {
+		if !strings.Contains(svc, want) {
+			t.Fatalf("watchdog service missing %q:\n%s", want, svc)
+		}
+	}
+	if strings.Contains(svc, "restart sunshine-headless.service") {
+		t.Fatalf("watchdog must not restart an already active Sunshine stream:\n%s", svc)
+	}
+
+	timer := renderSunshineWatchdogTimer()
+	for _, want := range []string{"OnBootSec=2min", "OnUnitInactiveSec=5min", "Unit=clouddeploy-watch-streaming.service"} {
+		if !strings.Contains(timer, want) {
+			t.Fatalf("watchdog timer missing %q:\n%s", want, timer)
 		}
 	}
 }
@@ -828,6 +855,38 @@ func TestOptionalAppsSkippedByDefault(t *testing.T) {
 	}
 }
 
+func TestOptionalAppsIncludesChromeDiscordAndGamingLaunchers(t *testing.T) {
+	deps := milestone5Deps(t)
+	deps.Profile.Deploy.OptionalApps = true
+
+	if err := (OptionalApps{}).Run(context.Background(), deps); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	ph := deps.State.Get(OptionalAppsName)
+	if ph.Status != state.StatusDone {
+		t.Fatalf("status: got %q want done, reason=%q", ph.Status, ph.Reason)
+	}
+	if ph.Details["google_chrome_installed"] != true {
+		t.Fatalf("optional apps should include Google Chrome: %#v", ph.Details)
+	}
+	flatpaks, ok := ph.Details["flatpak_apps"].([]string)
+	if !ok {
+		t.Fatalf("flatpak_apps detail has wrong type: %#v", ph.Details["flatpak_apps"])
+	}
+	for _, want := range []string{
+		"com.discordapp.Discord",
+		"com.heroicgameslauncher.hgl",
+		"net.lutris.Lutris",
+		"com.usebottles.bottles",
+		"org.prismlauncher.PrismLauncher",
+		"net.davidotek.pupgui2",
+	} {
+		if !slices.Contains(flatpaks, want) {
+			t.Fatalf("optional Flatpak stack missing %q: %v", want, flatpaks)
+		}
+	}
+}
+
 func TestSunshineConfigPhaseDryRunMarksDone(t *testing.T) {
 	deps := milestone5Deps(t)
 	if err := (SunshineConfigPhase{}).Run(context.Background(), deps); err != nil {
@@ -856,7 +915,7 @@ func TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey(t *testing.T) {
 	deps := milestone5Deps(t)
 	// Simulate systemd's EnvironmentFile=-/etc/clouddeploy/secrets.env
 	// import: the value is now in the process env.
-	const fixtureKey = "fixture-authkey-resume-fixture-do-not-leak"
+	const fixtureKey = "fixture-authkey-resume-do-not-leak"
 	t.Setenv("TAILSCALE_AUTHKEY", fixtureKey)
 	// Force DryRun on so the phase exercises every branch without
 	// actually invoking apt or `tailscale up`. Under DryRun the
@@ -886,7 +945,7 @@ func TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey(t *testing.T) {
 
 func TestTailscaleWithAuthKeyButNoIPDoesNotMarkDone(t *testing.T) {
 	deps := milestone5Deps(t)
-	t.Setenv("TAILSCALE_AUTHKEY", "fixture-authkey-fixture")
+	t.Setenv("TAILSCALE_AUTHKEY", "fixture-authkey")
 	deps.DryRun = true
 
 	err := (Tailscale{

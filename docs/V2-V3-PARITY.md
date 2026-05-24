@@ -72,17 +72,17 @@ Milestone 4 work into `v3`).
 | Plasma 6 availability checks (`installed_plasma_version`, `installed_kwin_version`) | v2 refuses if Plasma 6 isn't available on the running release; this is the link to the ubuntu-upgrade phase. | real | `internal/phase/desktop_packages.go` | Native package probing is used for the 25.10 path. |
 | KWin private HDR patch build / install (`build_install_patched_kwin`) | Applies `patches/kwin-clouddeploy-nvidia-private-hdr.patch`, builds, installs. | real | `internal/phase/kwin_patch.go` | Builds patched KWin source packages and installs the resulting `.debs`. |
 | KWin apt pin / hold / marker (`write_patched_kwin_apt_pin`) | Prevents `unattended-upgrades` from replacing the patched build. | real | `internal/phase/kwin_patch.go` + `internal/kwin` | Writes `/var/lib/clouddeploy/kwin-patch.json` and holds the patched packages. |
-| Sunshine fork clone / build / pin (`install_sunshine_from_fork_if_requested`) | Pins `464bccf1`, builds, dual-installs, setcap. | missing | TBD `internal/sunshine` | Second-highest impact. |
-| Sunshine setcap (cap_sys_admin + cap_net_bind_service + cap_sys_nice) | Without it, NVENC scheduling breaks at 4K120. | missing | TBD `internal/sunshine` | |
-| Sunshine runtime assets (`/usr/local/assets/`) | Web UI + apps.json. | missing | TBD `internal/sunshine` | |
-| sunshine.conf generation (no `hdr=` / `fps=` / `resolutions=` invalid keys) | v2 lesson: those keys make Sunshine warn and confuse newcomers. | missing | TBD `internal/sunshine.WriteConfig` | |
-| Sunshine CSRF allowlist + Tailscale IP (`csrf_allowed_origins`) | Pairing-PIN endpoint refuses non-allowlisted origins. | missing | TBD `internal/sunshine` | |
-| KWin / Plasma / Sunshine systemd units (`install_clouddeploy_systemd_units`) | The runtime services that drive the streaming stack. | missing | TBD `internal/systemd` | |
-| Tailscale install + auth + connect (`validate_tailscale_authkey`) | Required to reach the VM from Moonlight. | missing | TBD `internal/phase/tailscale.go` | Needs `TAILSCALE_AUTHKEY` secret. |
-| PipeWire virtual sink (`install_clouddeploy_pipewire_virtual_sink`) | Sunshine audio capture needs a sink in the VM (no real HDA). | missing | TBD `internal/phase/audio.go` | |
+| Sunshine fork clone / build / pin (`install_sunshine_from_fork_if_requested`) | Pins the CloudDeploy Sunshine fork, builds, dual-installs, setcap. | real | `internal/phase/milestone5.go` | v3 profiles pin `ec7f60fb` for HDR plus the Linux `audio_sink` fix. |
+| Sunshine setcap (cap_sys_admin + cap_net_bind_service + cap_sys_nice) | Without it, NVENC scheduling breaks at 4K120. | real | `internal/phase/milestone5.go` | Nonfatal details are recorded if setcap fails. |
+| Sunshine runtime assets (`/usr/local/assets/`) | Web UI + apps.json. | real | `internal/phase/milestone5.go` | Installed with the Sunshine build. |
+| sunshine.conf generation (no `hdr=` / `fps=` / `resolutions=` invalid keys) | v2 lesson: those keys make Sunshine warn and confuse newcomers. | real | `internal/phase/milestone5.go` | Pins `audio_sink`/`virtual_sink` to the persistent 7.1 PipeWire sink. |
+| Sunshine CSRF allowlist + Tailscale IP (`csrf_allowed_origins`) | Pairing-PIN endpoint refuses non-allowlisted origins. | real | `internal/phase/milestone5.go` | Rewrites config after Tailscale IP discovery and tries a Sunshine restart. |
+| KWin / Plasma / Sunshine systemd units (`install_clouddeploy_systemd_units`) | The runtime services that drive the streaming stack. | real | `internal/phase/kwin_session.go`, `internal/phase/milestone5.go` | Sunshine is enabled at boot and restarts automatically. |
+| Tailscale install + auth + connect (`validate_tailscale_authkey`) | Required to reach the VM from Moonlight. | real | `internal/phase/milestone5.go` | Needs `TAILSCALE_AUTHKEY` secret when enabled. |
+| PipeWire virtual sink (`install_clouddeploy_pipewire_virtual_sink`) | Sunshine audio capture needs a sink in the VM (no real HDA). | real | `internal/phase/milestone5.go` | Creates `clouddeploy-surround71` and the experimental mic remap. |
 | Force-KWin-mode helper (`clouddeploy-force-kwin-mode.sh` writer) | Periodically asserts `kscreen-doctor output.DP-1.mode.3840x2160@120`. | real | `internal/phase/kwin_session.go` | Resolves KScreen output/mode IDs and enables HDR/WCG when the profile is HDR. |
-| Reset-streaming helper (`clouddeploy-reset-streaming`) | One-button "restart the streaming stack" for the operator. | missing | TBD `internal/systemd` | |
-| Watchdog service / timer (`clouddeploy-watch-streaming.timer`) | Restarts Sunshine if it falls over. | missing | TBD `internal/systemd` | |
+| Reset-streaming helper (`clouddeploy-reset-streaming`) | One-button "restart the streaming stack" for the operator. | real | `internal/phase/milestone5.go` | Restarts KWin/Plasma/Sunshine in order. |
+| Watchdog service / timer (`clouddeploy-watch-streaming.timer`) | Starts Sunshine if it is down. | real | `internal/phase/milestone5.go` | Uses `systemctl start`, not `restart`, so active streams are not interrupted. |
 | Final streaming validation (`validate_streaming_stack_ready`) | Walks the journal + DRM state + `nvidia-smi` + `kscreen-doctor` and confirms everything. | missing | TBD `internal/validate` | |
 | HDR DRM validation (`validate_hdr_final_state` + `scripts/validate-hdr-drm-state.py`) | Confirms `NV_CRTC_REGAMMA_TF=PQ` + `NV_INPUT_COLORSPACE=BT.2100 PQ`. | partial | wraps existing Python helper | Helper exists; v3 wrapper / phase to invoke it does not. |
 | HDR stream packet validation (`/usr/local/sbin/clouddeploy-validate-hdr-stream`) | Greps Sunshine journal for `Sent HDR mode control packet to Moonlight: enabled=1`. | missing | TBD `internal/validate` | |
@@ -91,7 +91,7 @@ Milestone 4 work into `v3`).
 
 | v2 capability | Status | Notes |
 | --- | --- | --- |
-| Optional apps (Steam, Heroic, Lutris, Bottles, Prism, ProtonUp-Qt, Chrome) (`install_optional_apps_nonfatal`) | missing | M4+. Pure quality-of-life; not on the success-criteria path. |
+| Optional apps (Steam, Heroic, Lutris, Bottles, Prism, ProtonUp-Qt, Chrome, Discord) (`install_optional_apps_nonfatal`) | real | `internal/phase/milestone5.go`. Pure quality-of-life; profile-gated and nonfatal. |
 | Final summary / checklist (`print_final_validation_summary`, `print_known_good_checklist`) | missing | M4. |
 | `clouddeploy-run` helper | n/a | v3 has `bootstrap.sh` + direct `clouddeployctl` invocations. |
 | `clouddeploy-write-env` helper | partial | Profile YAML covers the configurable part; secrets land later. |

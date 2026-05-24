@@ -7,10 +7,10 @@
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/NoviceAtPython/CloudDeploy-mover/v3/bootstrap.sh \
-#     | sudo PROFILE=hdr-4k120 ENABLE_HDR=1 bash
+#     | sudo env PROFILE=hdr-4k120-cuda-auto-unattended-optional CLOUDDEPLOY_UNATTENDED=1 bash
 #
 # Or, with the repo already on disk:
-#   sudo PROFILE=hdr-4k120 ./bootstrap.sh
+#   sudo env PROFILE=hdr-4k120-cuda-auto-unattended-optional CLOUDDEPLOY_UNATTENDED=1 ./bootstrap.sh
 #
 # The v2 path (CloudDeploy-wayland.sh at the repo root) is unaffected by
 # this script. v2 deploys keep working by invoking the v2 entrypoint
@@ -315,9 +315,11 @@ run_apply() {
     log "rerun: 'sudo clouddeployctl resume'. Set CLOUDDEPLOY_UNATTENDED=1"
     log "or CLOUDDEPLOY_AUTO_REBOOT=1 for autopilot continuation."
     log ""
-    log "For a deploy that reaches Moonlight AV1 10-bit HDR today,"
-    log "keep using the v2 entrypoint:"
-    log "    sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh"
+    log "Recommended gaming profile:"
+    log "    PROFILE=hdr-4k120-cuda-auto-unattended-optional"
+    log "It targets 4K/120 HDR, AV1-capable NVIDIA GPUs, Sunshine,"
+    log "Tailscale, 7.1 PipeWire audio, Steam, Chrome, Discord,"
+    log "Heroic, Lutris, Bottles, Prism Launcher, and ProtonUp-Qt."
     log ""
     log "See docs/V2-V3-PARITY.md for the formal v2 -> v3 capability"
     log "audit and docs/V3-ROADMAP.md for milestone status."

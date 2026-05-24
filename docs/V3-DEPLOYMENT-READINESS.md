@@ -22,23 +22,20 @@ gap between "v3 today" and "no-contact full deploy" honest.
 * `collect-logs` packages /var/log/clouddeploy + state + systemctl +
   journal + dmesg + apt logs into a tarball.
 
-It does **not** yet:
+It still has beta gaps:
 
-* Block on cloud-init's apt lock (we wait on dpkg locks but not
-  on cloud-init's lifecycle).
-* Repair the snapd / libblockdev / corrupt-`/var/lib/dpkg/updates`
-  failure modes the v2 path handles.
-* Build the Sunshine fork at `464bccf1`.
-* Generate the full Plasma shell / Sunshine systemd service chain.
-* Wire Tailscale.
-* Install the PipeWire virtual sink.
-* Run the streaming or HDR validators.
+* Microphone input has not been validated.
+* Cloud-init lifecycle waiting is limited; dpkg/apt locks are handled, but
+  images that are still actively provisioning may need a retry.
+* Some cloud hosts expose broken GPU PCIe/MSI topology; `nvidia-smi` can work
+  while NVENC work submission hangs.
+* The validated end-to-end path is narrow: Vast.ai RTX 4090-class Ada GPU,
+  4K/120, HDR, AV1-capable Moonlight client.
 
-Until those land, the only command that reaches Moonlight
-`AV1 10-bit HDR` end-to-end remains the v2 entrypoint:
+The current recommended v3 profile is:
 
 ```bash
-sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
+PROFILE=hdr-4k120-cuda-auto-unattended-optional
 ```
 
 ## 1. Current stubs
@@ -114,7 +111,7 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 | `cuda` | **v3 real** | mode=none default. |
 | `edid` | **v3 real (opt-in)** | Reboot-aware. |
 | `kwin_patch` | **v3 real** | Validates patch, builds/install patched KWin source packages, holds installed packages, writes marker. |
-| `sunshine_build` | **v3 real (Milestone 5)** | Pin commit `464bccf1`, build fork, install `/usr/local/bin/sunshine-clouddeploy`, set caps, install assets. |
+| `sunshine_build` | **v3 real (Milestone 5)** | Pin commit `ec7f60fb`, build fork, install `/usr/local/bin/sunshine-clouddeploy`, set caps, install assets. |
 | `sunshine_config` | **v3 real (Milestone 5)** | KMS/NVENC config without known-invalid keys + CSRF allowlist. |
 | `tailscale` | **v3 real (Milestone 5, optional)** | `tailscale up` only when `TAILSCALE_AUTHKEY` is present. |
 | `pipewire_audio` | **v3 real (Milestone 5)** | PipeWire/WirePlumber install + user-session audio visibility check. |
@@ -127,26 +124,19 @@ sudo ENABLE_HDR=1 bash ./CloudDeploy-wayland.sh
 
 In rough order of how the deploy hits them:
 
-1. **EDID/GRUB reboot sequencing — partially solved.** The EDID phase
-   now generates the binary and updates GRUB; combined with the
-   continuation service the operator no longer has to babysit the
-   reboot. Validated for the `hdr-4k120` profile only.
-2. **Sunshine build/service chain is missing.** The patched-KWin phase can
-   now install the private HDR path, but v3 still does not build/run the
-   pinned Sunshine fork or wire the final runtime services. **Highest-impact
-   missing piece**.
-3. **Sunshine fork build is missing.** Without the pinned
-   `464bccf1` build, the HDR control packet synthesis fix is not in
-   place. Even with patched KWin, Moonlight would still see SDR.
-4. **systemd unit generation is missing.** Without the right unit
-   files (CAP_SYS_NICE + HDR env vars + GBM_BACKEND=nvidia-drm),
-   Sunshine cannot start correctly.
-5. **HDR validation is missing.** Without the post-deploy validator,
-   we cannot programmatically prove the deploy reached the success
-   state.
-6. **Tailscale is missing.** Without it, the VM is unreachable from
-   the operator's network and the deploy "succeeds" but no client
-   can actually connect.
+1. **Mic input is unvalidated.** PipeWire creates the experimental
+   `clouddeploy-mic` path, but it has not been proved with a real Moonlight
+   headset/microphone session.
+2. **Moonlight pairing is still manual.** Sunshine is reachable, but there is
+   no state-file pairing injection or first-class `clouddeployctl pair` flow.
+3. **Cloud host topology can still fail below the guest.** A VM can pass
+   `nvidia-smi` but hang on NVENC if the provider exposes broken PCIe/MSI
+   interrupt topology.
+4. **HDR validation still depends on a real client attempt.** The
+   `stream_validate` phase records Sunshine/server markers, but full proof
+   still requires a Moonlight session.
+5. **Fresh-host coverage is narrow.** The known-good path is the tested
+   Vast.ai RTX 4090/Ada VM. More hosts and client devices need coverage.
 
 ## 4. Exit codes
 

@@ -3,7 +3,7 @@
 //
 // Milestone-4 scope. The state v3 must preserve verbatim:
 //
-//   - Pin to fork commit 464bccf1b6e33bf35138136c6138fd9851e6d906
+//   - Pin to the profile-supplied Sunshine fork commit
 //     (or the profile-supplied override).
 //   - Source-build via the same cmake/ninja flow as v2.
 //   - Install to BOTH /usr/local/bin/sunshine-clouddeploy and
