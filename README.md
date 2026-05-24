@@ -158,8 +158,17 @@ clouddeployctl state show
 clouddeployctl doctor sunshine
 ```
 
-Pair Moonlight using the Sunshine web UI or Sunshine's pairing flow. Connect
-over the VM's Tailscale IP/hostname when possible.
+Pair Moonlight with one command — no raw bash or web UI required:
+
+```bash
+sudo clouddeployctl pair
+```
+
+It prints your Tailscale IP to add in Moonlight, waits for the 4-digit PIN
+Moonlight shows, and submits it to Sunshine for you (credentials are read from
+`/etc/clouddeploy/secrets.env`). After a successful deploy this same hint is
+also shown on every SSH login. If you prefer, the Sunshine web UI on
+`https://<tailscale-ip>:47990` still works too.
 
 Steam should be launched from the desktop icon or application menu so the
 CloudDeploy PlayStation HIDRAW environment is applied. If Steam was already

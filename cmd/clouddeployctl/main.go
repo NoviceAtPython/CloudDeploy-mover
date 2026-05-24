@@ -80,6 +80,7 @@ func newRoot() *cobra.Command {
 	root.AddCommand(newCollectLogsCmd())
 	root.AddCommand(newMonitorCmd())
 	root.AddCommand(newSunshineCmd())
+	root.AddCommand(newPairCmd())
 
 	return root
 }
@@ -582,6 +583,9 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 		}
 	}
 	fmt.Print(partialApplyBanner)
+	// Surface the one-command pairing path: write the SSH-login MOTD and
+	// print the "run clouddeployctl pair" hint. Best-effort, non-fatal.
+	finalizeDeployUX(ctx, deps)
 	return nil
 }
 
