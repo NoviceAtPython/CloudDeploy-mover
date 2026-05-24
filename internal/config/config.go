@@ -376,7 +376,13 @@ const DefaultSunshineInstallBin = "/usr/local/bin/sunshine-clouddeploy"
 const DefaultSunshineConfigName = "sunshine.conf"
 const DefaultSunshineBuildJobs = 2
 const DefaultSunshineEnableCUDA = "auto"
-const DefaultSunshineGamepad = "xone"
+
+// DefaultSunshineGamepad deliberately uses Sunshine's client-reported
+// metadata path instead of forcing every controller to Xbox. The v3
+// profiles keep motion_as_ds4/touchpad_as_ds4 disabled, so unknown
+// third-party pads still fall back to Xbox instead of being guessed as
+// PlayStation from noisy capability bits.
+const DefaultSunshineGamepad = "auto"
 const DefaultDoxygenVersion = "1.17.0"
 const DefaultDoxygenURL = "https://www.doxygen.nl/files/doxygen-1.17.0.linux.bin.tar.gz"
 const DefaultDoxygenSHA256 = "75419ef4f446fc1c24ef12514b574e66e898ee6f527c6ae2ad84f91a905823c2"
@@ -426,8 +432,19 @@ func (p *Profile) EffectiveSunshine() SunshineConfig {
 
 func (s SunshineConfig) GamepadValue() string {
 	mode := strings.ToLower(strings.TrimSpace(s.Gamepad))
-	if mode == "" {
+	switch mode {
+	case "":
 		return DefaultSunshineGamepad
+	case "xbox", "xinput", "x360":
+		return "xone"
+	case "ps", "playstation":
+		return "auto"
+	case "ps4", "ds4", "dualshock", "dualshock4", "ps5", "dualsense", "dualshock5":
+		// Sunshine's Linux backend exposes Xbox One, DualSense, and
+		// Switch virtual devices. A physical DS4 reported by Moonlight
+		// as PlayStation is still handled by gamepad=auto; explicit PS
+		// aliases force the only Linux PlayStation virtual backend.
+		return "ds5"
 	}
 	return mode
 }
@@ -926,7 +943,20 @@ func ValidateProfile(p *Profile) error {
 	case "auto", "xone", "ds5", "switch":
 		// ok
 	default:
-		return fmt.Errorf("config: profile %q: sunshine.gamepad must be empty/auto/xone/ds5/switch, got %q", p.Profile, p.Sunshine.Gamepad)
+		return fmt.Errorf("config: profile %q: sunshine.gamepad must be empty/auto/xone/ds5/switch or a supported xbox/playstation alias, got %q", p.Profile, p.Sunshine.Gamepad)
+	}
+	audio := p.EffectiveAudio()
+	if !looksLikePulseName(audio.VirtualSink) {
+		return fmt.Errorf("config: profile %q: audio.virtual_sink %q is not a safe PulseAudio/PipeWire node name", p.Profile, audio.VirtualSink)
+	}
+	if p.Audio.Rate < 0 {
+		return fmt.Errorf("config: profile %q: audio.rate must be >= 0, got %d", p.Profile, p.Audio.Rate)
+	}
+	if p.Audio.Channels < 0 {
+		return fmt.Errorf("config: profile %q: audio.channels must be >= 0, got %d", p.Profile, p.Audio.Channels)
+	}
+	if strings.TrimSpace(audio.ChannelMap) != "" && !looksLikePulseChannelMap(audio.ChannelMap) {
+		return fmt.Errorf("config: profile %q: audio.channel_map %q is not a safe PulseAudio/PipeWire channel map", p.Profile, audio.ChannelMap)
 	}
 	if p.Deploy.MaxAutoReboots < 0 {
 		return fmt.Errorf("config: profile %q: deploy.max_auto_reboots must be >= 0", p.Profile)
@@ -1099,6 +1129,34 @@ func looksLikePOSIXLogin(s string) bool {
 	for i := 1; i < len(v); i++ {
 		c := v[i]
 		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikePulseName(s string) bool {
+	v := strings.TrimSpace(s)
+	if v == "" || len(v) > 96 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func looksLikePulseChannelMap(s string) bool {
+	v := strings.TrimSpace(s)
+	if v == "" || len(v) > 256 {
+		return false
+	}
+	for i := 0; i < len(v); i++ {
+		c := v[i]
+		if !((c >= 'a' && c <= 'z') || c == '-' || c == ',') {
 			return false
 		}
 	}

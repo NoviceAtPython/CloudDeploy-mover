@@ -52,8 +52,8 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		"encoder = nvenc",
 		"adapter_name = /dev/dri/card1",
 		"stream_audio = enabled",
-		"audio_sink = clouddeploy-surround71",
-		"virtual_sink = clouddeploy-surround71",
+		"audio_sink =",
+		"virtual_sink =",
 		// HDR-Main10 defaults: av1_mode=3 (AV1 Main + Main10),
 		// hevc_mode=3 (HEVC Main + Main10). Live-VM regression:
 		// av1_mode=2 + hevc_mode=0 left Moonlight without an HDR
@@ -62,7 +62,7 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		// the SunshineConfig validator.
 		"av1_mode = 3",
 		"hevc_mode = 3",
-		"gamepad = xone",
+		"gamepad = auto",
 		"motion_as_ds4 = false",
 		"touchpad_as_ds4 = false",
 		"ds4_back_as_touchpad_click = false",
@@ -81,8 +81,10 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 	if strings.Contains(body, "hevc_mode = 0") {
 		t.Errorf("sunshine.conf still uses the buggy hevc_mode=0 auto-probe default:\n%s", body)
 	}
-	if strings.Contains(body, "gamepad = auto") {
-		t.Errorf("sunshine.conf still uses client-reported auto gamepad mode:\n%s", body)
+	for _, bad := range []string{"audio_sink = clouddeploy-surround71", "virtual_sink = clouddeploy-surround71"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("sunshine.conf pins the CloudDeploy bootstrap sink and can split playback/capture again:\n%s", body)
+		}
 	}
 }
 
@@ -117,6 +119,47 @@ func TestRenderSunshineConfig_HonorsExplicitGamepadMode(t *testing.T) {
 	} {
 		if !strings.Contains(body, want) {
 			t.Errorf("sunshine.conf missing explicit gamepad setting %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRenderCloudDeployAudioScriptCreatesSurroundSinkAndVirtualMic(t *testing.T) {
+	cfg := config.AudioConfig{
+		VirtualSink: "clouddeploy-surround71",
+		Rate:        48000,
+		Channels:    8,
+		ChannelMap:  "front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right",
+	}
+	body := renderCloudDeployAudioScript(cfg)
+	for _, want := range []string{
+		"SINK_NAME='clouddeploy-surround71'",
+		"MIC_SINK_NAME='clouddeploy-mic-sink'",
+		"MIC_SOURCE_NAME='clouddeploy-mic'",
+		"pactl load-module module-null-sink",
+		"channels=\"$CHANNELS\"",
+		"channel_map=\"$CHANNEL_MAP\"",
+		"pactl load-module module-remap-source",
+		"pactl set-default-sink \"$SINK_NAME\"",
+		"pactl set-default-source \"$default_source\"",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("audio script missing %q:\n%s", want, body)
+		}
+	}
+}
+
+func TestRenderCloudDeployAudioUserService(t *testing.T) {
+	unit := renderCloudDeployAudioUserService("/home/cloudgamer/.local/bin/clouddeploy-audio-virtual-devices.sh")
+	for _, want := range []string{
+		"Description=CloudDeploy virtual PipeWire audio devices",
+		"Wants=pipewire-pulse.service wireplumber.service",
+		"Type=oneshot",
+		"ExecStart=/home/cloudgamer/.local/bin/clouddeploy-audio-virtual-devices.sh",
+		"RemainAfterExit=yes",
+		"WantedBy=default.target",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("audio user service missing %q:\n%s", want, unit)
 		}
 	}
 }

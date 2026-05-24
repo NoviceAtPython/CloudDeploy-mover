@@ -721,13 +721,15 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	b.WriteString("encoder = " + encoder + "\n")
 	b.WriteString("adapter_name = " + drm + "\n")
 	if audio.EnabledValue() {
-		sink := strings.TrimSpace(audio.VirtualSink)
-		if sink == "" {
-			sink = "clouddeploy-surround71"
-		}
 		b.WriteString("stream_audio = enabled\n")
-		b.WriteString("audio_sink = " + sink + "\n")
-		b.WriteString("virtual_sink = " + sink + "\n")
+		// Leave both sink selectors blank. Sunshine creates a
+		// per-session sink-sunshine-surround71 device when Moonlight
+		// negotiates 7.1 audio, switches the desktop default to it, and
+		// records that monitor. Pinning audio_sink/virtual_sink to the
+		// CloudDeploy bootstrap sink caused live sessions to play into
+		// one sink while Sunshine captured another.
+		b.WriteString("audio_sink =\n")
+		b.WriteString("virtual_sink =\n")
 	} else {
 		b.WriteString("stream_audio = disabled\n")
 	}
@@ -861,6 +863,23 @@ type PipeWireAudio struct{}
 
 func (PipeWireAudio) Name() string { return PipeWireAudioName }
 
+const (
+	clouddeployAudioServiceName = "clouddeploy-audio-virtual-devices.service"
+	clouddeployMicSinkName      = "clouddeploy-mic-sink"
+	clouddeployMicSourceName    = "clouddeploy-mic"
+)
+
+var pipeWireAudioPackages = []string{
+	"pipewire",
+	"pipewire-pulse",
+	"wireplumber",
+	"pulseaudio-utils",
+	"alsa-utils",
+	"pipewire-alsa",
+	"libasound2-plugins",
+	"pipewire-audio-client-libraries",
+}
+
 func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	log := logger(deps)
 	if shouldSkip(deps.State, PipeWireAudioName) {
@@ -873,9 +892,12 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	details := map[string]any{
 		"enabled":      cfg.EnabledValue(),
 		"virtual_sink": cfg.VirtualSink,
+		"mic_sink":     clouddeployMicSinkName,
+		"mic_source":   clouddeployMicSourceName,
 		"rate":         cfg.Rate,
 		"channels":     cfg.Channels,
 		"channel_map":  cfg.ChannelMap,
+		"packages":     pipeWireAudioPackages,
 	}
 	if !cfg.EnabledValue() {
 		deps.State.MarkSkipped(PipeWireAudioName, "audio.enabled=false")
@@ -884,27 +906,46 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 		return nil
 	}
 	if err := deps.APT.Run(ctx, func(tc *apt.TxContext) error {
-		return tc.Install(ctx, []string{"pipewire", "pipewire-pulse", "wireplumber", "pulseaudio-utils"})
+		return tc.Install(ctx, pipeWireAudioPackages)
 	}); err != nil {
 		return failPhase(deps, PipeWireAudioName, details, "install PipeWire", err, true)
 	}
 	desk := deps.Profile.EffectiveDesktop()
 	uid := uidFromState(deps)
 	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "enable", "--now", "pipewire", "pipewire-pulse", "wireplumber"}, time.Minute)
-	unloadScript := "pactl list short modules | awk -v sink=" + shellQuote(cfg.VirtualSink) + " '$0 ~ \"sink_name=\" sink {print $1}' | xargs -r -n1 pactl unload-module"
-	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"bash", "-lc", unloadScript}, time.Minute)
-	loadArgs := []string{
-		"pactl", "load-module", "module-null-sink",
-		"sink_name=" + cfg.VirtualSink,
-		"sink_properties=device.description=CloudDeploy Surround 7.1",
-		"format=float32le",
-		fmt.Sprintf("rate=%d", cfg.Rate),
-		fmt.Sprintf("channels=%d", cfg.Channels),
-		"channel_map=" + cfg.ChannelMap,
+	if !deps.DryRun {
+		scriptPath := clouddeployAudioScriptPath(desk.User)
+		unitPath := clouddeployAudioServicePath(desk.User)
+		if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "create audio script dir", err, true)
+		}
+		if err := os.MkdirAll(filepath.Dir(unitPath), 0o755); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "create audio user unit dir", err, true)
+		}
+		if err := os.WriteFile(scriptPath, []byte(renderCloudDeployAudioScript(cfg)), 0o755); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "write audio virtual device script", err, true)
+		}
+		if err := os.WriteFile(unitPath, []byte(renderCloudDeployAudioUserService(scriptPath)), 0o644); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "write audio user service", err, true)
+		}
+		for _, cmd := range [][]string{
+			{"chown", "-R", desk.User + ":" + desk.User, filepath.Dir(filepath.Dir(scriptPath))},
+			{"chown", "-R", desk.User + ":" + desk.User, filepath.Dir(filepath.Dir(unitPath))},
+			{"chmod", "0755", scriptPath},
+			{"chmod", "0644", unitPath},
+		} {
+			if err := run(ctx, deps, "", cmd, time.Minute, true); err != nil {
+				return failPhase(deps, PipeWireAudioName, details, "fix audio service ownership", err, true)
+			}
+		}
+		details["audio_script"] = scriptPath
+		details["audio_user_service"] = unitPath
 	}
-	_ = runAsDesktop(ctx, deps, desk.User, uid, loadArgs, time.Minute)
-	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "set-default-sink", cfg.VirtualSink}, 15*time.Second)
-	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "set-default-source", cfg.VirtualSink + ".monitor"}, 15*time.Second)
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "daemon-reload"}, time.Minute)
+	if err := runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "enable", "--now", clouddeployAudioServiceName}, time.Minute); err != nil {
+		return failPhase(deps, PipeWireAudioName, details, "enable audio virtual devices", err, true)
+	}
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "restart", clouddeployAudioServiceName}, time.Minute)
 	wpctl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"wpctl", "status"}, 15*time.Second)
 	pactl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sinks"}, 15*time.Second)
 	sources, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sources"}, 15*time.Second)
@@ -917,12 +958,104 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	details["pactl_info_excerpt"] = lastLines(info, 8)
 	details["virtual_sink_detail"] = strings.TrimSpace(sinkDetail)
 	details["virtual_sink_seen"] = strings.Contains(pactl, cfg.VirtualSink)
+	details["virtual_mic_seen"] = strings.Contains(sources, clouddeployMicSourceName)
 	if !deps.DryRun && strings.TrimSpace(wpctl) == "" && strings.TrimSpace(pactl) == "" {
 		return failPhase(deps, PipeWireAudioName, details, "PipeWire validation failed", fmt.Errorf("neither wpctl nor pactl returned audio devices"), true)
 	}
 	deps.State.MarkDone(PipeWireAudioName, details)
 	_ = deps.PersistState()
 	return nil
+}
+
+func clouddeployAudioScriptPath(user string) string {
+	return "/home/" + user + "/.local/bin/clouddeploy-audio-virtual-devices.sh"
+}
+
+func clouddeployAudioServicePath(user string) string {
+	return "/home/" + user + "/.config/systemd/user/" + clouddeployAudioServiceName
+}
+
+func renderCloudDeployAudioUserService(scriptPath string) string {
+	return `[Unit]
+Description=CloudDeploy virtual PipeWire audio devices
+Wants=pipewire-pulse.service wireplumber.service
+After=pipewire-pulse.service wireplumber.service
+
+[Service]
+Type=oneshot
+ExecStart=` + scriptPath + `
+RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+`
+}
+
+func renderCloudDeployAudioScript(cfg config.AudioConfig) string {
+	cfg = (&config.Profile{Audio: cfg}).EffectiveAudio()
+	return `#!/usr/bin/env bash
+set -euo pipefail
+
+SINK_NAME=` + shellQuote(cfg.VirtualSink) + `
+MIC_SINK_NAME=` + shellQuote(clouddeployMicSinkName) + `
+MIC_SOURCE_NAME=` + shellQuote(clouddeployMicSourceName) + `
+RATE=` + strconv.Itoa(cfg.Rate) + `
+CHANNELS=` + strconv.Itoa(cfg.Channels) + `
+CHANNEL_MAP=` + shellQuote(cfg.ChannelMap) + `
+
+for _ in $(seq 1 30); do
+  pactl info >/dev/null 2>&1 && break
+  sleep 1
+done
+pactl info >/dev/null
+
+unload_matching_module() {
+  local pattern="$1"
+  pactl list short modules |
+    awk -v pattern="$pattern" 'index($0, pattern) { print $1 }' |
+    sort -rn |
+    while read -r module_id; do
+      [ -n "$module_id" ] && pactl unload-module "$module_id" || true
+    done
+}
+
+unload_matching_module "source_name=$MIC_SOURCE_NAME"
+unload_matching_module "sink_name=$MIC_SINK_NAME"
+unload_matching_module "sink_name=$SINK_NAME"
+
+pactl load-module module-null-sink \
+  sink_name="$SINK_NAME" \
+  "sink_properties=device.description=CloudDeploy 7.1 Surround" \
+  format=float32le \
+  rate="$RATE" \
+  channels="$CHANNELS" \
+  channel_map="$CHANNEL_MAP"
+
+pactl load-module module-null-sink \
+  sink_name="$MIC_SINK_NAME" \
+  "sink_properties=device.description=CloudDeploy Microphone Feed" \
+  format=float32le \
+  rate=48000 \
+  channels=1 \
+  channel_map=mono
+
+default_source="$MIC_SINK_NAME.monitor"
+if pactl load-module module-remap-source \
+  source_name="$MIC_SOURCE_NAME" \
+  master="$MIC_SINK_NAME.monitor" \
+  channels=1 \
+  master_channel_map=mono \
+  channel_map=mono \
+  "source_properties=device.description=CloudDeploy Virtual Microphone"; then
+  default_source="$MIC_SOURCE_NAME"
+fi
+
+pactl set-default-sink "$SINK_NAME"
+pactl set-default-source "$default_source"
+
+pactl list short sinks | grep -F "$SINK_NAME" >/dev/null
+pactl list short sources | grep -E "(^|[[:space:]])(${MIC_SOURCE_NAME}|${MIC_SINK_NAME}\.monitor)([[:space:]]|$)" >/dev/null
+`
 }
 
 type StreamingServices struct{}

@@ -260,6 +260,33 @@ func TestEffectiveDesktop_SessionBackendDefaultsRealvt(t *testing.T) {
 	}
 }
 
+func TestEffectiveSunshineGamepadDefaultsToMetadataOnlyAuto(t *testing.T) {
+	got := (&Profile{}).EffectiveSunshine()
+	if got.Gamepad != "auto" {
+		t.Fatalf("default gamepad: got %q want auto", got.Gamepad)
+	}
+	if got.MotionAsDS4 || got.TouchpadAsDS4 || got.DS4BackAsTouchpadClick {
+		t.Fatalf("auto gamepad must not enable capability heuristics by default: %+v", got)
+	}
+}
+
+func TestSunshineGamepadAliases(t *testing.T) {
+	for raw, want := range map[string]string{
+		"xbox":        "xone",
+		"xinput":      "xone",
+		"x360":        "xone",
+		"ps":          "auto",
+		"playstation": "auto",
+		"ds4":         "ds5",
+		"dualshock4":  "ds5",
+		"dualsense":   "ds5",
+	} {
+		if got := (SunshineConfig{Gamepad: raw}).GamepadValue(); got != want {
+			t.Fatalf("GamepadValue(%q): got %q want %q", raw, got, want)
+		}
+	}
+}
+
 func TestEffectiveKWin_DefaultsPatchedHDR(t *testing.T) {
 	t.Run("stock profile skips patch by default", func(t *testing.T) {
 		p := &Profile{}
