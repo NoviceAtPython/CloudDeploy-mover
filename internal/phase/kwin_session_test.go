@@ -45,6 +45,13 @@ func happyKwin(unitPath string) KWinSession {
 		SystemctlShowMainPIDFn: func(context.Context, *Deps, string) (int, error) {
 			return 42, nil
 		},
+		// Without this stub the real `systemctl show -p SubState` runs on
+		// the CI runner and returns "dead", which corrupts KWin failure
+		// classification (live-VM tests assume a healthy active/running
+		// service whose only problem is a late socket/session).
+		SystemctlShowSubStateFn: func(context.Context, *Deps, string) string {
+			return "running"
+		},
 		JournalRecentFn: func(context.Context, *Deps, string, int) (string, error) {
 			return "kwin_core: starting up\nDP-1 enabled\n", nil
 		},

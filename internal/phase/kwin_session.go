@@ -485,6 +485,9 @@ type KWinSession struct {
 	// "no process". nil = runner.
 	SystemctlShowMainPIDFn func(ctx context.Context, deps *Deps, unit string) (int, error)
 
+	// SystemctlShowSubStateFn returns the unit SubState. nil = runner.
+	SystemctlShowSubStateFn func(ctx context.Context, deps *Deps, unit string) string
+
 	// JournalRecentFn returns the last N lines of the unit's journal.
 	// Used to scan for fatal signatures. nil = runner.
 	JournalRecentFn func(ctx context.Context, deps *Deps, unit string, lines int) (string, error)

@@ -579,6 +579,9 @@ func (p KWinSession) probeKWinAdoption(ctx context.Context, deps *Deps, unitName
 // "start-pre", "start-post", "failed", ...). Used by failure
 // classification to identify wedged-in-start-pre / start-post.
 func (p KWinSession) showSubState(ctx context.Context, deps *Deps, unitName string) string {
+	if p.SystemctlShowSubStateFn != nil {
+		return p.SystemctlShowSubStateFn(ctx, deps, unitName)
+	}
 	if deps == nil || deps.Runner == nil {
 		return ""
 	}
