@@ -12,7 +12,7 @@ The fix lives in three places, all reproducible from this repo:
    [`patches/kwin-clouddeploy-nvidia-private-hdr.patch`](../patches/kwin-clouddeploy-nvidia-private-hdr.patch).
 2. The Sunshine fork at `NoviceAtPython/Sunshine`, branch
    `codex/sunshine-pairing-diagnostics`, pinned in CloudDeploy to commit
-   **`ec7f60fb8a31042fe03a638bdafcdb3bfe096b87`** (see
+   **`8f02b1ce455ce4e7efa1b4031bb23764f2809cdb`** (see
    [`docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md`](final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md)
    for the full pin spec).
 3. Two runtime env vars CloudDeploy now auto-sets in
@@ -43,7 +43,7 @@ forced-headless virtual-output path that blob is intentionally
   `NV_HDR_STATIC_METADATA=blob 0`. Scanout is genuine HDR PQ; the
   standard metadata blob stays empty by design.
 
-The Sunshine fork's pinned commit `ec7f60fb`:
+The Sunshine fork's pinned commit `8f02b1ce`:
 
 1. Adds an NVIDIA-private-HDR detector in `src/platform/linux/kmsgrab.cpp`
    that walks the active CRTC + primary plane DRM props and accepts
@@ -109,7 +109,7 @@ systemctl cat sunshine-headless.service \
 
 # Sunshine fork pinned commit
 git -C /opt/sunshine-src rev-parse HEAD
-# Expected: ec7f60fb8a31042fe03a638bdafcdb3bfe096b87
+# Expected: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
 
 # Capabilities on both binaries
 getcap /usr/local/bin/sunshine-clouddeploy
@@ -138,7 +138,7 @@ Moonlight's overlay should read `AV1 10-bit HDR`.
 
 1. **`enabled=0` line present** — the Sunshine fork didn't synthesise.
    Check that the binary was actually built from
-   `ec7f60fb8a31042fe03a638bdafcdb3bfe096b87` (or newer with the same
+   `8f02b1ce455ce4e7efa1b4031bb23764f2809cdb` (or newer with the same
    synthesis logic):
    `git -C /opt/sunshine-src rev-parse HEAD`.
    Then verify the env vars reached the running process:

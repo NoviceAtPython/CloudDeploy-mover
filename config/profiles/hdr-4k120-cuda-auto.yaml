@@ -53,7 +53,7 @@ sunshine:
   source: fork
   fork_repo: https://github.com/NoviceAtPython/Sunshine
   fork_branch: codex/sunshine-pairing-diagnostics
-  fork_commit: ec7f60fb8a31042fe03a638bdafcdb3bfe096b87
+  fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
   encoder: nvenc
   capture: kms
   hevc_mode: 3

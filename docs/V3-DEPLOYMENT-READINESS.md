@@ -111,7 +111,7 @@ PROFILE=hdr-4k120-cuda-auto-unattended-optional
 | `cuda` | **v3 real** | mode=none default. |
 | `edid` | **v3 real (opt-in)** | Reboot-aware. |
 | `kwin_patch` | **v3 real** | Validates patch, builds/install patched KWin source packages, holds installed packages, writes marker. |
-| `sunshine_build` | **v3 real (Milestone 5)** | Pin commit `ec7f60fb`, build fork, install `/usr/local/bin/sunshine-clouddeploy`, set caps, install assets. |
+| `sunshine_build` | **v3 real (Milestone 5)** | Pin commit `8f02b1ce`, build fork, install `/usr/local/bin/sunshine-clouddeploy`, set caps, install assets. |
 | `sunshine_config` | **v3 real (Milestone 5)** | KMS/NVENC config without known-invalid keys + CSRF allowlist. |
 | `tailscale` | **v3 real (Milestone 5, optional)** | `tailscale up` only when `TAILSCALE_AUTHKEY` is present. |
 | `pipewire_audio` | **v3 real (Milestone 5)** | PipeWire/WirePlumber install + user-session audio visibility check. |

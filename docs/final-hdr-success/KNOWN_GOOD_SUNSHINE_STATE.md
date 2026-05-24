@@ -16,7 +16,7 @@ moving silently is enough to break HDR with no other symptom.
 | --- | --- |
 | Repo | `https://github.com/NoviceAtPython/Sunshine` |
 | Branch | `codex/sunshine-pairing-diagnostics` |
-| Commit (pinned) | `ec7f60fb8a31042fe03a638bdafcdb3bfe096b87` |
+| Commit (pinned) | `8f02b1ce455ce4e7efa1b4031bb23764f2809cdb` |
 | Optional permanent target | `clouddeploy-av1-hdr-success` (suggested; not auto-created) |
 
 CloudDeploy v3 hard-resets the Sunshine working tree to the profile
@@ -24,7 +24,7 @@ CloudDeploy v3 hard-resets the Sunshine working tree to the profile
 The current v3 profiles pin:
 
 ```bash
-sunshine.fork_commit: ec7f60fb8a31042fe03a638bdafcdb3bfe096b87
+sunshine.fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
 ```
 
 The older `CloudDeploy-wayland.sh` v2 script may still reference the

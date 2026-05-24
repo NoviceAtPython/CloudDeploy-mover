@@ -67,7 +67,7 @@ func TestHDRProfileSpec(t *testing.T) {
 	// fix (src/audio.cpp - skip HOST_AUDIO virtual-sink override when
 	// audio_sink is configured). Without that patch the live VM had
 	// silent Moonlight sessions even though stream_audio=enabled.
-	const wantCommit = "ec7f60fb8a31042fe03a638bdafcdb3bfe096b87"
+	const wantCommit = "8f02b1ce455ce4e7efa1b4031bb23764f2809cdb"
 	if p.Sunshine.ForkCommit != wantCommit {
 		t.Errorf("hdr-4k120: sunshine.fork_commit pin moved unexpectedly; got %q want %q", p.Sunshine.ForkCommit, wantCommit)
 	}
