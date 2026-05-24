@@ -309,6 +309,9 @@ func ensureDesktopShortcuts(ctx context.Context, deps *Deps, user string, deskto
 		if err != nil {
 			continue
 		}
+		if filepath.Base(name) == "steam.desktop" {
+			body = wrapSteamDesktopEntry(body)
+		}
 		dst := filepath.Join(desktopDir, filepath.Base(name))
 		if err := os.WriteFile(dst, body, 0o755); err != nil {
 			return installed, err
@@ -333,4 +336,41 @@ func readDesktopEntry(user, name string) ([]byte, error) {
 		}
 	}
 	return nil, fmt.Errorf("desktop entry %s not found", name)
+}
+
+func ensureSteamDesktopOverride(user string) error {
+	if strings.TrimSpace(user) == "" {
+		return fmt.Errorf("desktop user is empty")
+	}
+	body, err := readDesktopEntry(user, "steam.desktop")
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join("/home", user, ".local", "share", "applications")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, "steam.desktop"), wrapSteamDesktopEntry(body), 0o644)
+}
+
+const steamPlayStationEnvPrefix = "env PROTON_ENABLE_HIDRAW=1 SDL_JOYSTICK_HIDAPI_PS5=1 SDL_JOYSTICK_HIDAPI_PS4=1 "
+
+func wrapSteamDesktopEntry(body []byte) []byte {
+	lines := strings.Split(strings.ReplaceAll(string(body), "\r\n", "\n"), "\n")
+	for i, line := range lines {
+		switch {
+		case strings.HasPrefix(line, "Exec="):
+			cmd := strings.TrimPrefix(line, "Exec=")
+			if !strings.HasPrefix(cmd, steamPlayStationEnvPrefix) {
+				lines[i] = "Exec=" + steamPlayStationEnvPrefix + cmd
+			}
+		case strings.HasPrefix(line, "Name="):
+			lines[i] = "Name=Steam"
+		}
+	}
+	out := strings.Join(lines, "\n")
+	if !strings.HasSuffix(out, "\n") {
+		out += "\n"
+	}
+	return []byte(out)
 }

@@ -35,6 +35,19 @@ func TestGamingEnvironmentEnablesPlayStationHIDRaw(t *testing.T) {
 	}
 }
 
+func TestWrapSteamDesktopEntryAddsPlayStationEnv(t *testing.T) {
+	body := []byte("[Desktop Entry]\nName=Install Steam\nExec=/usr/games/steam %U\n")
+	got := string(wrapSteamDesktopEntry(body))
+	for _, want := range []string{
+		"Name=Steam",
+		"Exec=env PROTON_ENABLE_HIDRAW=1 SDL_JOYSTICK_HIDAPI_PS5=1 SDL_JOYSTICK_HIDAPI_PS4=1 /usr/games/steam %U",
+	} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("wrapped Steam desktop entry missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestDesktopPackages_RunMarksDone(t *testing.T) {
 	deps := newDeps(t, desktopProfile(), nil)
 	// apt.Transaction in tests runs in DryRun -> apt-get is a no-op.

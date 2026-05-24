@@ -1728,6 +1728,11 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 		} else {
 			details["desktop_shortcuts"] = shortcuts
 		}
+		if steamErr := ensureSteamDesktopOverride(desk.User); steamErr != nil {
+			details["steam_launcher_env_warning"] = steamErr.Error()
+		} else {
+			details["steam_launcher_env"] = true
+		}
 	}
 	deps.State.MarkDone(OptionalAppsName, details)
 	_ = deps.PersistState()
