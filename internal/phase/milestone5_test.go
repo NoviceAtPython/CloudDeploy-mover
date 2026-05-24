@@ -63,6 +63,7 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		"av1_mode = 3",
 		"hevc_mode = 3",
 		"gamepad = auto",
+		"ds5_inputtino_randomize_mac = false",
 		"motion_as_ds4 = false",
 		"touchpad_as_ds4 = false",
 		"ds4_back_as_touchpad_click = false",
@@ -113,6 +114,7 @@ func TestRenderSunshineConfig_HonorsExplicitGamepadMode(t *testing.T) {
 	body := renderSunshineConfig(cfg, "/dev/dri/card1", nil)
 	for _, want := range []string{
 		"gamepad = ds5",
+		"ds5_inputtino_randomize_mac = false",
 		"motion_as_ds4 = true",
 		"touchpad_as_ds4 = true",
 		"ds4_back_as_touchpad_click = true",
@@ -241,6 +243,18 @@ func TestUinputUdevRuleHasStaticNodeOption(t *testing.T) {
 	for _, bad := range []string{`MODE="0664"`, `MODE="0644"`, `GROUP="root"`} {
 		if strings.Contains(uinputUdevRuleBody, bad) {
 			t.Fatalf("uinput udev rule must not contain %q (regression): %s", bad, uinputUdevRuleBody)
+		}
+	}
+}
+
+func TestLegacyJoydevBlacklistDisablesBogusJsControllerPath(t *testing.T) {
+	for _, want := range []string{
+		"blacklist joydev",
+		"install joydev /bin/false",
+		"/dev/input/js0",
+	} {
+		if !strings.Contains(legacyJoydevModprobeBody, want) {
+			t.Fatalf("legacy joydev blacklist missing %q:\n%s", want, legacyJoydevModprobeBody)
 		}
 	}
 }

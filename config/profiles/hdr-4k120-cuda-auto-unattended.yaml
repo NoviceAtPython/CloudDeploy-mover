@@ -45,6 +45,7 @@ sunshine:
   # Linux PlayStation backend, Xbox stays Xbox, and unknown/third-party
   # pads fall back to Xbox. Keep capability heuristics disabled below.
   gamepad: auto
+  disable_legacy_joydev: true
   motion_as_ds4: false
   touchpad_as_ds4: false
   ds4_back_as_touchpad_click: false

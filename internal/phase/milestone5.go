@@ -738,6 +738,9 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	b.WriteString("hevc_mode = " + hevcMode + "\n")
 	b.WriteString("av1_mode = " + av1Mode + "\n")
 	b.WriteString("gamepad = " + gamepad + "\n")
+	if gamepad == "auto" || gamepad == "ds5" {
+		b.WriteString("ds5_inputtino_randomize_mac = false\n")
+	}
 	b.WriteString(fmt.Sprintf("motion_as_ds4 = %t\n", cfg.MotionAsDS4))
 	b.WriteString(fmt.Sprintf("touchpad_as_ds4 = %t\n", cfg.TouchpadAsDS4))
 	b.WriteString(fmt.Sprintf("ds4_back_as_touchpad_click = %t\n", cfg.DS4BackAsTouchpadClick))
@@ -1127,7 +1130,7 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 			details["egl_external_platform_json_error"] = eglGBMErr.Error()
 		}
 		_ = run(ctx, deps, "", []string{"ldconfig"}, time.Minute, true)
-		ensureUinput(ctx, deps, desk.User, details)
+		ensureUinput(ctx, deps, desk.User, cfg, details)
 		drm := selectedDRMDevice(deps)
 		if drm == "" {
 			drm = "/dev/dri/card1"
@@ -1185,9 +1188,39 @@ const uhidModulesLoadBody = `# Managed by clouddeploy v3 - load uhid at boot.
 uhid
 `
 
-func ensureUinput(ctx context.Context, deps *Deps, user string, details map[string]any) {
+const legacyJoydevModprobePath = "/etc/modprobe.d/clouddeploy-no-legacy-joydev.conf"
+
+const legacyJoydevModprobeBody = `# Managed by clouddeploy v3.
+# Sunshine/Moonlight uses evdev/uhid/uinput. The legacy joydev API can
+# expose Sunshine absolute mouse passthrough as /dev/input/js0, which
+# Steam may treat as a bogus controller.
+blacklist joydev
+install joydev /bin/false
+`
+
+func ensureUinput(ctx context.Context, deps *Deps, user string, cfg config.SunshineConfig, details map[string]any) {
 	_ = run(ctx, deps, "", []string{"modprobe", "uinput"}, time.Minute, true)
 	_ = run(ctx, deps, "", []string{"modprobe", "uhid"}, time.Minute, true)
+	if cfg.DisableLegacyJoydevValue() {
+		if !deps.DryRun {
+			if err := os.MkdirAll(filepath.Dir(legacyJoydevModprobePath), 0o755); err == nil {
+				_ = os.WriteFile(legacyJoydevModprobePath, []byte(legacyJoydevModprobeBody), 0o644)
+			}
+		}
+		unloadErr := run(ctx, deps, "", []string{"modprobe", "-r", "joydev"}, 15*time.Second, true)
+		details["legacy_joydev_disabled"] = true
+		details["legacy_joydev_blacklist"] = legacyJoydevModprobePath
+		details["legacy_joydev_unloaded"] = unloadErr == nil
+		if unloadErr != nil {
+			details["legacy_joydev_unload_warning"] = unloadErr.Error()
+		}
+		_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=input", "--action=change"}, time.Minute, true)
+	} else {
+		if !deps.DryRun {
+			_ = os.Remove(legacyJoydevModprobePath)
+		}
+		details["legacy_joydev_disabled"] = false
+	}
 	if !deps.DryRun {
 		if err := os.MkdirAll("/etc/modules-load.d", 0o755); err == nil {
 			_ = os.WriteFile("/etc/modules-load.d/uinput.conf", []byte(uinputModulesLoadBody), 0o644)

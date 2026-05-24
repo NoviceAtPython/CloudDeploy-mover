@@ -319,6 +319,7 @@ type SunshineConfig struct {
 	MotionAsDS4             bool     `yaml:"motion_as_ds4"`
 	TouchpadAsDS4           bool     `yaml:"touchpad_as_ds4"`
 	DS4BackAsTouchpadClick  bool     `yaml:"ds4_back_as_touchpad_click"`
+	DisableLegacyJoydev     *bool    `yaml:"disable_legacy_joydev"`
 	HevcMode                *int     `yaml:"hevc_mode"`
 	Av1Mode                 *int     `yaml:"av1_mode"`
 	ForceAV1HDR10           bool     `yaml:"force_av1_hdr10"`
@@ -437,16 +438,21 @@ func (s SunshineConfig) GamepadValue() string {
 		return DefaultSunshineGamepad
 	case "xbox", "xinput", "x360":
 		return "xone"
-	case "ps", "playstation":
-		return "auto"
-	case "ps4", "ds4", "dualshock", "dualshock4", "ps5", "dualsense", "dualshock5":
+	case "ps", "playstation", "ps4", "ds4", "dualshock", "dualshock4", "ps5", "dualsense", "dualshock5":
 		// Sunshine's Linux backend exposes Xbox One, DualSense, and
-		// Switch virtual devices. A physical DS4 reported by Moonlight
-		// as PlayStation is still handled by gamepad=auto; explicit PS
-		// aliases force the only Linux PlayStation virtual backend.
+		// Switch virtual devices. Explicit PS aliases force the only
+		// Linux PlayStation virtual backend; gamepad=auto remains the
+		// client-reported recognition path for mixed PS/Xbox setups.
 		return "ds5"
 	}
 	return mode
+}
+
+func (s SunshineConfig) DisableLegacyJoydevValue() bool {
+	if s.DisableLegacyJoydev == nil {
+		return true
+	}
+	return *s.DisableLegacyJoydev
 }
 
 // TailscaleConfig controls the optional network overlay phase.

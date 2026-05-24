@@ -265,6 +265,9 @@ func TestEffectiveSunshineGamepadDefaultsToMetadataOnlyAuto(t *testing.T) {
 	if got.Gamepad != "auto" {
 		t.Fatalf("default gamepad: got %q want auto", got.Gamepad)
 	}
+	if !got.DisableLegacyJoydevValue() {
+		t.Fatalf("legacy joydev should be disabled by default")
+	}
 	if got.MotionAsDS4 || got.TouchpadAsDS4 || got.DS4BackAsTouchpadClick {
 		t.Fatalf("auto gamepad must not enable capability heuristics by default: %+v", got)
 	}
@@ -275,8 +278,8 @@ func TestSunshineGamepadAliases(t *testing.T) {
 		"xbox":        "xone",
 		"xinput":      "xone",
 		"x360":        "xone",
-		"ps":          "auto",
-		"playstation": "auto",
+		"ps":          "ds5",
+		"playstation": "ds5",
 		"ds4":         "ds5",
 		"dualshock4":  "ds5",
 		"dualsense":   "ds5",
