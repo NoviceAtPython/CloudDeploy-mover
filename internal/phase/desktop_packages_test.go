@@ -2,6 +2,7 @@ package phase
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
@@ -18,6 +19,18 @@ func TestDesktopPackages_DefaultListIncludesCompositorAndKscreen(t *testing.T) {
 	for _, m := range must {
 		if !have[m] {
 			t.Errorf("DefaultDesktopPackages missing required entry %q", m)
+		}
+	}
+}
+
+func TestGamingEnvironmentEnablesPlayStationHIDRaw(t *testing.T) {
+	for _, want := range []string{
+		"PROTON_ENABLE_HIDRAW=1",
+		"SDL_JOYSTICK_HIDAPI_PS5=1",
+		"SDL_JOYSTICK_HIDAPI_PS4=1",
+	} {
+		if !strings.Contains(gamingEnvironmentBody, want) {
+			t.Fatalf("gaming environment missing %q:\n%s", want, gamingEnvironmentBody)
 		}
 	}
 }

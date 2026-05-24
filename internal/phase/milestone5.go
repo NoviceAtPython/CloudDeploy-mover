@@ -867,9 +867,10 @@ type PipeWireAudio struct{}
 func (PipeWireAudio) Name() string { return PipeWireAudioName }
 
 const (
-	clouddeployAudioServiceName = "clouddeploy-audio-virtual-devices.service"
-	clouddeployMicSinkName      = "clouddeploy-mic-sink"
-	clouddeployMicSourceName    = "clouddeploy-mic"
+	clouddeployAudioServiceName      = "clouddeploy-audio-virtual-devices.service"
+	clouddeployAudioRouteServiceName = "clouddeploy-audio-route-watch.service"
+	clouddeployMicSinkName           = "clouddeploy-mic-sink"
+	clouddeployMicSourceName         = "clouddeploy-mic"
 )
 
 var pipeWireAudioPackages = []string{
@@ -919,6 +920,8 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	if !deps.DryRun {
 		scriptPath := clouddeployAudioScriptPath(desk.User)
 		unitPath := clouddeployAudioServicePath(desk.User)
+		routeScriptPath := clouddeployAudioRouteScriptPath(desk.User)
+		routeUnitPath := clouddeployAudioRouteServicePath(desk.User)
 		if err := os.MkdirAll(filepath.Dir(scriptPath), 0o755); err != nil {
 			return failPhase(deps, PipeWireAudioName, details, "create audio script dir", err, true)
 		}
@@ -931,11 +934,19 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 		if err := os.WriteFile(unitPath, []byte(renderCloudDeployAudioUserService(scriptPath)), 0o644); err != nil {
 			return failPhase(deps, PipeWireAudioName, details, "write audio user service", err, true)
 		}
+		if err := os.WriteFile(routeScriptPath, []byte(renderCloudDeployAudioRouteScript(cfg)), 0o755); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "write audio route watcher script", err, true)
+		}
+		if err := os.WriteFile(routeUnitPath, []byte(renderCloudDeployAudioRouteUserService(routeScriptPath)), 0o644); err != nil {
+			return failPhase(deps, PipeWireAudioName, details, "write audio route watcher service", err, true)
+		}
 		for _, cmd := range [][]string{
 			{"chown", "-R", desk.User + ":" + desk.User, filepath.Dir(filepath.Dir(scriptPath))},
 			{"chown", "-R", desk.User + ":" + desk.User, filepath.Dir(filepath.Dir(unitPath))},
 			{"chmod", "0755", scriptPath},
 			{"chmod", "0644", unitPath},
+			{"chmod", "0755", routeScriptPath},
+			{"chmod", "0644", routeUnitPath},
 		} {
 			if err := run(ctx, deps, "", cmd, time.Minute, true); err != nil {
 				return failPhase(deps, PipeWireAudioName, details, "fix audio service ownership", err, true)
@@ -943,12 +954,18 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 		}
 		details["audio_script"] = scriptPath
 		details["audio_user_service"] = unitPath
+		details["audio_route_script"] = routeScriptPath
+		details["audio_route_user_service"] = routeUnitPath
 	}
 	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "daemon-reload"}, time.Minute)
 	if err := runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "enable", "--now", clouddeployAudioServiceName}, time.Minute); err != nil {
 		return failPhase(deps, PipeWireAudioName, details, "enable audio virtual devices", err, true)
 	}
 	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "restart", clouddeployAudioServiceName}, time.Minute)
+	if err := runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "enable", "--now", clouddeployAudioRouteServiceName}, time.Minute); err != nil {
+		return failPhase(deps, PipeWireAudioName, details, "enable audio route watcher", err, true)
+	}
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "restart", clouddeployAudioRouteServiceName}, time.Minute)
 	wpctl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"wpctl", "status"}, 15*time.Second)
 	pactl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sinks"}, 15*time.Second)
 	sources, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sources"}, 15*time.Second)
@@ -974,8 +991,16 @@ func clouddeployAudioScriptPath(user string) string {
 	return "/home/" + user + "/.local/bin/clouddeploy-audio-virtual-devices.sh"
 }
 
+func clouddeployAudioRouteScriptPath(user string) string {
+	return "/home/" + user + "/.local/bin/clouddeploy-audio-route-watch.sh"
+}
+
 func clouddeployAudioServicePath(user string) string {
 	return "/home/" + user + "/.config/systemd/user/" + clouddeployAudioServiceName
+}
+
+func clouddeployAudioRouteServicePath(user string) string {
+	return "/home/" + user + "/.config/systemd/user/" + clouddeployAudioRouteServiceName
 }
 
 func renderCloudDeployAudioUserService(scriptPath string) string {
@@ -988,6 +1013,23 @@ After=pipewire-pulse.service wireplumber.service
 Type=oneshot
 ExecStart=` + scriptPath + `
 RemainAfterExit=yes
+
+[Install]
+WantedBy=default.target
+`
+}
+
+func renderCloudDeployAudioRouteUserService(scriptPath string) string {
+	return `[Unit]
+Description=CloudDeploy route game audio to active Sunshine/PipeWire sink
+Wants=pipewire-pulse.service ` + clouddeployAudioServiceName + `
+After=pipewire-pulse.service ` + clouddeployAudioServiceName + `
+
+[Service]
+Type=simple
+ExecStart=` + scriptPath + `
+Restart=always
+RestartSec=1
 
 [Install]
 WantedBy=default.target
@@ -1058,6 +1100,44 @@ pactl set-default-source "$default_source"
 
 pactl list short sinks | grep -F "$SINK_NAME" >/dev/null
 pactl list short sources | grep -E "(^|[[:space:]])(${MIC_SOURCE_NAME}|${MIC_SINK_NAME}\.monitor)([[:space:]]|$)" >/dev/null
+`
+}
+
+func renderCloudDeployAudioRouteScript(cfg config.AudioConfig) string {
+	cfg = (&config.Profile{Audio: cfg}).EffectiveAudio()
+	return `#!/usr/bin/env bash
+set -u
+
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+CLOUDDEPLOY_SINK=` + shellQuote(cfg.VirtualSink) + `
+
+log() {
+  printf '[%s] %s\n' "$(date -Is)" "$*"
+}
+
+last_target=""
+while true; do
+  default_sink="$(pactl info 2>/dev/null | awk -F': ' '/Default Sink:/ {print $2; exit}')"
+  case "$default_sink" in
+    sink-sunshine-*|"$CLOUDDEPLOY_SINK") target="$default_sink" ;;
+    *) target="" ;;
+  esac
+
+  if [ -n "$target" ]; then
+    pactl list short sink-inputs 2>/dev/null | while IFS=$'\t' read -r id sink rest; do
+      [ -n "${id:-}" ] || continue
+      current="$(pactl list short sinks 2>/dev/null | awk -v idx="$sink" '$1 == idx {print $2; exit}')"
+      if [ "$current" != "$target" ]; then
+        pactl move-sink-input "$id" "$target" >/dev/null 2>&1 && log "moved sink-input $id from ${current:-$sink} to $target"
+      fi
+    done
+    if [ "$target" != "$last_target" ]; then
+      log "audio route target: $target"
+      last_target="$target"
+    fi
+  fi
+  sleep 1
+done
 `
 }
 

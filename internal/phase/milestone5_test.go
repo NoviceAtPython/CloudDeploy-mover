@@ -166,6 +166,32 @@ func TestRenderCloudDeployAudioUserService(t *testing.T) {
 	}
 }
 
+func TestRenderCloudDeployAudioRouteWatcher(t *testing.T) {
+	cfg := config.AudioConfig{VirtualSink: "clouddeploy-surround71"}
+	script := renderCloudDeployAudioRouteScript(cfg)
+	for _, want := range []string{
+		"CLOUDDEPLOY_SINK='clouddeploy-surround71'",
+		"sink-sunshine-*",
+		"pactl move-sink-input",
+	} {
+		if !strings.Contains(script, want) {
+			t.Fatalf("audio route watcher missing %q:\n%s", want, script)
+		}
+	}
+
+	unit := renderCloudDeployAudioRouteUserService("/home/cloudgamer/.local/bin/clouddeploy-audio-route-watch.sh")
+	for _, want := range []string{
+		"Description=CloudDeploy route game audio to active Sunshine/PipeWire sink",
+		"ExecStart=/home/cloudgamer/.local/bin/clouddeploy-audio-route-watch.sh",
+		"Restart=always",
+		"WantedBy=default.target",
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("audio route watcher service missing %q:\n%s", want, unit)
+		}
+	}
+}
+
 func TestTailscaleSkipsWithoutAuthKey(t *testing.T) {
 	deps := milestone5Deps(t)
 	t.Setenv("TAILSCALE_AUTHKEY", "")

@@ -175,6 +175,12 @@ func (p DesktopPackages) Run(ctx context.Context, deps *Deps) error {
 		} else {
 			details["desktop_shortcuts"] = shortcuts
 		}
+		if err := ensureGamingEnvironment(desk.User); err != nil {
+			log.Warn("phase desktop-packages: gaming environment install failed (non-fatal)", "err", err)
+			details["gaming_environment_warning"] = err.Error()
+		} else {
+			details["gaming_environment"] = true
+		}
 	}
 	deps.State.MarkDone(DesktopPackagesName, details)
 	_ = deps.PersistState()
@@ -261,6 +267,28 @@ func ensureCoreDesktopShortcuts(ctx context.Context, deps *Deps, user string) ([
 		"org.kde.konsole.desktop",
 		"google-chrome.desktop",
 	})
+}
+
+const gamingEnvironmentBody = `# Managed by CloudDeploy v3.
+# Native PlayStation controller path for Proton games that support DualSense.
+PROTON_ENABLE_HIDRAW=1
+SDL_JOYSTICK_HIDAPI_PS5=1
+SDL_JOYSTICK_HIDAPI_PS4=1
+`
+
+func ensureGamingEnvironment(user string) error {
+	if strings.TrimSpace(user) == "" {
+		return fmt.Errorf("desktop user is empty")
+	}
+	dir := filepath.Join("/home", user, ".config", "environment.d")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "90-clouddeploy-playstation-controller.conf")
+	if err := os.WriteFile(path, []byte(gamingEnvironmentBody), 0o644); err != nil {
+		return err
+	}
+	return nil
 }
 
 func ensureDesktopShortcuts(ctx context.Context, deps *Deps, user string, desktopFiles []string) ([]string, error) {
