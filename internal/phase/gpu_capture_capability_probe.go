@@ -185,7 +185,7 @@ func probeNVIDIAEGLRuntime(ctx context.Context, deps *Deps, user, uid string, de
 		}
 	}
 	details["egl_external_platform_json"] = strings.TrimSpace(gbmJSONs)
-	eglo, err := outputAsDesktop(ctx, deps, user, uid, []string{"bash", "-lc", "command -v eglinfo >/dev/null 2>&1 && timeout 15s eglinfo --display gbm 2>&1 || true"}, 20*time.Second)
+	eglo, err := outputAsDesktop(ctx, deps, user, uid, []string{"bash", "-lc", "command -v eglinfo >/dev/null 2>&1 && { timeout 15s eglinfo -p gbm -B 2>&1 || timeout 15s eglinfo --display gbm 2>&1 || true; } || true"}, 25*time.Second)
 	details["eglinfo_gbm_excerpt"] = lastLines(eglo, 20)
 	egloLower := strings.ToLower(eglo)
 	ok := strings.Contains(ldconfig, "libEGL_nvidia.so.0") && strings.TrimSpace(jsons) != "" && strings.Contains(egloLower, "nvidia") && !strings.Contains(egloLower, "llvmpipe")
@@ -249,11 +249,11 @@ func recordNVENCProbe(ctx context.Context, deps *Deps, details map[string]any, f
 }
 
 func probeFFmpegNVENCAsUser(ctx context.Context, deps *Deps, user, codec string) error {
-	filter := "testsrc2=size=128x72:rate=1"
+	filter := "testsrc2=size=640x360:rate=1"
 	encoder := "h264_nvenc"
 	extra := []string{}
 	if codec == "hevc-main10" {
-		filter = "testsrc2=size=128x72:rate=1,format=p010le"
+		filter = "testsrc2=size=640x360:rate=1,format=p010le"
 		encoder = "hevc_nvenc"
 		extra = []string{"-profile:v", "main10", "-pix_fmt", "p010le"}
 	}

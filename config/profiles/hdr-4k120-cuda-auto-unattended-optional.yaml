@@ -1,9 +1,10 @@
-# Autopilot variant of hdr-4k120-cuda-auto.
+# Autopilot 4K120 HDR profile with gaming/application extras enabled.
 #
-# Use for paid fresh-VM runs where clouddeployctl should install the
-# continuation service and reboot/resume without manual SSH steps.
+# This is the profile used for fresh cloud-gaming VM builds where the
+# base stream path should pass first and then install Steam/Proton,
+# launchers, Chrome, Discord, and supporting desktop shortcuts.
 
-profile: hdr-4k120-cuda-auto-unattended
+profile: hdr-4k120-cuda-auto-unattended-optional
 ubuntu_version: ""
 
 display:
@@ -18,9 +19,6 @@ nvidia:
   prefer_server: false
 
 cuda:
-  # Unattended paid-VM runs must keep going to EDID/KWin/Sunshine if
-  # the CUDA detector/smoke test degrades; NVENC validation happens
-  # later and is independent of the CUDA toolkit smoke binary.
   mode: optional
   method: apt
   selection_policy: latest-compatible
@@ -75,7 +73,7 @@ deploy:
   auto_reboot: true
   unattended: true
   max_auto_reboots: 8
-  optional_apps: false
+  optional_apps: true
 
   ubuntu_selection_policy: latest-compatible
   ubuntu_candidates:

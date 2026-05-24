@@ -158,6 +158,7 @@ Environment=XDG_RUNTIME_DIR=/run/user/{{ .UID }}
 # Validators (kscreen-doctor, qdbus) set WAYLAND_DISPLAY themselves
 # after wayland-0 has appeared; we deliberately do NOT set it here.
 Environment=DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/{{ .UID }}/bus
+Environment=DISPLAY=:0
 Environment=XDG_SESSION_TYPE=wayland
 Environment=XDG_SESSION_CLASS=user
 Environment=XDG_SESSION_DESKTOP=KDE
@@ -691,6 +692,10 @@ func UnitNameForSession(backend, compositorMode string) string {
 // `--socket wayland-0` pins the socket name so the validators can
 // connect deterministically; KWin would default to wayland-0 anyway,
 // but pinning makes the intent obvious in `ps` / `systemctl status`.
+// The Xwayland flags are load-bearing for Steam, Discord and many
+// Windows-game launchers under Proton. Without them, the compositor
+// and Sunshine can work while every X11 app exits with "Unable to
+// open display".
 func execStartFor(choice kwinUnitChoice, runtimeBin string) string {
 	if strings.TrimSpace(runtimeBin) == "" {
 		runtimeBin = "/usr/bin/kwin_wayland"
@@ -708,9 +713,9 @@ func execStartFor(choice kwinUnitChoice, runtimeBin string) string {
 	}
 	// kwin-only paths.
 	if choice.IsRealVT {
-		return runtimeBin + " --drm --socket wayland-0 --no-lockscreen"
+		return runtimeBin + " --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen"
 	}
-	return "/usr/bin/dbus-run-session -- " + runtimeBin + " --drm --socket wayland-0 --no-lockscreen"
+	return "/usr/bin/dbus-run-session -- " + runtimeBin + " --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen"
 }
 
 // RenderUnitText is exported so tests + doctor kwin can show the
@@ -725,7 +730,7 @@ func RenderUnitText(user, uid string) string {
 		Description:    "CloudDeploy KWin Wayland session (real-VT)",
 		CompositorMode: "kwin",
 		KwinDRMDevice:  "/dev/dri/card1",
-		ExecStart:      "/usr/bin/kwin_wayland --drm --socket wayland-0 --no-lockscreen",
+		ExecStart:      "/usr/bin/kwin_wayland --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen",
 	}
 	return in.apply(realVTUnitTemplate)
 }

@@ -452,6 +452,9 @@ func (t TailscaleConfig) EnabledValue() bool {
 type AudioConfig struct {
 	Enabled     *bool  `yaml:"enabled"`
 	VirtualSink string `yaml:"virtual_sink"`
+	Rate        int    `yaml:"rate"`
+	Channels    int    `yaml:"channels"`
+	ChannelMap  string `yaml:"channel_map"`
 }
 
 func (p *Profile) EffectiveAudio() AudioConfig {
@@ -464,7 +467,16 @@ func (p *Profile) EffectiveAudio() AudioConfig {
 		out.Enabled = &v
 	}
 	if strings.TrimSpace(out.VirtualSink) == "" {
-		out.VirtualSink = "clouddeploy-sink"
+		out.VirtualSink = "clouddeploy-surround71"
+	}
+	if out.Rate <= 0 {
+		out.Rate = 48000
+	}
+	if out.Channels <= 0 {
+		out.Channels = 8
+	}
+	if strings.TrimSpace(out.ChannelMap) == "" {
+		out.ChannelMap = "front-left,front-right,rear-left,rear-right,front-center,lfe,side-left,side-right"
 	}
 	return out
 }

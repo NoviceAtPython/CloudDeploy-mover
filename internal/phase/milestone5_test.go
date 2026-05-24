@@ -51,7 +51,9 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		"capture = kms",
 		"encoder = nvenc",
 		"adapter_name = /dev/dri/card1",
-		"stream_audio = disabled",
+		"stream_audio = enabled",
+		"audio_sink = clouddeploy-surround71",
+		"virtual_sink = clouddeploy-surround71",
 		// HDR-Main10 defaults: av1_mode=3 (AV1 Main + Main10),
 		// hevc_mode=3 (HEVC Main + Main10). Live-VM regression:
 		// av1_mode=2 + hevc_mode=0 left Moonlight without an HDR
@@ -129,6 +131,7 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 		"Environment=__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
 		"Environment=__EGL_EXTERNAL_PLATFORM_CONFIG_DIRS=/usr/share/egl/egl_external_platform.d",
 		"Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia",
+		"clouddeploy-plasmashell.service",
 	} {
 		if !strings.Contains(unit, want) {
 			t.Errorf("sunshine service missing %q:\n%s", want, unit)
@@ -144,9 +147,11 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 func TestUinputUdevRuleHasStaticNodeOption(t *testing.T) {
 	for _, want := range []string{
 		`KERNEL=="uinput"`,
+		`KERNEL=="uhid"`,
 		`MODE="0660"`,
 		`GROUP="input"`,
 		`OPTIONS+="static_node=uinput"`,
+		`OPTIONS+="static_node=uhid"`,
 	} {
 		if !strings.Contains(uinputUdevRuleBody, want) {
 			t.Fatalf("uinput udev rule missing %q:\n%s", want, uinputUdevRuleBody)

@@ -10,7 +10,7 @@ import (
 func TestDesktopPackages_DefaultListIncludesCompositorAndKscreen(t *testing.T) {
 	// Sanity: the default list MUST contain the packages downstream
 	// phases shell out to.
-	must := []string{"kwin-wayland", "kscreen", "dbus-user-session", "pipewire", "qt6-wayland", "drm-info"}
+	must := []string{"kwin-wayland", "xwayland", "plasma-desktop", "dolphin", "systemsettings", "kscreen", "dbus-user-session", "pipewire", "qt6-wayland", "drm-info"}
 	have := map[string]bool{}
 	for _, p := range DefaultDesktopPackages {
 		have[p] = true

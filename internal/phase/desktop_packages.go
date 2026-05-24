@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -29,9 +31,31 @@ const DesktopPackagesName = "desktop_packages"
 var DefaultDesktopPackages = []string{
 	// Wayland compositor + KWin runtime.
 	"kwin-wayland",
+	// Xwayland is required by Steam and many game launchers even
+	// though the compositor itself is Wayland.
+	"xwayland",
+	"xauth",
 	// Plasma 6 workspace bits (drag-in the right session pieces).
 	"plasma-workspace",
 	"plasma-desktop",
+	// Usable desktop surface and expected KDE apps. A headless
+	// streaming VM still needs a visible shell, file manager, terminal
+	// and settings app so Sunshine captures more than an empty KWin
+	// scene.
+	"systemsettings",
+	"dolphin",
+	"konsole",
+	"kate",
+	"plasma-systemmonitor",
+	"plasma-discover",
+	"plasma-pa",
+	"pavucontrol",
+	"kio-extras",
+	"ark",
+	"gwenview",
+	"okular",
+	"kde-spectacle",
+	"xdg-utils",
 	// kscreen-doctor lives in the kde-plasma-desktop family. We pull
 	// kscreen (the CLI) explicitly because drm_display_validate
 	// shells out to it.
@@ -137,6 +161,21 @@ func (p DesktopPackages) Run(ctx context.Context, deps *Deps) error {
 	} else {
 		details["apt_mark_manual"] = true
 	}
+	if !deps.DryRun {
+		if err := ensureKDEOpenHelpers(); err != nil {
+			log.Warn("phase desktop-packages: KDE open-helper shim install failed (non-fatal)", "err", err)
+			details["kde_open_helper_warning"] = err.Error()
+		} else {
+			details["kde_open_helpers"] = true
+		}
+		desk := deps.Profile.EffectiveDesktop()
+		if shortcuts, err := ensureCoreDesktopShortcuts(ctx, deps, desk.User); err != nil {
+			log.Warn("phase desktop-packages: desktop shortcut install failed (non-fatal)", "err", err)
+			details["desktop_shortcut_warning"] = err.Error()
+		} else {
+			details["desktop_shortcuts"] = shortcuts
+		}
+	}
 	deps.State.MarkDone(DesktopPackagesName, details)
 	_ = deps.PersistState()
 	log.Info("phase desktop-packages: done", "package_ct", len(pkgs))
@@ -190,4 +229,80 @@ func (p DesktopPackages) markManual(ctx context.Context, deps *Deps, pkgs []stri
 		return fmt.Errorf("apt-mark manual: %w", res.Err)
 	}
 	return nil
+}
+
+func ensureKDEOpenHelpers() error {
+	shims := map[string]string{
+		"/usr/local/bin/kfmclient": `#!/usr/bin/env bash
+exec /usr/bin/kde-open "$@"
+`,
+		"/usr/local/bin/kde-open6": `#!/usr/bin/env bash
+exec /usr/bin/kde-open "$@"
+`,
+		"/usr/local/bin/kioclient6": `#!/usr/bin/env bash
+exec /usr/bin/kioclient "$@"
+`,
+	}
+	if err := os.MkdirAll("/usr/local/bin", 0o755); err != nil {
+		return err
+	}
+	for path, body := range shims {
+		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func ensureCoreDesktopShortcuts(ctx context.Context, deps *Deps, user string) ([]string, error) {
+	return ensureDesktopShortcuts(ctx, deps, user, []string{
+		"org.kde.dolphin.desktop",
+		"systemsettings.desktop",
+		"org.kde.konsole.desktop",
+		"google-chrome.desktop",
+	})
+}
+
+func ensureDesktopShortcuts(ctx context.Context, deps *Deps, user string, desktopFiles []string) ([]string, error) {
+	if strings.TrimSpace(user) == "" {
+		return nil, fmt.Errorf("desktop user is empty")
+	}
+	desktopDir := filepath.Join("/home", user, "Desktop")
+	if err := os.MkdirAll(desktopDir, 0o755); err != nil {
+		return nil, err
+	}
+	var installed []string
+	for _, name := range desktopFiles {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		body, err := readDesktopEntry(user, name)
+		if err != nil {
+			continue
+		}
+		dst := filepath.Join(desktopDir, filepath.Base(name))
+		if err := os.WriteFile(dst, body, 0o755); err != nil {
+			return installed, err
+		}
+		installed = append(installed, filepath.Base(name))
+	}
+	if len(installed) > 0 {
+		_ = run(ctx, deps, "", []string{"chown", "-R", user + ":" + user, desktopDir}, time.Minute, true)
+	}
+	return installed, nil
+}
+
+func readDesktopEntry(user, name string) ([]byte, error) {
+	for _, dir := range []string{
+		"/usr/share/applications",
+		"/var/lib/flatpak/exports/share/applications",
+		filepath.Join("/home", user, ".local/share/flatpak/exports/share/applications"),
+	} {
+		body, err := os.ReadFile(filepath.Join(dir, name))
+		if err == nil {
+			return body, nil
+		}
+	}
+	return nil, fmt.Errorf("desktop entry %s not found", name)
 }

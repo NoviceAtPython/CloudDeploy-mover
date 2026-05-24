@@ -81,6 +81,7 @@ func TestRenderUnitText_RealVTKWinIsTheDefault(t *testing.T) {
 		"User=cloudgamer",
 		"XDG_RUNTIME_DIR=/run/user/1001",
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1001/bus",
+		"DISPLAY=:0",
 		"TTYPath=/dev/tty7",
 		"PAMName=login",
 		"TTYReset=yes",
@@ -96,7 +97,7 @@ func TestRenderUnitText_RealVTKWinIsTheDefault(t *testing.T) {
 		"GBM_BACKEND=nvidia-drm",
 		"__EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/10_nvidia.json",
 		"__GLX_VENDOR_LIBRARY_NAME=nvidia",
-		"kwin_wayland --drm --socket wayland-0 --no-lockscreen",
+		"kwin_wayland --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen",
 		// Validation-time restart policy + bounded start. Both are
 		// new in the post-2026-05-22 RTX-4090-debug rewrite.
 		"Restart=no",
@@ -179,7 +180,7 @@ func TestExecStartFor_PicksRightBinary(t *testing.T) {
 		mustHave string
 	}{
 		{"realvt", "plasma", "startplasma-wayland"},
-		{"realvt", "kwin", "kwin_wayland --drm --socket wayland-0 --no-lockscreen"},
+		{"realvt", "kwin", "kwin_wayland --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen"},
 		{"user", "kwin", "dbus-run-session"},
 		{"user", "plasma", "dbus-run-session"},
 		{"weston", "weston", "weston --backend=drm-backend.so"},
@@ -230,7 +231,7 @@ func TestKWinSession_HappyPath_RealVTKWin(t *testing.T) {
 	if !strings.Contains(string(body), "TTYPath=/dev/tty7") {
 		t.Errorf("real-VT unit body missing TTYPath=/dev/tty7:\n%s", string(body))
 	}
-	if !strings.Contains(string(body), "kwin_wayland --drm --socket wayland-0 --no-lockscreen") {
+	if !strings.Contains(string(body), "kwin_wayland --drm --xwayland --xwayland-display :0 --socket wayland-0 --no-lockscreen") {
 		t.Errorf("real-VT unit body missing direct KWin launch:\n%s", string(body))
 	}
 	if strings.Contains(string(body), "Environment=WAYLAND_DISPLAY=wayland-0") {

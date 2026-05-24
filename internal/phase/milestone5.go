@@ -658,7 +658,8 @@ func (p SunshineConfigPhase) Run(ctx context.Context, deps *Deps) error {
 		path = home + "/" + defaultSunshineConfRel
 	}
 	origins := sunshineCSRFOrigins(deps, tailscaleIPFromState(deps))
-	body := renderSunshineConfig(cfg, drm, origins)
+	audio := deps.Profile.EffectiveAudio()
+	body := renderSunshineConfigWithAudio(cfg, audio, drm, origins)
 	details := map[string]any{"path": path, "adapter_name": drm, "csrf_allowed_origins": origins, "uid": uid}
 	if !deps.DryRun {
 		configDir := filepath.Dir(path)
@@ -692,6 +693,10 @@ func (p SunshineConfigPhase) Run(ctx context.Context, deps *Deps) error {
 }
 
 func renderSunshineConfig(cfg config.SunshineConfig, drm string, origins []string) string {
+	return renderSunshineConfigWithAudio(cfg, config.AudioConfig{}, drm, origins)
+}
+
+func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.AudioConfig, drm string, origins []string) string {
 	encoder := strings.TrimSpace(cfg.Encoder)
 	if encoder == "" {
 		encoder = "nvenc"
@@ -714,7 +719,17 @@ func renderSunshineConfig(cfg config.SunshineConfig, drm string, origins []strin
 	b.WriteString("capture = " + capture + "\n")
 	b.WriteString("encoder = " + encoder + "\n")
 	b.WriteString("adapter_name = " + drm + "\n")
-	b.WriteString("stream_audio = disabled\n")
+	if audio.EnabledValue() {
+		sink := strings.TrimSpace(audio.VirtualSink)
+		if sink == "" {
+			sink = "clouddeploy-surround71"
+		}
+		b.WriteString("stream_audio = enabled\n")
+		b.WriteString("audio_sink = " + sink + "\n")
+		b.WriteString("virtual_sink = " + sink + "\n")
+	} else {
+		b.WriteString("stream_audio = disabled\n")
+	}
 	b.WriteString("address_family = ipv4\n")
 	b.WriteString("ping_timeout = 60000\n")
 	b.WriteString("hevc_mode = " + hevcMode + "\n")
@@ -847,7 +862,13 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	deps.State.MarkRunning(PipeWireAudioName)
 	_ = deps.PersistState()
 	cfg := deps.Profile.EffectiveAudio()
-	details := map[string]any{"enabled": cfg.EnabledValue(), "virtual_sink": cfg.VirtualSink}
+	details := map[string]any{
+		"enabled":      cfg.EnabledValue(),
+		"virtual_sink": cfg.VirtualSink,
+		"rate":         cfg.Rate,
+		"channels":     cfg.Channels,
+		"channel_map":  cfg.ChannelMap,
+	}
 	if !cfg.EnabledValue() {
 		deps.State.MarkSkipped(PipeWireAudioName, "audio.enabled=false")
 		deps.State.Get(PipeWireAudioName).Details = details
@@ -862,15 +883,31 @@ func (p PipeWireAudio) Run(ctx context.Context, deps *Deps) error {
 	desk := deps.Profile.EffectiveDesktop()
 	uid := uidFromState(deps)
 	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"systemctl", "--user", "enable", "--now", "pipewire", "pipewire-pulse", "wireplumber"}, time.Minute)
-	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "load-module", "module-null-sink", "sink_name=" + cfg.VirtualSink, "sink_properties=device.description=CloudDeploy"}, time.Minute)
+	unloadScript := "pactl list short modules | awk -v sink=" + shellQuote(cfg.VirtualSink) + " '$0 ~ \"sink_name=\" sink {print $1}' | xargs -r -n1 pactl unload-module"
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"bash", "-lc", unloadScript}, time.Minute)
+	loadArgs := []string{
+		"pactl", "load-module", "module-null-sink",
+		"sink_name=" + cfg.VirtualSink,
+		"sink_properties=device.description=CloudDeploy Surround 7.1",
+		"format=float32le",
+		fmt.Sprintf("rate=%d", cfg.Rate),
+		fmt.Sprintf("channels=%d", cfg.Channels),
+		"channel_map=" + cfg.ChannelMap,
+	}
+	_ = runAsDesktop(ctx, deps, desk.User, uid, loadArgs, time.Minute)
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "set-default-sink", cfg.VirtualSink}, 15*time.Second)
+	_ = runAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "set-default-source", cfg.VirtualSink + ".monitor"}, 15*time.Second)
 	wpctl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"wpctl", "status"}, 15*time.Second)
 	pactl, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sinks"}, 15*time.Second)
 	sources, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "list", "short", "sources"}, 15*time.Second)
 	info, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"pactl", "info"}, 15*time.Second)
+	detailScript := "pactl list sinks | awk -v sink=" + shellQuote(cfg.VirtualSink) + " '$0 == \"\\tName: \" sink || $0 == \"Name: \" sink {p=1} p && /Name:|Sample Specification:|Channel Map:|State:/{print} p && /Formats:/{exit}'"
+	sinkDetail, _ := outputAsDesktop(ctx, deps, desk.User, uid, []string{"bash", "-lc", detailScript}, 15*time.Second)
 	details["wpctl_seen"] = strings.TrimSpace(wpctl) != ""
 	details["pactl_sinks"] = strings.TrimSpace(pactl)
 	details["pactl_sources"] = strings.TrimSpace(sources)
 	details["pactl_info_excerpt"] = lastLines(info, 8)
+	details["virtual_sink_detail"] = strings.TrimSpace(sinkDetail)
 	details["virtual_sink_seen"] = strings.Contains(pactl, cfg.VirtualSink)
 	if !deps.DryRun && strings.TrimSpace(wpctl) == "" && strings.TrimSpace(pactl) == "" {
 		return failPhase(deps, PipeWireAudioName, details, "PipeWire validation failed", fmt.Errorf("neither wpctl nor pactl returned audio devices"), true)
@@ -895,11 +932,12 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	cfg := deps.Profile.EffectiveSunshine()
 	uid := uidFromState(deps)
 	conf := sunshineConfigPath(deps)
-	unit := renderSunshineService(desk.User, uid, cfg.InstallBin, conf, cfg)
+	compositorUnit := UnitNameForSession(desk.SessionBackend, desk.CompositorMode)
+	unit := renderSunshineServiceForCompositor(desk.User, uid, cfg.InstallBin, conf, cfg, compositorUnit)
 	backend := selectedCaptureBackend(deps)
 	details := map[string]any{
 		"selected_backend":          backend,
-		"compositor_service":        "kwin-realvt.service",
+		"compositor_service":        compositorUnit,
 		"sunshine_service":          "sunshine-headless.service",
 		"config":                    conf,
 		"hevc_mode":                 cfg.HevcModeValue(),
@@ -925,11 +963,14 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 		if err := run(ctx, deps, "", []string{"systemctl", "daemon-reload"}, time.Minute, true); err != nil {
 			return failPhase(deps, StreamingServicesName, details, "daemon-reload", err, true)
 		}
-		_ = run(ctx, deps, "", []string{"systemctl", "enable", "kwin-realvt.service", "sunshine-headless.service", "clouddeploy-watch-streaming.timer"}, time.Minute, true)
-		if err := ensureKWinReady(ctx, deps, desk.User, uid); err != nil {
+		_ = run(ctx, deps, "", []string{"systemctl", "enable", compositorUnit, "sunshine-headless.service", "clouddeploy-watch-streaming.timer"}, time.Minute, true)
+		if err := ensureKWinReady(ctx, deps, desk.User, uid, compositorUnit); err != nil {
 			return failPhase(deps, StreamingServicesName, details, "KWin not ready", err, true)
 		}
 		_ = run(ctx, deps, "", []string{forceKwinModeScriptPath}, 90*time.Second, true)
+		if err := ensurePlasmaShellService(ctx, deps, desk.User, uid, compositorUnit, details); err != nil {
+			return failPhase(deps, StreamingServicesName, details, "start Plasma shell", err, true)
+		}
 		// Guarantee NVIDIA EGL/GBM platform registration before Sunshine
 		// boots. The probe phase already writes these when it runs;
 		// streaming_services re-asserts them so a resumed deploy that
@@ -975,16 +1016,21 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
-// uinputUdevRuleBody is what /etc/udev/rules.d/70-clouddeploy-uinput.rules
-// gets every deploy. The `static_node=uinput` OPTION asks the kernel to
-// create /dev/uinput at module-load time even before the first hot-plug
-// event fires, so Sunshine sees the node the moment uinput is loaded.
-// MODE="0660", GROUP="input" + cloudgamer in the input group is the
-// permission triangle Moonlight controller/keyboard injection needs.
-const uinputUdevRuleBody = `# Managed by clouddeploy v3 (phase streaming_services).
-# Static-node + group permissions for Moonlight controller/keyboard input.
+// virtualInputUdevRuleBody is what
+// /etc/udev/rules.d/70-clouddeploy-virtual-input.rules gets every
+// deploy. uinput handles virtual keyboard/mouse; uhid is needed for
+// modern virtual HID/gamepad paths. MODE="0660", GROUP="input" +
+// cloudgamer in the input group is the permission triangle Moonlight
+// controller/keyboard injection needs.
+const virtualInputUdevRuleBody = `# Managed by clouddeploy v3 (phase streaming_services).
+# Static-node + group permissions for Moonlight controller/keyboard/gamepad input.
 KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
+KERNEL=="uhid", MODE="0660", GROUP="input", OPTIONS+="static_node=uhid"
 `
+
+// uinputUdevRuleBody is kept as a compatibility alias for tests and
+// older callers that referenced the old single-device rule name.
+const uinputUdevRuleBody = virtualInputUdevRuleBody
 
 // uinputModulesLoadBody persists uinput across reboots. Without this,
 // the live VM lost Moonlight input until someone manually modprobed
@@ -994,25 +1040,36 @@ const uinputModulesLoadBody = `# Managed by clouddeploy v3 - load uinput at boot
 uinput
 `
 
+const uhidModulesLoadBody = `# Managed by clouddeploy v3 - load uhid at boot.
+uhid
+`
+
 func ensureUinput(ctx context.Context, deps *Deps, user string, details map[string]any) {
 	_ = run(ctx, deps, "", []string{"modprobe", "uinput"}, time.Minute, true)
+	_ = run(ctx, deps, "", []string{"modprobe", "uhid"}, time.Minute, true)
 	if !deps.DryRun {
 		if err := os.MkdirAll("/etc/modules-load.d", 0o755); err == nil {
 			_ = os.WriteFile("/etc/modules-load.d/uinput.conf", []byte(uinputModulesLoadBody), 0o644)
+			_ = os.WriteFile("/etc/modules-load.d/uhid.conf", []byte(uhidModulesLoadBody), 0o644)
 			details["uinput_modules_load_conf"] = "/etc/modules-load.d/uinput.conf"
+			details["uhid_modules_load_conf"] = "/etc/modules-load.d/uhid.conf"
 		}
-		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-uinput.rules", []byte(uinputUdevRuleBody), 0o644)
+		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-virtual-input.rules", []byte(virtualInputUdevRuleBody), 0o644)
 	}
 	_ = run(ctx, deps, "", []string{"udevadm", "control", "--reload-rules"}, time.Minute, true)
 	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uinput"}, time.Minute, true)
+	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uhid"}, time.Minute, true)
 	// Add cloudgamer to the input group permanently. Without group
 	// membership the udev rule's MODE=0660,GROUP=input doesn't give
 	// the service user write access.
 	_ = run(ctx, deps, "", []string{"usermod", "-aG", "input", user}, 15*time.Second, true)
 	details["uinput_exists"] = pathExists("/dev/uinput")
+	details["uhid_exists"] = pathExists("/dev/uhid")
 	details["uinput_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"}, 15*time.Second, true) == nil
-	details["uinput_rule"] = "/etc/udev/rules.d/70-clouddeploy-uinput.rules"
-	details["uinput_static_node_option"] = strings.Contains(uinputUdevRuleBody, "static_node=uinput")
+	details["uhid_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uhid"}, 15*time.Second, true) == nil
+	details["virtual_input_rule"] = "/etc/udev/rules.d/70-clouddeploy-virtual-input.rules"
+	details["uinput_static_node_option"] = strings.Contains(virtualInputUdevRuleBody, "static_node=uinput")
+	details["uhid_static_node_option"] = strings.Contains(virtualInputUdevRuleBody, "static_node=uhid")
 	details["uinput_group_member"] = run(ctx, deps, "", []string{"bash", "-lc", "id -nG " + shellQuote(user) + " | tr ' ' '\\n' | grep -qx input"}, 15*time.Second, true) == nil
 }
 
@@ -1036,6 +1093,7 @@ func verifySunshineDeviceAccess(ctx context.Context, deps *Deps, user, drm strin
 		{label: "drm_card", path: drm, required: true},
 		{label: "drm_render", path: render, required: render != ""},
 		{label: "uinput", path: "/dev/uinput", required: false},
+		{label: "uhid", path: "/dev/uhid", required: false},
 	}
 	for _, item := range probes {
 		if item.path == "" {
@@ -1057,6 +1115,7 @@ func verifySunshineDeviceAccess(ctx context.Context, deps *Deps, user, drm strin
 	details["drm_device_access_ok"] = true
 	details["render_device_access_ok"] = render == "" || details["device_probe_drm_render_ok"] == true
 	details["uinput_access_ok"] = details["device_probe_uinput_ok"] == true
+	details["uhid_access_ok"] = details["device_probe_uhid_ok"] == true
 	return nil
 }
 
@@ -1336,8 +1395,28 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 		_ = deps.PersistState()
 		return nil
 	}
-	pkgs := []string{"flatpak", "steam-installer", "wine64", "winetricks"}
-	err := deps.APT.Run(ctx, func(tc *apt.TxContext) error { return tc.Install(ctx, pkgs) })
+	if err := run(ctx, deps, "", []string{"dpkg", "--add-architecture", "i386"}, time.Minute, true); err != nil {
+		details["i386_arch_warning"] = err.Error()
+	} else {
+		details["i386_arch_enabled"] = true
+	}
+	pkgs := []string{
+		"flatpak",
+		"steam-installer",
+		"steam-libs",
+		"steam-libs-i386",
+		"wine64",
+		"winetricks",
+		"libgl1:i386",
+		"libvulkan1:i386",
+		"mesa-vulkan-drivers:i386",
+	}
+	err := deps.APT.Run(ctx, func(tc *apt.TxContext) error {
+		if err := tc.Update(ctx); err != nil {
+			return err
+		}
+		return tc.Install(ctx, pkgs)
+	})
 	details["apt_packages"] = pkgs
 	if err != nil {
 		deps.State.MarkFailed(OptionalAppsName, "optional app apt install failed", err, false)
@@ -1345,18 +1424,122 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 		_ = deps.PersistState()
 		return nil
 	}
+	if glPkg := nvidiaGLI386Package(deps); glPkg != "" {
+		details["nvidia_i386_gl_package"] = glPkg
+		glErr := deps.APT.Run(ctx, func(tc *apt.TxContext) error { return tc.Install(ctx, []string{glPkg}) })
+		details["nvidia_i386_gl_installed"] = glErr == nil
+		if glErr != nil {
+			details["nvidia_i386_gl_warning"] = glErr.Error()
+		}
+	}
+	if chromeErr := ensureGoogleChrome(ctx, deps); chromeErr != nil {
+		details["google_chrome_warning"] = chromeErr.Error()
+	} else {
+		details["google_chrome_installed"] = true
+	}
 	_ = run(ctx, deps, "", []string{"flatpak", "remote-add", "--if-not-exists", "flathub", "https://flathub.org/repo/flathub.flatpakrepo"}, 2*time.Minute, false)
-	for _, app := range []string{"com.heroicgameslauncher.hgl", "net.lutris.Lutris", "com.usebottles.bottles", "org.prismlauncher.PrismLauncher", "net.davidotek.pupgui2"} {
-		_ = run(ctx, deps, "", []string{"flatpak", "install", "-y", "flathub", app}, 20*time.Minute, false)
+	flatpaks := []string{
+		"com.heroicgameslauncher.hgl",
+		"net.lutris.Lutris",
+		"com.usebottles.bottles",
+		"org.prismlauncher.PrismLauncher",
+		"net.davidotek.pupgui2",
+		"com.discordapp.Discord",
+	}
+	var flatpakFailures []string
+	for _, app := range flatpaks {
+		if err := run(ctx, deps, "", []string{"flatpak", "install", "-y", "--noninteractive", "flathub", app}, 20*time.Minute, false); err != nil {
+			flatpakFailures = append(flatpakFailures, app+": "+err.Error())
+		}
+	}
+	details["flatpak_apps"] = flatpaks
+	if len(flatpakFailures) > 0 {
+		details["flatpak_warnings"] = flatpakFailures
+	}
+	if !deps.DryRun {
+		desk := deps.Profile.EffectiveDesktop()
+		shortcuts, shortcutErr := ensureDesktopShortcuts(ctx, deps, desk.User, []string{
+			"google-chrome.desktop",
+			"steam.desktop",
+			"com.heroicgameslauncher.hgl.desktop",
+			"net.lutris.Lutris.desktop",
+			"com.usebottles.bottles.desktop",
+			"org.prismlauncher.PrismLauncher.desktop",
+			"net.davidotek.pupgui2.desktop",
+			"com.discordapp.Discord.desktop",
+			"discord.desktop",
+		})
+		if shortcutErr != nil {
+			details["desktop_shortcut_warning"] = shortcutErr.Error()
+		} else {
+			details["desktop_shortcuts"] = shortcuts
+		}
 	}
 	deps.State.MarkDone(OptionalAppsName, details)
 	_ = deps.PersistState()
 	return nil
 }
 
+func nvidiaGLI386Package(deps *Deps) string {
+	major := "580"
+	if deps != nil && deps.Profile != nil {
+		major = effectiveMajor(deps.Profile.NVIDIA.DriverMajor)
+	}
+	family := ""
+	if deps != nil && deps.State != nil {
+		if ph := deps.State.Get(NvidiaDriverName); ph != nil && ph.Details != nil {
+			if v, ok := ph.Details["package_family"].(string); ok {
+				family = strings.TrimSpace(v)
+			}
+		}
+	}
+	switch family {
+	case "server", "server-open":
+		return "libnvidia-gl-" + major + "-server:i386"
+	case "non-server", "non-server-open":
+		return "libnvidia-gl-" + major + ":i386"
+	default:
+		return ""
+	}
+}
+
+func ensureGoogleChrome(ctx context.Context, deps *Deps) error {
+	if deps.DryRun {
+		return nil
+	}
+	if run(ctx, deps, "", []string{"dpkg-query", "-W", "-f=${Status}", "google-chrome-stable"}, 15*time.Second, false) == nil {
+		return nil
+	}
+	if err := deps.APT.Run(ctx, func(tc *apt.TxContext) error {
+		return tc.Install(ctx, []string{"ca-certificates", "curl", "gnupg"})
+	}); err != nil {
+		return err
+	}
+	if err := run(ctx, deps, "", []string{"bash", "-lc", "install -d -m 0755 /etc/apt/keyrings && curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /etc/apt/keyrings/google-linux-signing-key.gpg.tmp && mv /etc/apt/keyrings/google-linux-signing-key.gpg.tmp /etc/apt/keyrings/google-linux-signing-key.gpg && chmod 0644 /etc/apt/keyrings/google-linux-signing-key.gpg"}, 2*time.Minute, true); err != nil {
+		return err
+	}
+	src := "deb [arch=amd64 signed-by=/etc/apt/keyrings/google-linux-signing-key.gpg] https://dl.google.com/linux/chrome/deb/ stable main\n"
+	if err := os.WriteFile("/etc/apt/sources.list.d/google-chrome.list", []byte(src), 0o644); err != nil {
+		return err
+	}
+	return deps.APT.Run(ctx, func(tc *apt.TxContext) error {
+		if err := tc.Update(ctx); err != nil {
+			return err
+		}
+		return tc.Install(ctx, []string{"google-chrome-stable"})
+	})
+}
+
 func renderSunshineService(user, uid, bin, conf string, cfg config.SunshineConfig) string {
+	return renderSunshineServiceForCompositor(user, uid, bin, conf, cfg, "kwin-realvt.service")
+}
+
+func renderSunshineServiceForCompositor(user, uid, bin, conf string, cfg config.SunshineConfig, compositorService string) string {
 	if bin == "" {
 		bin = "/usr/local/bin/sunshine-clouddeploy"
+	}
+	if strings.TrimSpace(compositorService) == "" {
+		compositorService = "kwin-realvt.service"
 	}
 	// Gate the HDR-force env vars on the profile.
 	//
@@ -1380,8 +1563,8 @@ func renderSunshineService(user, uid, bin, conf string, cfg config.SunshineConfi
 	}
 	return fmt.Sprintf(`[Unit]
 Description=CloudDeploy Sunshine Wayland/KMS/NVENC
-Wants=network-online.target kwin-realvt.service
-After=network-online.target kwin-realvt.service
+Wants=network-online.target %s clouddeploy-plasmashell.service
+After=network-online.target %s clouddeploy-plasmashell.service
 
 [Service]
 User=%s
@@ -1422,7 +1605,104 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-`, user, user, user, user, user, user, uid, uid, hdrEnvBlock, bin, conf)
+`, compositorService, compositorService, user, user, user, user, user, user, uid, uid, hdrEnvBlock, bin, conf)
+}
+
+func ensurePlasmaShellService(ctx context.Context, deps *Deps, user, uid, compositorService string, details map[string]any) error {
+	if strings.TrimSpace(user) == "" || strings.TrimSpace(uid) == "" {
+		return fmt.Errorf("missing desktop user/uid for plasmashell")
+	}
+	if strings.TrimSpace(compositorService) == "" {
+		compositorService = "kwin-realvt.service"
+	}
+	if !pathExists("/usr/bin/plasmashell") {
+		details["plasmashell_available"] = false
+		return nil
+	}
+	details["plasmashell_available"] = true
+	if deps.DryRun {
+		details["plasmashell_service"] = "dry-run"
+		return nil
+	}
+	helper := renderPlasmaShellHelper(user, uid)
+	service := renderPlasmaShellService(uid, compositorService)
+	if err := os.WriteFile("/usr/local/bin/clouddeploy-start-plasmashell", []byte(helper), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile("/etc/systemd/system/clouddeploy-plasmashell.service", []byte(service), 0o644); err != nil {
+		return err
+	}
+	if err := run(ctx, deps, "", []string{"systemctl", "daemon-reload"}, time.Minute, true); err != nil {
+		return err
+	}
+	if err := run(ctx, deps, "", []string{"systemctl", "enable", "--now", "clouddeploy-plasmashell.service"}, 2*time.Minute, true); err != nil {
+		return err
+	}
+	details["plasmashell_service"] = "clouddeploy-plasmashell.service"
+	details["plasmashell_running"] = runAsDesktop(ctx, deps, user, uid, []string{"systemctl", "--user", "is-active", "--quiet", "plasma-plasmashell.service"}, 15*time.Second) == nil
+	return nil
+}
+
+func renderPlasmaShellHelper(user, uid string) string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
+set -euo pipefail
+user=%s
+uid=%s
+runtime=/run/user/${uid}
+mkdir -p "${runtime}"
+chown "${user}:${user}" "${runtime}"
+chmod 0700 "${runtime}"
+systemctl start "user@${uid}.service"
+for _ in $(seq 1 45); do
+  if [ -S "${runtime}/bus" ] && [ -S "${runtime}/wayland-0" ]; then
+    break
+  fi
+  sleep 1
+done
+if [ ! -S "${runtime}/bus" ] || [ ! -S "${runtime}/wayland-0" ]; then
+  echo "clouddeploy-start-plasmashell: user bus or wayland-0 missing under ${runtime}" >&2
+  exit 1
+fi
+env_common=(
+  "HOME=/home/${user}"
+  "USER=${user}"
+  "LOGNAME=${user}"
+  "XDG_RUNTIME_DIR=${runtime}"
+  "DBUS_SESSION_BUS_ADDRESS=unix:path=${runtime}/bus"
+  "WAYLAND_DISPLAY=wayland-0"
+  "DISPLAY=:0"
+  "QT_QPA_PLATFORM=wayland"
+  "XDG_CURRENT_DESKTOP=KDE"
+  "XDG_SESSION_TYPE=wayland"
+  "XDG_SESSION_DESKTOP=KDE"
+  "KDE_FULL_SESSION=true"
+  "XDG_MENU_PREFIX=plasma-"
+  "XDG_DATA_DIRS=/home/${user}/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/"
+)
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user import-environment DISPLAY WAYLAND_DISPLAY QT_QPA_PLATFORM XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP KDE_FULL_SESSION XDG_MENU_PREFIX XDG_DATA_DIRS XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user restart xdg-desktop-portal.service || true
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user start plasma-plasmashell.service
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user is-active --quiet plasma-plasmashell.service
+`, shellQuote(user), shellQuote(uid))
+}
+
+func renderPlasmaShellService(uid, compositorService string) string {
+	if strings.TrimSpace(compositorService) == "" {
+		compositorService = "kwin-realvt.service"
+	}
+	return fmt.Sprintf(`[Unit]
+Description=CloudDeploy visible Plasma shell for Sunshine capture
+After=%s user@%s.service
+Wants=%s user@%s.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/clouddeploy-start-plasmashell
+
+[Install]
+WantedBy=multi-user.target
+`, compositorService, uid, compositorService, uid)
 }
 
 func writeResetStreamingHelper(deps *Deps, bin, conf string) error {
@@ -1430,13 +1710,14 @@ func writeResetStreamingHelper(deps *Deps, bin, conf string) error {
 	_ = conf
 	body := `#!/usr/bin/env bash
 set -euo pipefail
-systemctl stop sunshine-headless.service kwin-realvt.service 2>/dev/null || true
+systemctl stop sunshine-headless.service clouddeploy-plasmashell.service kwin-realvt.service 2>/dev/null || true
 rm -f /run/user/*/wayland-0 /run/user/*/wayland-0.lock 2>/dev/null || true
 systemctl start --no-block kwin-realvt.service
 sleep 8
 /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
+systemctl restart clouddeploy-plasmashell.service || true
 systemctl restart sunshine-headless.service
-systemctl --no-pager --full status kwin-realvt.service sunshine-headless.service
+systemctl --no-pager --full status kwin-realvt.service clouddeploy-plasmashell.service sunshine-headless.service
 `
 	return os.WriteFile("/usr/local/bin/clouddeploy-reset-streaming", []byte(body), 0o755)
 }
@@ -1793,8 +2074,11 @@ func sunshineCredentialsEvidence(home string) bool {
 	return err == nil && len(entries) > 0
 }
 
-func ensureKWinReady(ctx context.Context, deps *Deps, user, uid string) error {
-	if err := run(ctx, deps, "", []string{"systemctl", "is-active", "--quiet", "kwin-realvt.service"}, 15*time.Second, false); err != nil {
+func ensureKWinReady(ctx context.Context, deps *Deps, user, uid, unit string) error {
+	if strings.TrimSpace(unit) == "" {
+		unit = "kwin-realvt.service"
+	}
+	if err := run(ctx, deps, "", []string{"systemctl", "is-active", "--quiet", unit}, 15*time.Second, false); err != nil {
 		return err
 	}
 	qdbus, qerr := resolveQDBus()
@@ -1941,23 +2225,39 @@ func sunshineCSRFOrigins(deps *Deps, ips ...string) []string {
 
 func runAsDesktop(ctx context.Context, deps *Deps, user, uid string, argv []string, timeout time.Duration) error {
 	args := append([]string{"runuser", "-u", user, "--", "env",
+		"HOME=/home/" + user,
+		"USER=" + user,
+		"LOGNAME=" + user,
 		"XDG_RUNTIME_DIR=/run/user/" + uid,
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
 		"WAYLAND_DISPLAY=wayland-0",
+		"DISPLAY=:0",
 		"QT_QPA_PLATFORM=wayland",
 		"XDG_CURRENT_DESKTOP=KDE",
-		"XDG_SESSION_TYPE=wayland"}, argv...)
+		"XDG_SESSION_TYPE=wayland",
+		"XDG_SESSION_DESKTOP=KDE",
+		"KDE_FULL_SESSION=true",
+		"XDG_MENU_PREFIX=plasma-",
+		"XDG_DATA_DIRS=/home/" + user + "/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/"}, argv...)
 	return run(ctx, deps, "", args, timeout, true)
 }
 
 func outputAsDesktop(ctx context.Context, deps *Deps, user, uid string, argv []string, timeout time.Duration) (string, error) {
 	args := append([]string{"runuser", "-u", user, "--", "env",
+		"HOME=/home/" + user,
+		"USER=" + user,
+		"LOGNAME=" + user,
 		"XDG_RUNTIME_DIR=/run/user/" + uid,
 		"DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/" + uid + "/bus",
 		"WAYLAND_DISPLAY=wayland-0",
+		"DISPLAY=:0",
 		"QT_QPA_PLATFORM=wayland",
 		"XDG_CURRENT_DESKTOP=KDE",
-		"XDG_SESSION_TYPE=wayland"}, argv...)
+		"XDG_SESSION_TYPE=wayland",
+		"XDG_SESSION_DESKTOP=KDE",
+		"KDE_FULL_SESSION=true",
+		"XDG_MENU_PREFIX=plasma-",
+		"XDG_DATA_DIRS=/home/" + user + "/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/"}, argv...)
 	return output(ctx, deps, "", args, timeout, true)
 }
 
