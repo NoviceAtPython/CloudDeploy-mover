@@ -52,8 +52,15 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 		"encoder = nvenc",
 		"adapter_name = /dev/dri/card1",
 		"stream_audio = enabled",
-		"audio_sink =",
-		"virtual_sink =",
+		// audio_sink must point at the persistent CloudDeploy 7.1 PipeWire
+		// sink so Sunshine captures the same monitor that all desktop apps
+		// are playing into. This depends on the Sunshine fork patch in
+		// audio.cpp that skips the HOST_AUDIO-based virtual-sink override
+		// when audio_sink is configured; with the patch, Sunshine no
+		// longer switches the default sink mid-session and audio routes
+		// stay coherent.
+		"audio_sink = clouddeploy-surround71",
+		"virtual_sink = clouddeploy-surround71",
 		// HDR-Main10 defaults: av1_mode=3 (AV1 Main + Main10),
 		// hevc_mode=3 (HEVC Main + Main10). Live-VM regression:
 		// av1_mode=2 + hevc_mode=0 left Moonlight without an HDR
@@ -82,9 +89,13 @@ func TestRenderSunshineConfigAvoidsKnownInvalidKeys(t *testing.T) {
 	if strings.Contains(body, "hevc_mode = 0") {
 		t.Errorf("sunshine.conf still uses the buggy hevc_mode=0 auto-probe default:\n%s", body)
 	}
-	for _, bad := range []string{"audio_sink = clouddeploy-surround71", "virtual_sink = clouddeploy-surround71"} {
+	// Empty audio_sink/virtual_sink was the previous (broken) workaround
+	// that relied on a userspace audio route watcher to chase Sunshine's
+	// per-session default sink. The patched Sunshine fork lets us pin
+	// audio_sink instead, so the watcher is no longer load-bearing.
+	for _, bad := range []string{"\naudio_sink =\n", "\nvirtual_sink =\n", "\naudio_sink = \n", "\nvirtual_sink = \n"} {
 		if strings.Contains(body, bad) {
-			t.Errorf("sunshine.conf pins the CloudDeploy bootstrap sink and can split playback/capture again:\n%s", body)
+			t.Errorf("sunshine.conf leaves audio_sink/virtual_sink empty - patched Sunshine needs an explicit sink to bypass HOST_AUDIO override:\n%s", body)
 		}
 	}
 }
@@ -269,6 +280,25 @@ func TestUinputUdevRuleHasStaticNodeOption(t *testing.T) {
 	for _, bad := range []string{`MODE="0664"`, `MODE="0644"`, `GROUP="root"`} {
 		if strings.Contains(uinputUdevRuleBody, bad) {
 			t.Fatalf("uinput udev rule must not contain %q (regression): %s", bad, uinputUdevRuleBody)
+		}
+	}
+}
+
+func TestVirtualInputUdevRuleGrantsHidrawAccessForHIDAPI(t *testing.T) {
+	// The hidraw rule is what makes SDL_JOYSTICK_HIDAPI_PS5/PS4 and
+	// PROTON_ENABLE_HIDRAW=1 actually do something. Without 0660
+	// root:input on /dev/hidraw*, Steam/Proton silently fall back to
+	// evdev-only handling for the inputtino virtual DualSense and
+	// buttons map incorrectly (bumpers fire on their own, face buttons
+	// swap). This was the missing piece behind yesterday's "wacky
+	// controller" symptom.
+	for _, want := range []string{
+		`KERNEL=="hidraw*"`,
+		`SUBSYSTEM=="hidraw"`,
+		`ATTRS{idVendor}=="054c"`,
+	} {
+		if !strings.Contains(virtualInputUdevRuleBody, want) {
+			t.Fatalf("virtual-input udev rule missing hidraw grant %q:\n%s", want, virtualInputUdevRuleBody)
 		}
 	}
 }

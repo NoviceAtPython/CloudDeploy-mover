@@ -63,7 +63,11 @@ func TestHDRProfileSpec(t *testing.T) {
 	if strings.ToLower(p.CUDA.Mode) != "none" {
 		t.Errorf("hdr-4k120: cuda.mode must be 'none' (minimal HDR profile); got %q", p.CUDA.Mode)
 	}
-	const wantCommit = "464bccf1b6e33bf35138136c6138fd9851e6d906"
+	// Pin bumped 2026-05-24 to pick up the Sunshine audio_sink override
+	// fix (src/audio.cpp - skip HOST_AUDIO virtual-sink override when
+	// audio_sink is configured). Without that patch the live VM had
+	// silent Moonlight sessions even though stream_audio=enabled.
+	const wantCommit = "ec7f60fb8a31042fe03a638bdafcdb3bfe096b87"
 	if p.Sunshine.ForkCommit != wantCommit {
 		t.Errorf("hdr-4k120: sunshine.fork_commit pin moved unexpectedly; got %q want %q", p.Sunshine.ForkCommit, wantCommit)
 	}

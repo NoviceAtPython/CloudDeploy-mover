@@ -721,15 +721,22 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	b.WriteString("encoder = " + encoder + "\n")
 	b.WriteString("adapter_name = " + drm + "\n")
 	if audio.EnabledValue() {
+		sink := strings.TrimSpace(audio.VirtualSink)
+		if sink == "" {
+			sink = "clouddeploy-surround71"
+		}
+		// Pin audio_sink to the persistent CloudDeploy PipeWire sink so
+		// Sunshine captures from a monitor that always exists and that
+		// every desktop app is already targeting (it is also the default
+		// sink). This relies on the Sunshine fork patch that skips the
+		// HOST_AUDIO-based override of audio_sink for the Linux backend;
+		// without that patch Sunshine would still switch the default to a
+		// hardcoded sink-sunshine-* null sink mid-session and capture from
+		// a sink that nothing is playing into. The fork commit is pinned
+		// in config/profiles/*.yaml.
 		b.WriteString("stream_audio = enabled\n")
-		// Leave both sink selectors blank. Sunshine creates a
-		// per-session sink-sunshine-surround71 device when Moonlight
-		// negotiates 7.1 audio, switches the desktop default to it, and
-		// records that monitor. Pinning audio_sink/virtual_sink to the
-		// CloudDeploy bootstrap sink caused live sessions to play into
-		// one sink while Sunshine captured another.
-		b.WriteString("audio_sink =\n")
-		b.WriteString("virtual_sink =\n")
+		b.WriteString("audio_sink = " + sink + "\n")
+		b.WriteString("virtual_sink = " + sink + "\n")
 	} else {
 		b.WriteString("stream_audio = disabled\n")
 	}
@@ -1242,14 +1249,29 @@ func (p StreamingServices) Run(ctx context.Context, deps *Deps) error {
 
 // virtualInputUdevRuleBody is what
 // /etc/udev/rules.d/70-clouddeploy-virtual-input.rules gets every
-// deploy. uinput handles virtual keyboard/mouse; uhid is needed for
-// modern virtual HID/gamepad paths. MODE="0660", GROUP="input" +
-// cloudgamer in the input group is the permission triangle Moonlight
-// controller/keyboard injection needs.
+// deploy.
+//
+// uinput  - virtual keyboard/mouse and Xbox/Switch virtual gamepads (inputtino)
+// uhid    - modern virtual HID gamepad path (PS5 DualSense via inputtino)
+// hidraw* - SDL_JOYSTICK_HIDAPI_PS5/PS4 and Proton's PROTON_ENABLE_HIDRAW=1
+//
+// The hidraw rule is the piece that was missing. When inputtino creates
+// the virtual DualSense via /dev/uhid the kernel registers an evdev
+// node AND a hidraw node. SDL/Steam/Proton need hidraw access for the
+// native PlayStation features (adaptive triggers, touchpad, motion,
+// RGB LED). Without 0660 root:input on hidraw, Steam Input and SDL
+// silently fall back to evdev-only handling and the button mapping
+// gets garbled - bumpers fire on their own, face buttons swap, etc.
+// MODE="0660", GROUP="input" + cloudgamer in the input group is the
+// permission triangle Moonlight controller/keyboard injection needs.
 const virtualInputUdevRuleBody = `# Managed by clouddeploy v3 (phase streaming_services).
 # Static-node + group permissions for Moonlight controller/keyboard/gamepad input.
 KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
-KERNEL=="uhid", MODE="0660", GROUP="input", OPTIONS+="static_node=uhid"
+KERNEL=="uhid",   MODE="0660", GROUP="input", OPTIONS+="static_node=uhid"
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", MODE="0660", GROUP="input"
+# Sony controllers (DualSense 054c:0ce6, DualShock 4, etc.) explicit rule
+# in case the generic hidraw match runs after a vendor-specific default.
+KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="054c", MODE="0660", GROUP="input"
 `
 
 // uinputUdevRuleBody is kept as a compatibility alias for tests and
@@ -1309,10 +1331,14 @@ func ensureUinput(ctx context.Context, deps *Deps, user string, cfg config.Sunsh
 			details["uhid_modules_load_conf"] = "/etc/modules-load.d/uhid.conf"
 		}
 		_ = os.WriteFile("/etc/udev/rules.d/70-clouddeploy-virtual-input.rules", []byte(virtualInputUdevRuleBody), 0o644)
+		// Remove the obsolete uinput-only rule file from older deploys; the
+		// virtual-input rule above replaces it.
+		_ = os.Remove("/etc/udev/rules.d/70-clouddeploy-uinput.rules")
 	}
 	_ = run(ctx, deps, "", []string{"udevadm", "control", "--reload-rules"}, time.Minute, true)
 	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uinput"}, time.Minute, true)
 	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uhid"}, time.Minute, true)
+	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=hidraw"}, time.Minute, true)
 	// Add cloudgamer to the input group permanently. Without group
 	// membership the udev rule's MODE=0660,GROUP=input doesn't give
 	// the service user write access.
@@ -1324,6 +1350,7 @@ func ensureUinput(ctx context.Context, deps *Deps, user string, cfg config.Sunsh
 	details["virtual_input_rule"] = "/etc/udev/rules.d/70-clouddeploy-virtual-input.rules"
 	details["uinput_static_node_option"] = strings.Contains(virtualInputUdevRuleBody, "static_node=uinput")
 	details["uhid_static_node_option"] = strings.Contains(virtualInputUdevRuleBody, "static_node=uhid")
+	details["hidraw_rule_present"] = strings.Contains(virtualInputUdevRuleBody, "KERNEL==\"hidraw*\"")
 	details["uinput_group_member"] = run(ctx, deps, "", []string{"bash", "-lc", "id -nG " + shellQuote(user) + " | tr ' ' '\\n' | grep -qx input"}, 15*time.Second, true) == nil
 }
 
