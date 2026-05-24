@@ -9,7 +9,56 @@ if LC_ALL=C grep -q $'\r' "$0" 2>/dev/null; then
 fi
 
 set -Eeuo pipefail
+
+# Non-interactive defaults applied globally to every apt / dpkg / debconf
+# child. NEEDRESTART_MODE=a tells needrestart to auto-restart services
+# instead of prompting (which would hang an unattended deploy); _SUSPEND=1
+# tells it to skip its own kernel/services check entirely during package
+# operations. DEBIAN_PRIORITY=critical suppresses lower-severity prompts.
 export DEBIAN_FRONTEND=noninteractive
+export DEBIAN_PRIORITY=critical
+export NEEDRESTART_MODE=a
+export NEEDRESTART_SUSPEND=1
+
+# Source a root-owned, mode-600 user env file BEFORE any default is
+# evaluated, so secrets (SUNSHINE_PASS, TAILSCALE_AUTHKEY) and feature
+# toggles (ENABLE_HDR, CLOUDDEPLOY_AUTO_DIST_UPGRADE, etc.) can be set
+# without exposing them in `ps` via sudo env VAR=... command-line args.
+# Search order:
+#   1. ${CLOUDDEPLOY_USER_ENV_FILE} (explicit override)
+#   2. /root/clouddeploy-v2.env
+#   3. /root/.config/clouddeploy/env
+# Each candidate is rejected unless owned by root and mode 0600 or 0400.
+_cd_env_file=""
+for _cd_env_candidate in \
+                "${CLOUDDEPLOY_USER_ENV_FILE:-}" \
+                "/root/clouddeploy-v2.env" \
+                "/root/.config/clouddeploy/env"; do
+        [[ -n "${_cd_env_candidate}" && -f "${_cd_env_candidate}" ]] || continue
+        _cd_env_uid="$(stat -c '%u' "${_cd_env_candidate}" 2>/dev/null || echo -1)"
+        _cd_env_mode="$(stat -c '%a' "${_cd_env_candidate}" 2>/dev/null || echo "")"
+        if [[ "${_cd_env_uid}" != "0" ]]; then
+                echo "WARNING: ${_cd_env_candidate} is not owned by root (uid=${_cd_env_uid}); skipping for safety." >&2
+                continue
+        fi
+        case "${_cd_env_mode}" in
+                600|400)
+                        _cd_env_file="${_cd_env_candidate}"
+                        break
+                        ;;
+                *)
+                        echo "WARNING: ${_cd_env_candidate} has mode ${_cd_env_mode:-unknown}; expected 600 or 400. Skipping for safety." >&2
+                        ;;
+        esac
+done
+if [[ -n "${_cd_env_file}" ]]; then
+        echo "Sourcing CloudDeploy user env file: ${_cd_env_file}" >&2
+        set -a
+        # shellcheck disable=SC1090
+        . "${_cd_env_file}"
+        set +a
+fi
+unset _cd_env_file _cd_env_candidate _cd_env_uid _cd_env_mode
 
 APT_DPKG_OPTIONS=(
         -o Dpkg::Options::=--force-confdef
@@ -53,6 +102,11 @@ SUNSHINE_DEB_URL="${SUNSHINE_DEB_URL:-https://github.com/LizardByte/Sunshine/rel
 TARGET_NVIDIA_DRIVER_MAJOR="${TARGET_NVIDIA_DRIVER_MAJOR:-580}"
 INSTALL_CUDA_TOOLKIT="${INSTALL_CUDA_TOOLKIT:-1}"
 CUDA_TOOLKIT_PACKAGE="${CUDA_TOOLKIT_PACKAGE:-cuda-toolkit}"
+CUDA_INSTALL_METHOD="${CUDA_INSTALL_METHOD:-auto}"
+REQUIRE_CUDA_TOOLKIT="${REQUIRE_CUDA_TOOLKIT:-${INSTALL_CUDA_TOOLKIT}}"
+CUDA_RUNFILE_VERSION="${CUDA_RUNFILE_VERSION:-13.0.2}"
+CUDA_RUNFILE_DRIVER_VERSION="${CUDA_RUNFILE_DRIVER_VERSION:-580.95.05}"
+CUDA_RUNFILE_URL="${CUDA_RUNFILE_URL:-https://developer.download.nvidia.com/compute/cuda/${CUDA_RUNFILE_VERSION}/local_installers/cuda_${CUDA_RUNFILE_VERSION}_${CUDA_RUNFILE_DRIVER_VERSION}_linux.run}"
 FORCE_DRIVER_UPGRADE="${FORCE_DRIVER_UPGRADE:-1}"
 # Safe/stable deploys use the packaged .deb by default. Fresh VMs may still
 # need SUNSHINE_SOURCE_MODE=fork until the CloudDeploy pairing/stream fixes are upstreamed.
@@ -61,16 +115,125 @@ SUNSHINE_FORK_REPO="${SUNSHINE_FORK_REPO:-https://github.com/NoviceAtPython/Suns
 SUNSHINE_DIAGNOSTIC_FORK_BRANCH="${SUNSHINE_DIAGNOSTIC_FORK_BRANCH:-codex/sunshine-pairing-diagnostics}"
 SUNSHINE_CLEAN_FORK_BRANCH="${SUNSHINE_CLEAN_FORK_BRANCH:-clouddeploy-clean-pairing-stream-fix}"
 SUNSHINE_FORK_BRANCH="${SUNSHINE_FORK_BRANCH:-$SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
+# Pinned Sunshine fork commit. This is the known-good HDR success state
+# (Moonlight overlay confirmed "AV1 10-bit HDR" on the live VM after this
+# commit landed in NoviceAtPython/Sunshine). Hard-resetting to this hash
+# inside install_sunshine_from_fork_if_requested prevents future movement
+# of codex/sunshine-pairing-diagnostics from silently breaking HDR. Set
+# to the empty string to disable the pin and follow the branch tip.
+# See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md.
+SUNSHINE_FORK_COMMIT="${SUNSHINE_FORK_COMMIT:-464bccf1b6e33bf35138136c6138fd9851e6d906}"
 SUNSHINE_BUILD_DIR="${SUNSHINE_BUILD_DIR:-/opt/sunshine-src}"
 SUNSHINE_BUILD_JOBS="${SUNSHINE_BUILD_JOBS:-2}"
 SUNSHINE_INSTALL_BIN="${SUNSHINE_INSTALL_BIN:-/usr/local/bin/sunshine-clouddeploy}"
+# Sunshine HDR runtime knobs. The Sunshine fork at SUNSHINE_FORK_COMMIT
+# adds two env vars that flip HDR all the way through to Moonlight's
+# overlay on the CloudDeploy NVIDIA private DRM path (where the standard
+# HDR_OUTPUT_METADATA blob is intentionally 0):
+#   SUNSHINE_FORCE_AV1_HDR10                - bumps active_av1_mode 2->3,
+#                                             forces config.monitor.
+#                                             dynamicRange=1, advertises
+#                                             SCM_AV1_MAIN10 in
+#                                             /serverinfo.
+#   SUNSHINE_SYNTHESIZE_HDR10_METADATA      - flips the
+#                                             control_hdr_mode_t.enabled
+#                                             control packet to 1 even
+#                                             when get_hdr_metadata()
+#                                             returns no display blob;
+#                                             synthesises BT.2020 / D65 /
+#                                             1000-nit / MaxCLL=1000 /
+#                                             MaxFALL=400 defaults so
+#                                             Moonlight's overlay reads
+#                                             HDR.
+# Both default to ENABLE_HDR so an HDR deploy auto-enables both without
+# the operator having to remember them. Operators can still override
+# explicitly by exporting either var before invoking the script.
+SUNSHINE_FORCE_AV1_HDR10="${SUNSHINE_FORCE_AV1_HDR10:-${ENABLE_HDR:-0}}"
+SUNSHINE_SYNTHESIZE_HDR10_METADATA="${SUNSHINE_SYNTHESIZE_HDR10_METADATA:-${ENABLE_HDR:-0}}"
+# Sunshine's optional CUDA/NvFBC module fails to compile against CUDA 13 headers
+# combined with newer glibc on Ubuntu 25.10 / 26.04 (rsqrt/rsqrtf conflict).
+# The KMS/DRM/Wayland/NVENC streaming path does not need it, so auto-disable it
+# on those releases. Set to "on" to force it on, or "off" to always disable.
+SUNSHINE_ENABLE_CUDA_MODULE="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
+# Optional automated Ubuntu release upgrade. Off by default because dist-upgrade
+# of a running VM is destructive. CLOUDDEPLOY_AUTO_DIST_UPGRADE=1 + matching
+# CLOUDDEPLOY_TARGET_UBUNTU_VERSION runs `do-release-upgrade` (one hop per
+# CloudDeploy run, reboot via the continuation service in between) until
+# /etc/os-release VERSION_ID equals the target. Non-LTS targets (25.10, 26.10,
+# anything ending in .10) require CLOUDDEPLOY_ACCEPT_NON_LTS=1 (alias:
+# CLOUDDEPLOY_ALLOW_QUESTING=1) so accidental users do not get upgraded.
+CLOUDDEPLOY_AUTO_DIST_UPGRADE="${CLOUDDEPLOY_AUTO_DIST_UPGRADE:-0}"
+CLOUDDEPLOY_TARGET_UBUNTU_VERSION="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION:-25.10}"
+CLOUDDEPLOY_ACCEPT_NON_LTS="${CLOUDDEPLOY_ACCEPT_NON_LTS:-${CLOUDDEPLOY_ALLOW_QUESTING:-0}}"
+# do-release-upgrade -d from 24.04 LTS to 25.10 fails with "Upgrades to the
+# development release are only available from the latest supported release"
+# because 25.10 has already shipped (it's not the development release any
+# more) but the LTS path only offers the next LTS. Direct apt codename
+# rewrite (noble -> questing) is the path that actually works for that hop.
+# auto = enable the direct path only for the specific known-failing hop;
+# 1 = always prefer direct codename rewrite; 0 = never (require
+# do-release-upgrade to succeed on its own).
+CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE="${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE:-auto}"
+# Experimental: opt-in to NVIDIA DKMS HDR metadata patches. The metadata path
+# never reliably produced NV_HDR_STATIC_METADATA != blob 0 + working Moonlight
+# HDR before the live VM was deleted (see docs/HDR-NVIDIA-PRIVATE.md). No DKMS
+# patches are bundled in this revision; setting this to 1 only emits a
+# reminder log line so future work can resume from the documented best-next
+# experiment without changing default behavior.
+CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA="${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA:-0}"
+# Initialize ENABLE_HDR before any other default that references it.
+# KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR inherits from this, so it must be
+# defined first - otherwise set -u trips on the bare ${ENABLE_HDR}.
+ENABLE_HDR="${ENABLE_HDR:-0}"
+# Patched-KWin NVIDIA private HDR. The stock KWin connector HDR path causes
+# NVIDIA driver rejection ("the driver rejected the output configuration"),
+# so a patched KWin that skips connector HDR_OUTPUT_METADATA + connector
+# Colorspace and sets NVIDIA private CRTC/plane DRM props
+# (NV_CRTC_REGAMMA_TF=PQ, NV_INPUT_COLORSPACE=BT.2100 PQ,
+# NV_PLANE_DEGAMMA_TF=PQ) is required to produce the documented HDR good
+# state. ENABLE_HDR=1 implies KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 unless
+# explicitly overridden. See docs/HDR-NVIDIA-PRIVATE.md.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR:-${ENABLE_HDR}}"
+# Whether the patched KWin should write NVIDIA private DRM props on the
+# primary plane during modeset. The good state requires plane-prop writes,
+# so this defaults on when KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS:-${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR:-0}}"
+# NV_HDR_STATIC_METADATA stays blob 0 by default; setting it broke the path
+# in every variant tested on the live VM and remains experimental.
+KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA="${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA:-0}"
+# Marker the patched-KWin build pipeline drops after a successful install.
+# Used by require_patched_kwin_if_hdr to refuse ENABLE_HDR=1 without it.
+PATCHED_KWIN_MARKER="${PATCHED_KWIN_MARKER:-/var/lib/clouddeploy/patched-kwin-installed}"
+# Origin of the CloudDeploy-mover repo, used when this script is run from a
+# raw curl download and needs to fetch patches/ or scripts/ assets that did
+# not ship alongside it. Both gh CLI and GH_TOKEN/GITHUB_TOKEN-authed curl
+# are tried before falling back to anonymous raw.githubusercontent.com.
+CLOUDDEPLOY_REPO_URL="${CLOUDDEPLOY_REPO_URL:-https://github.com/NoviceAtPython/CloudDeploy-mover}"
+CLOUDDEPLOY_REPO_BRANCH="${CLOUDDEPLOY_REPO_BRANCH:-v2}"
+# When FORCE_CONNECTOR_AUTO=1 (or FORCED_CONNECTOR=auto), pick a connector
+# from /sys/class/drm at runtime instead of hardcoding DP-1. HDMI-A-* is
+# preferred when ENABLE_HDR=1 because HDR metadata/InfoFrame behaviour
+# differs between forced DP and forced HDMI; otherwise DP-1 is preferred.
+FORCE_CONNECTOR_AUTO="${FORCE_CONNECTOR_AUTO:-0}"
+# Virtual-* DRM connectors (virtio-gpu / KVM emulated outputs) are NOT the
+# NVIDIA modeset path we need for the documented HDR good state. By default
+# auto-detect refuses to land on Virtual-* even when nothing else is
+# enumerable yet - we'd rather keep the FORCED_CONNECTOR default and
+# re-resolve after the NVIDIA driver loads. Set to 1 only when you
+# explicitly want CloudDeploy to drive a Virtual-* output (no HDR).
+CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR="${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
 TARGET_HEIGHT="${TARGET_HEIGHT:-2160}"
 TARGET_FPS="${TARGET_FPS:-120}"
-ENABLE_HDR="${ENABLE_HDR:-0}"
+# ENABLE_HDR is initialized above (before KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR
+# inherits from it), so it's already a real shell variable at this point.
 EDID_PROFILE="${EDID_PROFILE:-auto}"
+ENABLE_PLASMA6="${ENABLE_PLASMA6:-0}"
 STREAM_MODE="${STREAM_MODE:-plasma}"
+if [[ "${ENABLE_PLASMA6}" == "1" && "${STREAM_MODE}" == "plasma" ]]; then
+        STREAM_MODE="plasma6"
+fi
 SESSION_BACKEND="${SESSION_BACKEND:-$STREAM_MODE}"
 PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 KWIN_VTNR="${KWIN_VTNR:-7}"
@@ -82,7 +245,7 @@ SUNSHINE_DRM_DEVICE="${SUNSHINE_DRM_DEVICE:-auto}"
 SUNSHINE_AV1_MODE="${SUNSHINE_AV1_MODE:-2}"
 SUNSHINE_HEVC_MODE="${SUNSHINE_HEVC_MODE:-0}"
 SENTINEL="/opt/clouddeploy-wayland.installed"
-SCRIPT_VERSION="20-real-user-runtime-and-force-mode-guard"
+SCRIPT_VERSION="21-plasma6-hdr-experiment"
 REBOOT_MARKER="/opt/clouddeploy-wayland.needs-reboot"
 REBOOT_REASON_FILE="/opt/clouddeploy-wayland.reboot-reason"
 GRUB_OVERRIDE_FILE="/etc/default/grub.d/99-clouddeploy-edid.cfg"
@@ -92,6 +255,13 @@ INSTALL_OPTIONAL_APPS="${INSTALL_OPTIONAL_APPS:-1}"
 ENABLE_USER_NOPASSWD_SUDO="${ENABLE_USER_NOPASSWD_SUDO:-1}"
 CLOUDDEPLOY_STATE_DIR="${CLOUDDEPLOY_STATE_DIR:-/opt/clouddeploy/state}"
 CURRENT_PHASE="startup"
+CUDA_REPO_ENABLED=0
+CUDA_REPO_DISTRO=""
+CUDA_TOOLKIT_SOURCE="not selected"
+NVIDIA_DRIVER_SOURCE="not selected"
+NVIDIA_DRIVER_PACKAGE_FAMILY="unknown"
+NVIDIA_DRIVER_PACKAGE=""
+NVIDIA_DKMS_PACKAGE=""
 
 # =========================
 # Helpers
@@ -145,6 +315,38 @@ mark_phase_done() {
         touch "${CLOUDDEPLOY_STATE_DIR}/${marker}"
 }
 
+acquire_clouddeploy_lock() {
+        # Take an exclusive flock on /run/clouddeploy-wayland.lock so two
+        # CloudDeploy runs cannot trample each other's apt/dpkg state. The
+        # FD is held open for the lifetime of the script - flock releases
+        # automatically on exit, and /run is tmpfs so the lock cleans up on
+        # reboot too (continuation-resume runs get a fresh lock).
+        local lock_file="${CLOUDDEPLOY_LOCK_FILE:-/run/clouddeploy-wayland.lock}"
+        install -d -m 0755 "$(dirname "${lock_file}")"
+
+        # FD 200 is reserved for the lifetime of this process.
+        exec 200>"${lock_file}" || die "Could not open lock file ${lock_file} (am I root?)"
+        if ! flock -n 200; then
+                local other_pid="" other_cmd=""
+                # lsof and fuser are the most reliable ways to identify the
+                # other holder; both are best-effort.
+                if command -v lsof >/dev/null 2>&1; then
+                        other_pid="$(lsof -t "${lock_file}" 2>/dev/null | grep -v "^$$\$" | head -n1 || true)"
+                fi
+                if [[ -z "${other_pid}" ]] && command -v fuser >/dev/null 2>&1; then
+                        other_pid="$(fuser "${lock_file}" 2>/dev/null | tr -s '[:space:]' '\n' | grep -v "^$$\$" | head -n1 || true)"
+                fi
+                if [[ -n "${other_pid}" ]]; then
+                        other_cmd="$(ps -o cmd= -p "${other_pid}" 2>/dev/null || true)"
+                        die "Another CloudDeploy-wayland.sh run is already in progress (PID ${other_pid}: ${other_cmd:-unknown}). Refusing to start a duplicate - duplicate runs corrupt apt/dpkg state. Wait for it to finish, attach to its journal (journalctl -u clouddeploy-manual-rerun -f), or kill it explicitly before re-running."
+                fi
+                die "Another process holds ${lock_file}; refusing to start a duplicate CloudDeploy run. Wait for it to finish or remove the lock file if you are certain no other run is in progress."
+        fi
+        # Record our identity inside the lock so the next run gets a useful
+        # diagnostic. Not used for locking - flock is the real lock.
+        printf 'pid=%s started=%s cmd=%s\n' "$$" "$(date -Iseconds 2>/dev/null || date -u +%FT%TZ)" "$0 $*" >&200 || true
+}
+
 require_root() {
         [[ "${EUID}" -eq 0 ]] || die "Run this script as root."
 }
@@ -184,7 +386,7 @@ normalize_clouddeploy_users() {
         fi
 
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt)
+                plasma|plasma6|kwin|realvt)
                         if user_is_root_identity "${HEADLESS_USER}" && [[ "${ALLOW_ROOT_SESSION}" != "1" ]]; then
                                 die "STREAM_MODE=${STREAM_MODE} must not run KWin/Plasma as root. Set HEADLESS_USER to a real UID>=1000 user."
                         fi
@@ -256,6 +458,132 @@ detect_nvidia_drm_card() {
                 fi
         done
         return 1
+}
+
+list_drm_connectors() {
+        # Emits connector names like "DP-1", "HDMI-A-2", one per line, deduped.
+        # Restricts to NVIDIA cards (PCI vendor 0x10de) when at least one is
+        # present, falling back to all cards otherwise so the early call
+        # (before nvidia driver loads) still has something to work with.
+        local card_dir base card_name connector_name vendor
+        local nvidia_seen=0
+
+        for card_dir in /sys/class/drm/card[0-9]; do
+                [[ -e "${card_dir}/device/vendor" ]] || continue
+                vendor="$(cat "${card_dir}/device/vendor" 2>/dev/null || true)"
+                if [[ "${vendor}" == "0x10de" ]]; then
+                        nvidia_seen=1
+                fi
+        done
+
+        for card_dir in /sys/class/drm/card[0-9]-*; do
+                [[ -d "${card_dir}" ]] || continue
+                base="${card_dir##*/}"                # card1-DP-1, card1-HDMI-A-2
+                card_name="${base%%-*}"               # card1
+                connector_name="${base#*-}"           # DP-1, HDMI-A-2
+                if [[ "${nvidia_seen}" == "1" ]]; then
+                        vendor="$(cat "/sys/class/drm/${card_name}/device/vendor" 2>/dev/null || true)"
+                        [[ "${vendor}" == "0x10de" ]] || continue
+                fi
+                printf '%s\n' "${connector_name}"
+        done | sort -V | awk 'NF && !seen[$0]++'
+}
+
+drm_connector_status() {
+        local connector="$1" path
+        for path in /sys/class/drm/card[0-9]-"${connector}"/status; do
+                [[ -r "${path}" ]] || continue
+                cat "${path}" 2>/dev/null
+                return 0
+        done
+        return 1
+}
+
+resolve_force_connector_auto() {
+        # Returns one connector name on stdout, or exits with non-zero status
+        # when no acceptable connector is enumerable yet. Preference order:
+        #   ENABLE_HDR=1: HDMI-A-* first (HDR metadata/InfoFrame behaviour
+        #     varies between forced DP and HDMI; HDMI-A-* has been the
+        #     better experimental surface). Within HDMI, lower index first.
+        #   ENABLE_HDR=0: DP-1, then any DP-*, then HDMI-A-*.
+        # Within each class, prefer connectors that report status=connected
+        # over status=disconnected (both can be EDID-forced via kernel cmdline).
+        # Virtual-* (virtio-gpu emulated) connectors are NEVER selected
+        # unless CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1; otherwise the caller
+        # keeps the existing FORCED_CONNECTOR default and re-resolves once
+        # the NVIDIA driver loads.
+        local enable_hdr="${ENABLE_HDR:-0}"
+        local allow_virtual="${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}"
+        local connector
+        local -a hdmi dp virtual others
+        while read -r connector; do
+                [[ -n "${connector}" ]] || continue
+                case "${connector}" in
+                        HDMI-A-*) hdmi+=("${connector}") ;;
+                        DP-*) dp+=("${connector}") ;;
+                        Virtual*|virtual*) virtual+=("${connector}") ;;
+                        *) others+=("${connector}") ;;
+                esac
+        done < <(list_drm_connectors)
+
+        local -a preferred=()
+        if [[ "${enable_hdr}" == "1" ]]; then
+                preferred=("${hdmi[@]}" "${dp[@]}" "${others[@]}")
+        else
+                local dp_first="" rest=()
+                for connector in "${dp[@]}"; do
+                        if [[ "${connector}" == "DP-1" ]]; then
+                                dp_first="${connector}"
+                        else
+                                rest+=("${connector}")
+                        fi
+                done
+                [[ -n "${dp_first}" ]] && preferred+=("${dp_first}")
+                preferred+=("${rest[@]}" "${hdmi[@]}" "${others[@]}")
+        fi
+        if [[ "${allow_virtual}" == "1" ]]; then
+                preferred+=("${virtual[@]}")
+        fi
+
+        [[ "${#preferred[@]}" -gt 0 ]] || return 1
+
+        local status
+        for connector in "${preferred[@]}"; do
+                status="$(drm_connector_status "${connector}" 2>/dev/null || true)"
+                if [[ "${status}" == "connected" ]]; then
+                        printf '%s\n' "${connector}"
+                        return 0
+                fi
+        done
+        printf '%s\n' "${preferred[0]}"
+}
+
+maybe_resolve_force_connector() {
+        if [[ "${FORCE_CONNECTOR_AUTO}" != "1" && "${FORCED_CONNECTOR}" != "auto" ]]; then
+                return 0
+        fi
+        local picked
+        if picked="$(resolve_force_connector_auto)"; then
+                if [[ "${FORCED_CONNECTOR}" != "${picked}" ]]; then
+                        log "FORCE_CONNECTOR_AUTO: ENABLE_HDR=${ENABLE_HDR} -> FORCED_CONNECTOR=${picked} (was ${FORCED_CONNECTOR})"
+                else
+                        log "FORCE_CONNECTOR_AUTO: confirmed FORCED_CONNECTOR=${picked} (ENABLE_HDR=${ENABLE_HDR})"
+                fi
+                FORCED_CONNECTOR="${picked}"
+                return 0
+        fi
+
+        # No acceptable connector enumerable yet. This is the normal state
+        # on a fresh VM before the NVIDIA driver has loaded: /sys/class/drm
+        # only exposes Virtual-1 from virtio-gpu, which we refuse to drive
+        # (the documented HDR good state requires a real NVIDIA DRM
+        # connector). Don't permanently rewrite FORCED_CONNECTOR to a virtio
+        # output - the display-detection phase re-runs this resolver after
+        # nvidia-drm.modeset=1 + the EDID kernel args have taken effect.
+        if [[ "${FORCED_CONNECTOR}" == "auto" ]]; then
+                FORCED_CONNECTOR="DP-1"
+        fi
+        log "FORCE_CONNECTOR_AUTO: deferring connector autodetect until NVIDIA DRM connectors exist; keeping FORCED_CONNECTOR=${FORCED_CONNECTOR}. (CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR:-0}; Virtual-* outputs are not eligible for HDR.)"
 }
 
 nvidia_modules_present_for_running_kernel() {
@@ -337,7 +665,7 @@ select_phase2_edid_file() {
 
 service_for_mode() {
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt)
+                plasma|plasma6|kwin|realvt)
                         echo "kwin-realvt.service"
                         ;;
                 weston)
@@ -347,9 +675,476 @@ service_for_mode() {
                         die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                         ;;
                 *)
-                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston."
+                        die "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston."
                         ;;
         esac
+}
+
+plasma6_mode_active() {
+        [[ "${STREAM_MODE}" == "plasma6" || "${ENABLE_PLASMA6}" == "1" ]]
+}
+
+package_candidate_version() {
+        local pkg="$1"
+        local policy_out
+
+        policy_out="$(apt-cache policy "${pkg}" 2>/dev/null || true)"
+        printf '%s\n' "${policy_out}" \
+                | awk -F': ' '/^[[:space:]]*Candidate:/ { print $2; exit }' \
+                || true
+}
+
+ubuntu_version_id() {
+        local version_id=""
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                version_id="${VERSION_ID:-}"
+        fi
+        printf '%s\n' "${version_id}"
+}
+
+ubuntu_codename() {
+        local codename=""
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                codename="${VERSION_CODENAME:-${UBUNTU_CODENAME:-}}"
+        fi
+        printf '%s\n' "${codename}"
+}
+
+ubuntu_os_summary() {
+        local pretty="" version codename
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                pretty="${PRETTY_NAME:-}"
+        fi
+        version="$(ubuntu_version_id)"
+        codename="$(ubuntu_codename)"
+        printf '%s\n' "${pretty:-ubuntu ${version:-unknown} ${codename:-unknown}}"
+}
+
+ubuntu_version_is_lts() {
+        # LTS releases land on even years and end in .04 (16.04, 18.04, 20.04,
+        # 22.04, 24.04, 26.04, ...). Anything else is a non-LTS interim.
+        local ver="$1"
+        [[ "${ver}" =~ ^(1[68]|2[0246])\.04$ ]]
+}
+
+ubuntu_codename_for_version() {
+        # Map a VERSION_ID (e.g. 25.10) to the matching VERSION_CODENAME
+        # (e.g. questing) that appears in Ubuntu's apt sources Suites: line.
+        case "$1" in
+                22.04) printf 'jammy\n' ;;
+                22.10) printf 'kinetic\n' ;;
+                23.04) printf 'lunar\n' ;;
+                23.10) printf 'mantic\n' ;;
+                24.04) printf 'noble\n' ;;
+                24.10) printf 'oracular\n' ;;
+                25.04) printf 'plucky\n' ;;
+                25.10) printf 'questing\n' ;;
+                26.04) printf 'resolute\n' ;;
+                *) return 1 ;;
+        esac
+}
+
+should_use_direct_apt_codename_upgrade() {
+        # Returns 0 (yes) when the direct apt codename rewrite is the right
+        # tool for the current → target hop. 0/1/auto semantics:
+        #   1    -> always yes (operator override).
+        #   0    -> always no (force do-release-upgrade).
+        #   auto -> yes only for known-failing hops where do-release-upgrade
+        #           is known to bail out. Today: 24.04 LTS -> 25.10.
+        local from_ver="$1" to_ver="$2" mode="$3"
+        case "${mode}" in
+                1) return 0 ;;
+                0) return 1 ;;
+        esac
+        # auto
+        case "${from_ver}|${to_ver}" in
+                24.04|25.10) return 0 ;;
+                24.04\|25.10) return 0 ;;
+        esac
+        if [[ "${from_ver}" == "24.04" && "${to_ver}" == "25.10" ]]; then
+                return 0
+        fi
+        return 1
+}
+
+direct_apt_codename_upgrade() {
+        # Direct apt codename rewrite path. Used when do-release-upgrade
+        # cannot perform the hop (e.g. 24.04 LTS -> 25.10 questing). Steps:
+        #   1. Move third-party CUDA/NVIDIA/graphics-drivers apt sources
+        #      aside so they don't poison the dist-upgrade resolver.
+        #   2. apt-mark unhold all held packages.
+        #   3. Purge any installed CUDA/NVIDIA/xorg-nvidia packages; their
+        #      versions will be re-resolved from the new codename anyway.
+        #   4. Rewrite Ubuntu apt sources' codename in-place
+        #      (deb822 ubuntu.sources + legacy sources.list).
+        #   5. apt update + non-interactive dist-upgrade + autoremove +
+        #      dpkg --configure -a.
+        # Caller is responsible for scheduling the post-upgrade reboot via
+        # the continuation service.
+        local from_codename="$1" to_codename="$2"
+        log "Direct apt codename upgrade: ${from_codename} -> ${to_codename}"
+        log "WARNING: this path is experimental and target is non-LTS Ubuntu ${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}. CLOUDDEPLOY_ACCEPT_NON_LTS=1 was required to reach this code path."
+
+        # 1. Disable third-party CUDA/NVIDIA/graphics-drivers apt sources
+        # before the codename rewrite so dist-upgrade does not try to pull
+        # noble-keyed packages out of the new questing tree.
+        local disabled_dir="/etc/apt/sources.list.d/clouddeploy-disabled-during-upgrade"
+        install -d -m 0755 "${disabled_dir}"
+        local src basename match
+        for src in /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do
+                [[ -f "${src}" ]] || continue
+                basename="$(basename "${src}")"
+                case "${basename}" in
+                        ubuntu.sources) continue ;;
+                esac
+                match=0
+                if grep -qE 'developer\.download\.nvidia\.com|ppa\.launchpadcontent\.net/graphics-drivers|cuda-keyring|nvidia-(drivers|cuda)|graphics-drivers' "${src}" 2>/dev/null; then
+                        match=1
+                elif [[ "${basename}" =~ (cuda|nvidia|graphics-drivers) ]]; then
+                        match=1
+                fi
+                if [[ "${match}" == "1" ]]; then
+                        log "  disabling third-party apt source: ${src} -> ${disabled_dir}/"
+                        mv "${src}" "${disabled_dir}/" || die "Could not move ${src} aside before release upgrade"
+                fi
+        done
+
+        # 2. Unhold any held packages so dist-upgrade can rewrite them.
+        local held held_list
+        held="$(apt-mark showhold 2>/dev/null || true)"
+        if [[ -n "${held}" ]]; then
+                log "Unholding packages before codename rewrite:"
+                printf '%s\n' "${held}" | while read -r held_list; do
+                        [[ -n "${held_list}" ]] || continue
+                        log "  apt-mark unhold ${held_list}"
+                        apt-mark unhold "${held_list}" >/dev/null 2>&1 || true
+                done
+        fi
+
+        # 3. Purge old NVIDIA/CUDA packages so we don't drag a 565/12.6 stack
+        # into the new codename.
+        log "Purging old CUDA/NVIDIA/xorg-nvidia packages before codename rewrite"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" purge -y \
+                'cuda-*' 'nsight-*' 'nvidia-*' 'libnvidia-*' 'xserver-xorg-video-nvidia-*' \
+                2>&1 || log "WARNING: some pre-upgrade NVIDIA/CUDA purges failed; continuing"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+                apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y 2>&1 || true
+
+        # 4. Rewrite Ubuntu apt sources codename. We handle both the modern
+        # deb822 layout at /etc/apt/sources.list.d/ubuntu.sources and the
+        # legacy /etc/apt/sources.list.
+        local rewrote=0
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+                log "Rewriting /etc/apt/sources.list.d/ubuntu.sources Suites: ${from_codename} -> ${to_codename}"
+                sed -i -E "s/(^Suites:[[:space:]]*[^#]*)\\b${from_codename}\\b/\\1${to_codename}/g" /etc/apt/sources.list.d/ubuntu.sources
+                # Catch any other line that still mentions the old codename.
+                sed -i -E "s/\\b${from_codename}\\b/${to_codename}/g" /etc/apt/sources.list.d/ubuntu.sources
+                rewrote=1
+        fi
+        if [[ -f /etc/apt/sources.list ]] && grep -qE "\\b${from_codename}\\b" /etc/apt/sources.list; then
+                log "Rewriting /etc/apt/sources.list ${from_codename} -> ${to_codename}"
+                sed -i -E "s/\\b${from_codename}\\b/${to_codename}/g" /etc/apt/sources.list
+                rewrote=1
+        fi
+        [[ "${rewrote}" == "1" ]] || die "Could not find an Ubuntu apt sources file mentioning ${from_codename} to rewrite. Refusing to dist-upgrade without confirming the codename is moving."
+
+        # 5. apt update + dist-upgrade against the new codename.
+        log "apt-get update on ${to_codename}"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" update -y \
+                || die "apt-get update failed after rewriting codename to ${to_codename}; check /etc/apt/sources.list.d/ubuntu.sources"
+
+        log "Running dist-upgrade ${from_codename} -> ${to_codename} (10-30 min)"
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" -o Dpkg::Options::=--force-confnew dist-upgrade -y \
+                || die "dist-upgrade to ${to_codename} failed; inspect /var/log/apt/term.log and /var/log/dpkg.log"
+
+        DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a \
+                apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y \
+                2>&1 || log "WARNING: post-upgrade autoremove returned non-zero; continuing"
+        dpkg --configure -a 2>&1 || log "WARNING: dpkg --configure -a returned non-zero; continuation reboot may need to retry"
+}
+
+ubuntu_upgrade_progress_file() {
+        printf '%s\n' "${CLOUDDEPLOY_STATE_DIR}/ubuntu-upgrade-from-version"
+}
+
+maybe_upgrade_ubuntu() {
+        # Optional release upgrade. Runs before any NVIDIA/CUDA repo work so apt
+        # state stays clean across the dist-upgrade. Returns 0 when already at
+        # target, dies when the previous reboot did not make progress, and
+        # otherwise dispatches do-release-upgrade and reboots via the
+        # continuation service with reason=ubuntu-upgrade.
+        [[ "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}" == "1" ]] || return 0
+
+        local current_ver target_ver progress_file
+        current_ver="$(ubuntu_version_id)"
+        target_ver="${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
+        progress_file="$(ubuntu_upgrade_progress_file)"
+
+        if [[ -z "${current_ver}" ]]; then
+                die "Could not read VERSION_ID from /etc/os-release; refusing to attempt release upgrade"
+        fi
+
+        if [[ "${current_ver}" == "${target_ver}" ]]; then
+                if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "ubuntu-upgrade" ]]; then
+                        log "Ubuntu release upgrade complete: now at ${current_ver} (target ${target_ver})"
+                else
+                        log "Ubuntu already at target ${target_ver}; no release upgrade needed"
+                fi
+                rm -f "${progress_file}" 2>/dev/null || true
+                return 0
+        fi
+
+        # Non-LTS gate. We rely on this explicit opt-in because a non-LTS upgrade
+        # (e.g. 24.04 LTS -> 24.10 -> 25.04 -> 25.10) is a significant policy
+        # change for the VM.
+        if ! ubuntu_version_is_lts "${target_ver}"; then
+                if [[ "${CLOUDDEPLOY_ACCEPT_NON_LTS}" != "1" ]]; then
+                        die "Refusing to upgrade to non-LTS Ubuntu ${target_ver} without CLOUDDEPLOY_ACCEPT_NON_LTS=1 (alias CLOUDDEPLOY_ALLOW_QUESTING=1)"
+                fi
+        fi
+
+        log "Ubuntu release upgrade: current=${current_ver} target=${target_ver}"
+
+        # Resume guard: if we just rebooted for an upgrade, the version must have
+        # moved. If it did not, refuse to loop forever.
+        if [[ "${CLOUDDEPLOY_CONTINUE_REASON:-}" == "ubuntu-upgrade" ]] && [[ -f "${progress_file}" ]]; then
+                local prior_ver
+                prior_ver="$(<"${progress_file}")"
+                if [[ "${prior_ver}" == "${current_ver}" ]]; then
+                        die "Ubuntu release upgrade did not make progress (was ${prior_ver}, still ${current_ver}); aborting to avoid an infinite reboot loop"
+                fi
+                log "Ubuntu release upgrade progressed: ${prior_ver} -> ${current_ver}"
+        fi
+
+        # Direct apt codename rewrite path. For 24.04 LTS -> 25.10 questing,
+        # do-release-upgrade -d errors with "Upgrades to the development
+        # release are only available from the latest supported release",
+        # so we rewrite the codename directly under apt instead.
+        if should_use_direct_apt_codename_upgrade "${current_ver}" "${target_ver}" "${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE}"; then
+                local target_codename
+                target_codename="$(ubuntu_codename_for_version "${target_ver}" || true)"
+                local current_codename
+                current_codename="$(ubuntu_codename)"
+                if [[ -z "${current_codename}" ]]; then
+                        current_codename="$(ubuntu_codename_for_version "${current_ver}" || true)"
+                fi
+                if [[ -z "${target_codename}" || -z "${current_codename}" ]]; then
+                        die "Direct apt codename upgrade requested but could not resolve codenames (current=${current_ver:-?}/${current_codename:-?}, target=${target_ver:-?}/${target_codename:-?}). Set CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=0 to force do-release-upgrade instead."
+                fi
+
+                install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+                printf '%s\n' "${current_ver}" > "${progress_file}"
+
+                direct_apt_codename_upgrade "${current_codename}" "${target_codename}"
+
+                schedule_reboot_for_continuation "ubuntu-upgrade" \
+                        "Direct apt codename upgrade ${current_codename} -> ${target_codename} dispatched (Ubuntu ${current_ver} -> ${target_ver}); rebooting to complete and resume CloudDeploy"
+        fi
+
+        # Pre-flight: make sure update-manager-core is present and the release
+        # upgrader will offer non-LTS hops when allowed.
+        apt_install_wait update-manager-core || die "Could not install update-manager-core for release upgrade"
+
+        install -d -m 0755 /etc/update-manager
+        if [[ -f /etc/update-manager/release-upgrades ]]; then
+                if grep -qE '^Prompt=' /etc/update-manager/release-upgrades; then
+                        sed -i 's/^Prompt=.*/Prompt=normal/' /etc/update-manager/release-upgrades
+                else
+                        printf 'Prompt=normal\n' >> /etc/update-manager/release-upgrades
+                fi
+        else
+                cat > /etc/update-manager/release-upgrades <<'EOF'
+[DEFAULT]
+Prompt=normal
+EOF
+        fi
+
+        log "Bringing current Ubuntu ${current_ver} fully up to date before do-release-upgrade"
+        apt-get "${APT_DPKG_OPTIONS[@]}" update -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" dist-upgrade -y
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" autoremove -y || true
+
+        # Decide whether to pass -d (include development releases). do-release-
+        # upgrade on an LTS source only steps to the next LTS by default; -d
+        # opens up the intermediate non-LTS hops which is what gets us from
+        # 24.04 LTS -> 24.10 -> 25.04 -> 25.10.
+        local -a upgrade_flags
+        upgrade_flags=(-f DistUpgradeViewNonInteractive --quiet)
+        if ! ubuntu_version_is_lts "${target_ver}" || ! ubuntu_version_is_lts "${current_ver}"; then
+                upgrade_flags+=(-d)
+        fi
+
+        install -d -m 0755 "${CLOUDDEPLOY_STATE_DIR}"
+        printf '%s\n' "${current_ver}" > "${progress_file}"
+
+        log "Running do-release-upgrade ${upgrade_flags[*]}"
+        local upgrade_rc=0
+        DEBIAN_FRONTEND=noninteractive do-release-upgrade "${upgrade_flags[@]}" || upgrade_rc=$?
+        log "do-release-upgrade exit=${upgrade_rc}"
+
+        if [[ "${upgrade_rc}" -ne 0 ]]; then
+                # Don't reboot/loop on a failed release-upgrade - the system is
+                # often in a half-upgraded state and another reboot just hides
+                # the actual error. Surface the dist-upgrade logs and stop.
+                log "do-release-upgrade failed (exit ${upgrade_rc}); printing tail of /var/log/dist-upgrade logs:"
+                local logfile
+                if [[ -d /var/log/dist-upgrade ]]; then
+                        for logfile in /var/log/dist-upgrade/main.log /var/log/dist-upgrade/apt.log /var/log/dist-upgrade/term.log /var/log/dist-upgrade/apt-term.log; do
+                                if [[ -f "${logfile}" ]]; then
+                                        echo "--- tail of ${logfile} ---"
+                                        tail -n 80 "${logfile}" 2>/dev/null || true
+                                fi
+                        done
+                else
+                        echo "(no /var/log/dist-upgrade directory found)"
+                fi
+                die "do-release-upgrade failed (exit ${upgrade_rc}); refusing to reboot or loop. Investigate /var/log/dist-upgrade/*.log, fix the underlying apt/dpkg state, and re-run CloudDeploy."
+        fi
+
+        # do-release-upgrade succeeded; reboot through the continuation
+        # service so the next pass re-enters maybe_upgrade_ubuntu, validates
+        # the version actually moved, and either continues hopping or
+        # proceeds into the NVIDIA/CUDA/KDE phases.
+        schedule_reboot_for_continuation "ubuntu-upgrade" \
+                "Ubuntu release upgrade dispatched (from ${current_ver} toward ${target_ver}); rebooting to complete and resume CloudDeploy"
+}
+
+version_major() {
+        local version="$1"
+        version="${version#*:}"
+        printf '%s\n' "${version}" | sed -nE 's/^[^0-9]*([0-9]+).*/\1/p'
+}
+
+installed_plasma_version() {
+        if command -v plasmashell >/dev/null 2>&1; then
+                plasmashell --version 2>/dev/null | head -n1 || true
+        elif dpkg-query -W -f='plasma-workspace ${Version}\n' plasma-workspace 2>/dev/null; then
+                return 0
+        fi
+}
+
+installed_kwin_version() {
+        if command -v kwin_wayland >/dev/null 2>&1; then
+                kwin_wayland --version 2>/dev/null | head -n1 || true
+        elif dpkg-query -W -f='kwin-wayland ${Version}\n' kwin-wayland 2>/dev/null; then
+                return 0
+        fi
+}
+
+plasma6_packages_available_from_native_repos() {
+        local pkg candidate major
+        for pkg in plasma-workspace kwin-wayland plasma-desktop; do
+                candidate="$(package_candidate_version "${pkg}")"
+                [[ -n "${candidate}" && "${candidate}" != "(none)" ]] || return 1
+                major="$(version_major "${candidate}")"
+                [[ "${major}" == "6" ]] || return 1
+        done
+}
+
+require_plasma6_available_from_native_repos() {
+        local pkg candidate
+
+        plasma6_mode_active || return 0
+
+        log "STREAM_MODE=plasma6 / ENABLE_PLASMA6=1 requested; checking native distro Plasma 6 availability"
+        if plasma6_packages_available_from_native_repos; then
+                for pkg in plasma-workspace kwin-wayland plasma-desktop; do
+                        candidate="$(package_candidate_version "${pkg}")"
+                        log "Native Plasma 6 candidate: ${pkg}=${candidate}"
+                done
+                candidate="$(package_candidate_version plasma-workspace-wayland)"
+                if [[ -n "${candidate}" && "${candidate}" != "(none)" ]]; then
+                        log "Optional Plasma Wayland package available: plasma-workspace-wayland=${candidate}"
+                else
+                        log "Optional Plasma Wayland package absent: plasma-workspace-wayland; skipping on this distro"
+                fi
+                return 0
+        fi
+
+        echo "Plasma 6/KWin 6 package candidates from current apt repositories:" >&2
+        for pkg in plasma-workspace kwin-wayland plasma-desktop plasma-workspace-wayland; do
+                candidate="$(package_candidate_version "${pkg}")"
+                echo "  ${pkg}: ${candidate:-missing}" >&2
+        done
+        die "STREAM_MODE=plasma6 requires Plasma 6/KWin 6 packages from the current distro repositories. They are unavailable on this base image; use a newer base image/distro. CloudDeploy will not add KDE Neon repos to Ubuntu 24.04."
+}
+
+kde_plasma_package_list() {
+        local pkg candidate
+        local required_packages=(
+                plasma-workspace
+                kwin-wayland
+                plasma-desktop
+                kscreen
+                weston
+                xwayland
+                seatd
+                xdg-desktop-portal
+                xdg-desktop-portal-kde
+        )
+        local optional_packages=(
+                plasma-workspace-wayland
+                qdbus-qt5
+                qdbus6
+                qt6-tools-dev-tools
+                qttools5-dev-tools
+                kde-spectacle
+        )
+
+        for pkg in "${required_packages[@]}"; do
+                printf '%s\n' "${pkg}"
+        done
+
+        for pkg in "${optional_packages[@]}"; do
+                candidate="$(package_candidate_version "${pkg}")"
+                if [[ -n "${candidate}" && "${candidate}" != "(none)" ]]; then
+                        printf 'Optional KDE/Plasma package available: %s=%s\n' "${pkg}" "${candidate}" >&2
+                        printf '%s\n' "${pkg}"
+                else
+                        printf 'Optional KDE/Plasma package absent; skipping: %s\n' "${pkg}" >&2
+                fi
+        done
+}
+
+validate_plasma6_runtime_commands() {
+        local missing=()
+        local cmd
+
+        plasma6_mode_active || return 0
+
+        for cmd in kwin_wayland plasmashell startplasma-wayland kscreen-doctor; do
+                command -v "${cmd}" >/dev/null 2>&1 || missing+=("${cmd}")
+        done
+
+        if ! find_qdbus_bin >/dev/null 2>&1; then
+                missing+=("qdbus/qdbus-qt5/qdbus6")
+        fi
+
+        if (( ${#missing[@]} > 0 )); then
+                echo "Plasma/KWin command diagnostics:" >&2
+                for cmd in kwin_wayland plasmashell startplasma-wayland kscreen-doctor qdbus qdbus-qt5 qdbus6 /usr/lib/qt5/bin/qdbus /usr/lib/qt6/bin/qdbus; do
+                        if command -v "${cmd}" >/dev/null 2>&1; then
+                                echo "  ${cmd}: $(command -v "${cmd}")" >&2
+                        elif [[ -x "${cmd}" ]]; then
+                                echo "  ${cmd}: present" >&2
+                        else
+                                echo "  ${cmd}: missing" >&2
+                        fi
+                done
+                die "STREAM_MODE=plasma6 is missing required Plasma runtime command(s): ${missing[*]}"
+        fi
+
+        log "Plasma 6 runtime commands found: kwin_wayland, plasmashell, startplasma-wayland, kscreen-doctor, $(find_qdbus_bin)"
 }
 
 write_clouddeploy_env_file() {
@@ -363,10 +1158,13 @@ write_clouddeploy_env_file() {
                 printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
                 printf 'SUNSHINE_DEB_URL=%q\n' "${SUNSHINE_DEB_URL}"
                 printf 'FORCED_CONNECTOR=%q\n' "${FORCED_CONNECTOR}"
+                printf 'FORCE_CONNECTOR_AUTO=%q\n' "${FORCE_CONNECTOR_AUTO}"
+                printf 'CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=%q\n' "${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR}"
                 printf 'TARGET_WIDTH=%q\n' "${TARGET_WIDTH}"
                 printf 'TARGET_HEIGHT=%q\n' "${TARGET_HEIGHT}"
                 printf 'TARGET_FPS=%q\n' "${TARGET_FPS}"
                 printf 'ENABLE_HDR=%q\n' "${ENABLE_HDR}"
+                printf 'ENABLE_PLASMA6=%q\n' "${ENABLE_PLASMA6}"
                 printf 'EDID_PROFILE=%q\n' "${EDID_PROFILE}"
                 printf 'KWIN_VTNR=%q\n' "${KWIN_VTNR}"
                 printf 'KWIN_WAYLAND_DISPLAY=%q\n' "${KWIN_WAYLAND_DISPLAY}"
@@ -384,15 +1182,33 @@ write_clouddeploy_env_file() {
                 printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "${TARGET_NVIDIA_DRIVER_MAJOR}"
                 printf 'INSTALL_CUDA_TOOLKIT=%q\n' "${INSTALL_CUDA_TOOLKIT}"
                 printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "${CUDA_TOOLKIT_PACKAGE}"
+                printf 'CUDA_INSTALL_METHOD=%q\n' "${CUDA_INSTALL_METHOD}"
+                printf 'REQUIRE_CUDA_TOOLKIT=%q\n' "${REQUIRE_CUDA_TOOLKIT}"
+                printf 'CUDA_RUNFILE_VERSION=%q\n' "${CUDA_RUNFILE_VERSION}"
+                printf 'CUDA_RUNFILE_DRIVER_VERSION=%q\n' "${CUDA_RUNFILE_DRIVER_VERSION}"
+                printf 'CUDA_RUNFILE_URL=%q\n' "${CUDA_RUNFILE_URL}"
                 printf 'FORCE_DRIVER_UPGRADE=%q\n' "${FORCE_DRIVER_UPGRADE}"
                 printf 'SUNSHINE_SOURCE_MODE=%q\n' "${SUNSHINE_SOURCE_MODE}"
                 printf 'SUNSHINE_FORK_REPO=%q\n' "${SUNSHINE_FORK_REPO}"
                 printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "${SUNSHINE_DIAGNOSTIC_FORK_BRANCH}"
                 printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "${SUNSHINE_CLEAN_FORK_BRANCH}"
                 printf 'SUNSHINE_FORK_BRANCH=%q\n' "${SUNSHINE_FORK_BRANCH}"
+                printf 'SUNSHINE_FORK_COMMIT=%q\n' "${SUNSHINE_FORK_COMMIT}"
                 printf 'SUNSHINE_BUILD_DIR=%q\n' "${SUNSHINE_BUILD_DIR}"
                 printf 'SUNSHINE_BUILD_JOBS=%q\n' "${SUNSHINE_BUILD_JOBS}"
                 printf 'SUNSHINE_INSTALL_BIN=%q\n' "${SUNSHINE_INSTALL_BIN}"
+                printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "${SUNSHINE_ENABLE_CUDA_MODULE}"
+                printf 'SUNSHINE_FORCE_AV1_HDR10=%q\n' "${SUNSHINE_FORCE_AV1_HDR10}"
+                printf 'SUNSHINE_SYNTHESIZE_HDR10_METADATA=%q\n' "${SUNSHINE_SYNTHESIZE_HDR10_METADATA}"
+                printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}"
+                printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}"
+                printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "${CLOUDDEPLOY_ACCEPT_NON_LTS}"
+                printf 'CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=%q\n' "${CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE}"
+                printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS}"
+                printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=%q\n' "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA}"
+                printf 'PATCHED_KWIN_MARKER=%q\n' "${PATCHED_KWIN_MARKER}"
                 printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "${ENABLE_USER_NOPASSWD_SUDO}"
                 printf 'ALLOW_ROOT_SESSION=%q\n' "${ALLOW_ROOT_SESSION}"
         } > "${CLOUDDEPLOY_ENV_FILE}"
@@ -900,6 +1716,35 @@ kwin_support_reports_target_mode() {
         [[ "${refresh}" =~ ^(119|120) ]] || return 1
 }
 
+kscreen_connector_summary() {
+        command -v kscreen-doctor >/dev/null 2>&1 || return 0
+
+        run_as_user "${HEADLESS_USER}" env \
+                HOME="${HOME_DIR}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                kscreen-doctor -o 2>/dev/null \
+                | grep -Ei "${FORCED_CONNECTOR}|Geometry:|Scale:|Refresh Rate:|${TARGET_WIDTH}x${TARGET_HEIGHT}.*(119|120).*[*]" \
+                || true
+}
+
+live_edid_hdr_markers() {
+        local edid_path
+
+        command -v edid-decode >/dev/null 2>&1 || return 0
+
+        for edid_path in /sys/class/drm/card*-"${FORCED_CONNECTOR}"/edid; do
+                [[ -s "${edid_path}" ]] || continue
+                edid-decode "${edid_path}" 2>/dev/null \
+                        | grep -Ei 'HDR|EOTF|PQ|HLG|BT[.]2020|Static Metadata|SMPTE ST 2084' \
+                        || true
+        done | head -n 40
+}
+
 wait_for_kwin_target_mode() {
         local support_info
 
@@ -919,12 +1764,39 @@ apt_package_available() {
         local pkg="$1"
         local candidate
 
-        candidate="$(apt-cache policy "${pkg}" 2>/dev/null | awk '/Candidate:/ {print $2; exit}')"
+        candidate="$(package_candidate_version "${pkg}")"
         [[ -n "${candidate}" && "${candidate}" != "(none)" ]]
 }
 
-ensure_cuda_ubuntu_repo() {
-        local os_id="" version_id=""
+cuda_repo_distro_for_ubuntu_version() {
+        local version="$1"
+
+        case "${version}" in
+                22.04) printf '%s\n' "ubuntu2204" ;;
+                24.04) printf '%s\n' "ubuntu2404" ;;
+                25.10) printf '%s\n' "ubuntu2510" ;;
+                26.04) printf '%s\n' "ubuntu2604" ;;
+                *) printf '%s\n' "ubuntu${version//./}" ;;
+        esac
+}
+
+cuda_keyring_url_for_distro() {
+        local distro="$1"
+        printf 'https://developer.download.nvidia.com/compute/cuda/repos/%s/x86_64/cuda-keyring_1.1-1_all.deb\n' "${distro}"
+}
+
+cuda_repo_available_for_distro() {
+        local distro="$1"
+        local url
+
+        [[ -n "${distro}" ]] || return 1
+        url="$(cuda_keyring_url_for_distro "${distro}")"
+        wget --spider -q --timeout=10 --tries=2 "${url}" >/dev/null 2>&1
+}
+
+detect_cuda_repo_distro() {
+        local os_id="" version_id="" distro
+
         if [[ -r /etc/os-release ]]; then
                 # shellcheck disable=SC1091
                 . /etc/os-release
@@ -932,19 +1804,52 @@ ensure_cuda_ubuntu_repo() {
                 version_id="${VERSION_ID:-}"
         fi
 
-        [[ "${os_id}" == "ubuntu" && "${version_id}" == "24.04" ]] \
-                || die "CUDA/NVIDIA repo setup currently supports Ubuntu 24.04 only; detected ${os_id:-unknown} ${version_id:-unknown}"
+        [[ "${os_id}" == "ubuntu" && -n "${version_id}" ]] || return 1
+
+        distro="$(cuda_repo_distro_for_ubuntu_version "${version_id}")"
+        if cuda_repo_available_for_distro "${distro}"; then
+                printf '%s\n' "${distro}"
+                return 0
+        fi
+
+        return 1
+}
+
+ensure_cuda_ubuntu_repo() {
+        local os_id="" version_id="" distro tmpdeb url
+        if [[ -r /etc/os-release ]]; then
+                # shellcheck disable=SC1091
+                . /etc/os-release
+                os_id="${ID:-}"
+                version_id="${VERSION_ID:-}"
+        fi
+
+        [[ "${os_id}" == "ubuntu" ]] \
+                || die "CUDA/NVIDIA apt repository setup supports Ubuntu only; detected ${os_id:-unknown} ${version_id:-unknown}"
+
+        distro="$(detect_cuda_repo_distro || true)"
+        if [[ -z "${distro}" ]]; then
+                CUDA_REPO_ENABLED=0
+                CUDA_REPO_DISTRO=""
+                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                log "No official NVIDIA CUDA apt repo detected for $(ubuntu_os_summary); using native Ubuntu NVIDIA packages and CUDA runfile fallback if needed."
+                return 0
+        fi
+
+        CUDA_REPO_ENABLED=1
+        CUDA_REPO_DISTRO="${distro}"
+        NVIDIA_DRIVER_SOURCE="CUDA repo"
 
         if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
-                log "CUDA apt keyring already installed"
+                log "CUDA apt keyring already installed for detected repo ${CUDA_REPO_DISTRO}"
                 apt_update_retry
                 return 0
         fi
 
-        log "Installing NVIDIA CUDA apt keyring for Ubuntu 24.04"
-        local tmpdeb
+        log "Installing NVIDIA CUDA apt keyring for ${CUDA_REPO_DISTRO}"
         tmpdeb="$(mktemp /tmp/cuda-keyring.XXXXXX.deb)"
-        wget -O "${tmpdeb}" "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb"
+        url="$(cuda_keyring_url_for_distro "${CUDA_REPO_DISTRO}")"
+        wget -O "${tmpdeb}" "${url}"
         wait_for_apt
         dpkg -i "${tmpdeb}"
         rm -f "${tmpdeb}"
@@ -1117,7 +2022,17 @@ nvidia_target_dkms_package() {
                 "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
                 "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}"
         do
-                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                if installed_dpkg_package "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        for candidate in \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if apt_package_available "${candidate}"; then
                         printf '%s\n' "${candidate}"
                         return 0
                 fi
@@ -1132,12 +2047,89 @@ nvidia_target_driver_package() {
                 "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
                 "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
         do
-                if installed_dpkg_package "${candidate}" || apt_package_available "${candidate}"; then
+                if installed_dpkg_package "${candidate}"; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        for candidate in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                if apt_package_available "${candidate}"; then
                         printf '%s\n' "${candidate}"
                         return 0
                 fi
         done
         printf '%s\n' "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+}
+
+print_nvidia_target_package_policy() {
+        local pkg
+
+        echo "=== apt-cache policy for NVIDIA target ${TARGET_NVIDIA_DRIVER_MAJOR} packages ===" >&2
+        for pkg in \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-utils-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "libnvidia-encode-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "libnvidia-fbc1-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
+                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-utils-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "libnvidia-encode-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "libnvidia-fbc1-${TARGET_NVIDIA_DRIVER_MAJOR}" \
+                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
+        do
+                echo "--- ${pkg} ---" >&2
+                apt-cache policy "${pkg}" >&2 2>/dev/null || true
+        done
+}
+
+select_nvidia_driver_package_family() {
+        local family suffix driver_pkg dkms_pkg
+
+        for family in server non-server; do
+                if [[ "${family}" == "server" ]]; then
+                        suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+                else
+                        suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
+                fi
+
+                driver_pkg="nvidia-driver-${suffix}"
+                dkms_pkg="nvidia-dkms-${suffix}"
+                if apt_package_available "${driver_pkg}" && apt_package_available "${dkms_pkg}"; then
+                        NVIDIA_DRIVER_PACKAGE_FAMILY="${family}"
+                        NVIDIA_DRIVER_PACKAGE="${driver_pkg}"
+                        NVIDIA_DKMS_PACKAGE="${dkms_pkg}"
+                        if [[ "${CUDA_REPO_ENABLED}" == "1" ]]; then
+                                NVIDIA_DRIVER_SOURCE="CUDA repo"
+                        else
+                                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                        fi
+                        log "Selected NVIDIA driver source: ${NVIDIA_DRIVER_SOURCE}"
+                        log "Selected NVIDIA driver package family: ${NVIDIA_DRIVER_PACKAGE_FAMILY}"
+                        log "Selected NVIDIA driver packages: ${NVIDIA_DRIVER_PACKAGE}, ${NVIDIA_DKMS_PACKAGE}"
+                        return 0
+                fi
+        done
+
+        print_nvidia_target_package_policy
+        die "Could not find a consistent NVIDIA ${TARGET_NVIDIA_DRIVER_MAJOR} server or non-server package family in apt for $(ubuntu_os_summary)"
+}
+
+installed_nvidia_driver_package_family() {
+        if dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"; then
+                printf '%s\n' "server"
+        elif dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}"; then
+                printf '%s\n' "non-server"
+        elif dpkg_package_configured_ii "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"; then
+                printf '%s\n' "open"
+        else
+                printf '%s\n' "unknown"
+        fi
 }
 
 collect_non_current_kernel_versions() {
@@ -1318,18 +2310,20 @@ nvidia_install_output_has_dkms_kernel_failure() {
 }
 
 require_nvidia_recovery_package_state() {
-        local current_kernel
+        local current_kernel dkms_pkg driver_pkg
         current_kernel="$(uname -r)"
+        dkms_pkg="${NVIDIA_DKMS_PACKAGE:-$(nvidia_target_dkms_package)}"
+        driver_pkg="${NVIDIA_DRIVER_PACKAGE:-$(nvidia_target_driver_package)}"
 
-        if ! dpkg_package_configured_ii "nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
-                || ! dpkg_package_configured_ii "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server"; then
+        if ! dpkg_package_configured_ii "${dkms_pkg}" \
+                || ! dpkg_package_configured_ii "${driver_pkg}"; then
                 print_nvidia_driver_diagnostics
-                die "NVIDIA recovery did not leave nvidia-dkms-${TARGET_NVIDIA_DRIVER_MAJOR}-server and nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server configured as ii"
+                die "NVIDIA recovery did not leave ${dkms_pkg} and ${driver_pkg} configured as ii"
         fi
 
-        if ! nvidia_server_dkms_installed_for_current_kernel; then
+        if ! nvidia_dkms_installed_for_current_kernel; then
                 print_nvidia_driver_diagnostics
-                die "NVIDIA recovery did not install nvidia-srv DKMS for ${current_kernel}"
+                die "NVIDIA recovery did not install NVIDIA DKMS for ${current_kernel}"
         fi
 }
 
@@ -1435,7 +2429,12 @@ install_target_nvidia_driver() {
 
         repair_dpkg_state_if_needed
         prepare_single_kernel_for_nvidia_dkms
-        ensure_cuda_ubuntu_repo
+        if [[ "$(ubuntu_version_id)" == "24.04" ]]; then
+                ensure_cuda_ubuntu_repo
+        else
+                NVIDIA_DRIVER_SOURCE="native Ubuntu"
+                log "Ubuntu $(ubuntu_version_id) detected; preferring native Ubuntu NVIDIA driver packages and deferring any CUDA repo setup until toolkit install"
+        fi
 
         if dpkg-query -W -f='${binary:Package}\n' 2>/dev/null \
                 | grep -Eq '^(cuda-drivers|cuda-drivers-|nvidia-|libnvidia-|linux-modules-nvidia-|linux-objects-nvidia-|linux-signatures-nvidia-)'; then
@@ -1447,28 +2446,20 @@ install_target_nvidia_driver() {
                 cleanup_conflicting_nvidia_driver_packages
         fi
 
-        local driver_pkg=""
-        local candidate
-        for candidate in \
-                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" \
-                "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}" \
-                "nvidia-open-${TARGET_NVIDIA_DRIVER_MAJOR}"
-        do
-                if apt_package_available "${candidate}"; then
-                        driver_pkg="${candidate}"
-                        break
-                fi
-        done
+        select_nvidia_driver_package_family
 
-        [[ -n "${driver_pkg}" ]] || die "Could not find an installable NVIDIA ${TARGET_NVIDIA_DRIVER_MAJOR} driver package"
-
+        local driver_pkg="${NVIDIA_DRIVER_PACKAGE}"
         local pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
-        if [[ "${driver_pkg}" == "nvidia-driver-${TARGET_NVIDIA_DRIVER_MAJOR}-server" ]]; then
-                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
-        fi
+        local candidate
 
         local -a install_pkgs
-        install_pkgs=("${driver_pkg}")
+        if [[ "${NVIDIA_DRIVER_PACKAGE_FAMILY}" == "server" ]]; then
+                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}-server"
+        else
+                pkg_suffix="${TARGET_NVIDIA_DRIVER_MAJOR}"
+        fi
+
+        install_pkgs=("${driver_pkg}" "${NVIDIA_DKMS_PACKAGE}")
         for candidate in \
                 "nvidia-utils-${pkg_suffix}" \
                 "libnvidia-encode-${pkg_suffix}" \
@@ -1492,7 +2483,7 @@ install_target_nvidia_driver() {
                 fi
         fi
 
-        dkms_pkg="$(nvidia_target_dkms_package)"
+        dkms_pkg="${NVIDIA_DKMS_PACKAGE:-$(nvidia_target_dkms_package)}"
         require_nvidia_running_kernel_modules_intact
 
         modprobe nvidia 2>/dev/null || true
@@ -1542,23 +2533,284 @@ install_target_nvidia_driver() {
         log "NVIDIA driver acceptance gate passed for ${TARGET_NVIDIA_DRIVER_MAJOR} on kernel $(uname -r)"
 }
 
-install_cuda_toolkit_if_requested() {
-        if [[ "${INSTALL_CUDA_TOOLKIT}" == "0" ]]; then
-                log "INSTALL_CUDA_TOOLKIT=0; skipping CUDA toolkit install"
+cuda_toolkit_ready() {
+        local nvcc_bin=""
+
+        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                nvcc_bin="/usr/local/cuda/bin/nvcc"
+        elif command -v nvcc >/dev/null 2>&1; then
+                nvcc_bin="$(command -v nvcc)"
+        fi
+
+        [[ -n "${nvcc_bin}" ]] || return 1
+        [[ -d /usr/local/cuda/include ]] || return 1
+        [[ -d /usr/local/cuda/lib64 ]] || return 1
+}
+
+expected_cuda_major() {
+        # Derive the expected nvcc release major (e.g. "13") from either
+        # CUDA_TOOLKIT_PACKAGE (cuda-toolkit-13-0 -> 13) or CUDA_RUNFILE_VERSION
+        # (13.0.2 -> 13). Returns empty when neither pins a specific version.
+        local pkg="${CUDA_TOOLKIT_PACKAGE:-}"
+        if [[ "${pkg}" =~ ^cuda-toolkit-([0-9]+)(-[0-9]+)?$ ]]; then
+                printf '%s\n' "${BASH_REMATCH[1]}"
+                return 0
+        fi
+        if [[ -n "${CUDA_RUNFILE_VERSION:-}" ]]; then
+                printf '%s\n' "${CUDA_RUNFILE_VERSION%%.*}"
+                return 0
+        fi
+        printf '\n'
+}
+
+verify_cuda_toolkit_version_matches() {
+        local expected_major
+        expected_major="$(expected_cuda_major)"
+        [[ -n "${expected_major}" ]] || return 0
+        [[ -x /usr/local/cuda/bin/nvcc ]] || return 0
+
+        local actual_major
+        actual_major="$(/usr/local/cuda/bin/nvcc --version 2>/dev/null \
+                | sed -nE 's/.*release ([0-9]+)\.[0-9]+.*/\1/p' | head -n1)"
+        if [[ -z "${actual_major}" ]]; then
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit version check: could not parse nvcc release from /usr/local/cuda/bin/nvcc --version"
+                fi
+                log "WARNING: CUDA toolkit version check: could not parse nvcc release; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
                 return 0
         fi
 
-        log "Installing CUDA toolkit package: ${CUDA_TOOLKIT_PACKAGE}"
-        ensure_cuda_ubuntu_repo
-        apt_install_wait "${CUDA_TOOLKIT_PACKAGE}"
-
-        if [[ -x /usr/local/cuda/bin/nvcc ]]; then
-                /usr/local/cuda/bin/nvcc --version || true
-        elif command -v nvcc >/dev/null 2>&1; then
-                nvcc --version || true
+        if [[ "${actual_major}" != "${expected_major}" ]]; then
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit version mismatch: expected major ${expected_major}.x (CUDA_TOOLKIT_PACKAGE=${CUDA_TOOLKIT_PACKAGE}, CUDA_RUNFILE_VERSION=${CUDA_RUNFILE_VERSION}), but nvcc reports release ${actual_major}.x. Refusing to accept Ubuntu's nvidia-cuda-toolkit (12.4) when CUDA ${expected_major} is required."
+                fi
+                log "WARNING: CUDA toolkit version mismatch: expected ${expected_major}.x, got ${actual_major}.x; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
         else
-                log "CUDA toolkit installed, but nvcc was not found on PATH"
+                log "CUDA toolkit version check OK: nvcc release ${actual_major}.x matches expected ${expected_major}.x"
         fi
+}
+
+verify_cuda_toolkit_or_fail() {
+        if cuda_toolkit_ready; then
+                export PATH="/usr/local/cuda/bin:${PATH}"
+                export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                        /usr/local/cuda/bin/nvcc --version || true
+                else
+                        nvcc --version || true
+                fi
+                verify_cuda_toolkit_version_matches
+                return 0
+        fi
+
+        if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                die "CUDA toolkit was requested but nvcc, /usr/local/cuda/include, or /usr/local/cuda/lib64 is missing"
+        fi
+
+        log "CUDA toolkit verification failed, but REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}; continuing"
+        return 0
+}
+
+cuda_nvcc_release_major() {
+        # Parse the major number from `nvcc --version` output, e.g.
+        # "Cuda compilation tools, release 13.0, V13.0.88" -> "13".
+        # Empty on missing nvcc or unparseable output.
+        [[ -x /usr/local/cuda/bin/nvcc ]] || return 0
+        /usr/local/cuda/bin/nvcc --version 2>/dev/null \
+                | sed -nE 's/.*release ([0-9]+)\.[0-9]+.*/\1/p' | head -n1
+}
+
+install_cuda_toolkit_from_runfile() {
+        local cuda_tmpdir="/var/tmp/clouddeploy-cuda"
+        local max_attempts="${CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS:-3}"
+
+        CUDA_TOOLKIT_SOURCE="runfile"
+
+        # Defense-in-depth skip: if nvcc already reports a matching release
+        # under /usr/local/cuda, don't redownload the ~4 GiB runfile. The
+        # caller (install_cuda_toolkit_if_requested) also has a
+        # cuda_toolkit_ready short-circuit, but match here too so a partial
+        # /usr/local/cuda layout (missing /include or /lib64 symlink) that
+        # tripped cuda_toolkit_ready can still skip the runfile when nvcc
+        # is good.
+        local actual_major expected_major
+        actual_major="$(cuda_nvcc_release_major || true)"
+        expected_major="$(expected_cuda_major || true)"
+        if [[ -n "${actual_major}" ]]; then
+                if [[ -z "${expected_major}" || "${actual_major}" == "${expected_major}" ]]; then
+                        log "CUDA toolkit runfile install skipped: /usr/local/cuda/bin/nvcc already reports release ${actual_major}.x (matches expected ${expected_major:-any}; REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT})."
+                        CUDA_TOOLKIT_SOURCE="already installed (nvcc ${actual_major}.x)"
+                        verify_cuda_toolkit_or_fail
+                        return 0
+                fi
+                log "CUDA runfile install will proceed despite nvcc release ${actual_major}.x being present (expected ${expected_major}.x)."
+        fi
+
+        log "Installing CUDA toolkit using toolkit-only NVIDIA runfile"
+        log "CUDA runfile URL: ${CUDA_RUNFILE_URL}"
+        log "CUDA runfile retries: max ${max_attempts} attempts; curl --retry 10 --retry-all-errors --retry-delay 10"
+
+        # NVIDIA's CUDA runfile self-extracts (~4 GiB) to TMPDIR. /tmp is tmpfs
+        # / RAM-backed on most cloud images and can fail to allocate the
+        # extraction working space, producing checksum or "no space left on
+        # device" errors. Use a disk-backed staging directory under /var/tmp
+        # and point both curl and the runfile at it via TMPDIR + --tmpdir.
+        install -d -m 0755 "${cuda_tmpdir}"
+        export TMPDIR="${cuda_tmpdir}"
+
+        local download_log="${cuda_tmpdir}/curl.log"
+        local check_log="${cuda_tmpdir}/runfile-check.log"
+        local runfile=""
+        local last_failure=""
+        local attempt=0
+
+        while (( attempt < max_attempts )); do
+                attempt=$((attempt + 1))
+                rm -f "${cuda_tmpdir}"/cuda-toolkit.*.run 2>/dev/null || true
+                runfile="$(mktemp "${cuda_tmpdir}/cuda-toolkit.XXXXXX.run")"
+
+                log "CUDA runfile attempt ${attempt}/${max_attempts}: downloading to ${runfile}"
+                : > "${download_log}"
+                if ! curl -fL \
+                                --retry 10 \
+                                --retry-all-errors \
+                                --retry-delay 10 \
+                                --connect-timeout 30 \
+                                --silent --show-error \
+                                -w 'curl: http_code=%{http_code} bytes=%{size_download} time=%{time_total}s redirects=%{num_redirects}\n' \
+                                -o "${runfile}" \
+                                "${CUDA_RUNFILE_URL}" \
+                                > "${download_log}" 2>&1; then
+                        log "Attempt ${attempt}: curl exited non-zero; tail of ${download_log}:"
+                        tail -n 20 "${download_log}" 2>/dev/null || true
+                        rm -f "${runfile}"
+                        runfile=""
+                        last_failure="curl download failed (attempt ${attempt})"
+                        if (( attempt < max_attempts )); then
+                                log "Retrying CUDA runfile download in 10s..."
+                                sleep 10
+                        fi
+                        continue
+                fi
+
+                local runfile_size sha256
+                runfile_size="$(stat -c '%s' "${runfile}" 2>/dev/null || echo 0)"
+                sha256="$(sha256sum "${runfile}" 2>/dev/null | cut -d' ' -f1 || echo unknown)"
+                log "Attempt ${attempt}: downloaded size=${runfile_size} bytes, sha256=${sha256}"
+
+                if (( runfile_size < 1073741824 )); then
+                        log "Attempt ${attempt}: runfile size ${runfile_size} < 1 GiB; almost certainly an HTML error page. Discarding. Tail of curl log:"
+                        tail -n 10 "${download_log}" 2>/dev/null || true
+                        rm -f "${runfile}"
+                        runfile=""
+                        last_failure="runfile <1 GiB (${runfile_size} bytes; sha256=${sha256})"
+                        if (( attempt < max_attempts )); then
+                                log "Retrying CUDA runfile download in 10s..."
+                                sleep 10
+                        fi
+                        continue
+                fi
+
+                chmod 0755 "${runfile}"
+
+                # NVIDIA runfiles support --check to validate the embedded
+                # MD5 sum. This is the check that flagged "downloaded MD5
+                # differed from embedded expected MD5" on the live VM.
+                : > "${check_log}"
+                if sh "${runfile}" --check --tmpdir="${cuda_tmpdir}" > "${check_log}" 2>&1; then
+                        log "Attempt ${attempt}: runfile --check passed (size=${runfile_size}, sha256=${sha256})"
+                        break
+                fi
+
+                log "Attempt ${attempt}: runfile --check FAILED. size=${runfile_size}, sha256=${sha256}"
+                log "Tail of ${check_log}:"
+                tail -n 20 "${check_log}" 2>/dev/null || true
+                log "Tail of ${download_log}:"
+                tail -n 10 "${download_log}" 2>/dev/null || true
+                rm -f "${runfile}"
+                runfile=""
+                last_failure="--check failed (attempt ${attempt}; size=${runfile_size}; sha256=${sha256})"
+                if (( attempt < max_attempts )); then
+                        log "Retrying CUDA runfile download in 10s (max ${max_attempts} attempts)..."
+                        sleep 10
+                fi
+        done
+
+        if [[ -z "${runfile}" || ! -f "${runfile}" ]]; then
+                rm -rf "${cuda_tmpdir}" 2>/dev/null || true
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA runfile integrity check failed after ${max_attempts} attempts from ${CUDA_RUNFILE_URL}. Last failure: ${last_failure:-unknown}. Inspect ${download_log} and ${check_log} before re-running. The CUDA mirror may be intermittently corrupting downloads - set CLOUDDEPLOY_CUDA_RUNFILE_MAX_ATTEMPTS=5 (or higher) to give it more chances, or set CUDA_INSTALL_METHOD=apt to use the apt repo path instead."
+                fi
+                log "CUDA runfile integrity check failed after ${max_attempts} attempts; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+
+        # --toolkit (never --driver): the NVIDIA driver is installed
+        # separately by the apt path so a CUDA toolkit install failure here
+        # cannot remove or break the working NVIDIA 580 driver.
+        if ! sh "${runfile}" --silent --toolkit --override --tmpdir="${cuda_tmpdir}"; then
+                rm -f "${runfile}"
+                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                        die "CUDA toolkit-only runfile install failed from ${CUDA_RUNFILE_URL}"
+                fi
+                log "CUDA toolkit-only runfile install failed; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                return 0
+        fi
+        rm -f "${runfile}"
+        rm -rf "${cuda_tmpdir}" 2>/dev/null || true
+
+        verify_cuda_toolkit_or_fail
+}
+
+install_cuda_toolkit_if_requested() {
+        local method="${CUDA_INSTALL_METHOD}"
+
+        if [[ "${INSTALL_CUDA_TOOLKIT}" == "0" || "${method}" == "none" ]]; then
+                log "CUDA toolkit install disabled: INSTALL_CUDA_TOOLKIT=${INSTALL_CUDA_TOOLKIT}, CUDA_INSTALL_METHOD=${method}"
+                return 0
+        fi
+
+        if cuda_toolkit_ready; then
+                CUDA_TOOLKIT_SOURCE="already installed"
+                log "CUDA toolkit already present under /usr/local/cuda"
+                verify_cuda_toolkit_or_fail
+                return 0
+        fi
+
+        case "${method}" in
+                auto)
+                        if [[ -n "$(detect_cuda_repo_distro || true)" ]]; then
+                                method="apt"
+                        else
+                                method="runfile"
+                        fi
+                        ;;
+                apt|runfile)
+                        ;;
+                *)
+                        die "Unsupported CUDA_INSTALL_METHOD='${CUDA_INSTALL_METHOD}'. Supported: auto, apt, runfile, none."
+                        ;;
+        esac
+
+        case "${method}" in
+                apt)
+                        ensure_cuda_ubuntu_repo
+                        if [[ "${CUDA_REPO_ENABLED}" != "1" ]]; then
+                                if [[ "${REQUIRE_CUDA_TOOLKIT}" == "1" ]]; then
+                                        die "CUDA_INSTALL_METHOD=apt requested, but no official CUDA apt repo is available for $(ubuntu_os_summary)"
+                                fi
+                                log "CUDA apt repo unavailable; continuing because REQUIRE_CUDA_TOOLKIT=${REQUIRE_CUDA_TOOLKIT}"
+                                return 0
+                        fi
+                        CUDA_TOOLKIT_SOURCE="apt repo ${CUDA_REPO_DISTRO}"
+                        log "Installing CUDA toolkit package from ${CUDA_REPO_DISTRO}: ${CUDA_TOOLKIT_PACKAGE}"
+                        apt_install_wait "${CUDA_TOOLKIT_PACKAGE}"
+                        verify_cuda_toolkit_or_fail
+                        ;;
+                runfile)
+                        install_cuda_toolkit_from_runfile
+                        ;;
+        esac
 }
 
 install_sunshine_deb() {
@@ -1667,6 +2919,7 @@ Environment=KWIN_FORCE_SW_CURSOR=1
 Environment=KWIN_USE_OVERLAYS=0
 Environment=GBM_BACKEND=nvidia-drm
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+$(kwin_clouddeploy_env_block)
 PermissionsStartOnly=true
 ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
 ExecStartPre=-/usr/bin/systemctl start user@${HEADLESS_UID}.service
@@ -1722,6 +2975,21 @@ User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 SupplementaryGroups=video render input
 WorkingDirectory=${HOME_DIR}
+# Sunshine on KMS capture needs CAP_SYS_ADMIN to claim DRM framebuffer
+# handles and CAP_NET_BIND_SERVICE for its privileged listening ports.
+# NoNewPrivileges=no is required because file caps are stripped under
+# NoNewPrivileges=yes; AmbientCapabilities + CapabilityBoundingSet make
+# the file caps actually usable by the running process. Without these,
+# Sunshine falls back to /dev/dri/card0 connector=Virtual-1 1024x768 on
+# multi-GPU VMs with "Failed to gain CAP_SYS_ADMIN" / "missing_fb_handle"
+# / "Couldn't get handle for DRM Framebuffer" in the journal.
+NoNewPrivileges=no
+# CAP_SYS_NICE: Sunshine's NVENC encode threads set elevated scheduling
+# priority on a real-time-ish thread to keep encode latency stable at
+# 4K120. The final known-good live-VM install had it; preserve here so
+# the deploy matches that exact state.
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE CAP_SYS_NICE
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
 Environment=LOGNAME=${HEADLESS_USER}
@@ -1733,6 +3001,13 @@ Environment=SUNSHINE_STREAM_DIAG_VIDEO_PEER_MODE=rtsp-client-port
 Environment=SUNSHINE_STREAM_DIAG_IGNORE_CONTROL_TIMEOUT=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS=1
 Environment=SUNSHINE_STREAM_DIAG_FORCE_ANNOUNCE_SUCCESS_IMMEDIATE=1
+# Sunshine fork HDR knobs. These are the levers that flip Moonlight's
+# overlay from "AV1 10-bit SDR" to "AV1 10-bit HDR" on the CloudDeploy
+# NVIDIA private DRM path. They are always emitted (defaulting to
+# ENABLE_HDR) so a future "Environment=ENABLE_HDR=1" reset doesn't
+# silently drop the HDR signalling.
+Environment=SUNSHINE_FORCE_AV1_HDR10=${SUNSHINE_FORCE_AV1_HDR10}
+Environment=SUNSHINE_SYNTHESIZE_HDR10_METADATA=${SUNSHINE_SYNTHESIZE_HDR10_METADATA}
 ExecStartPre=/usr/local/bin/clouddeploy-wait-sunshine-session.sh
 ExecStart=${runtime_bin} ${HOME_DIR}/.config/sunshine/sunshine.conf
 Restart=on-failure
@@ -1746,6 +3021,369 @@ EOF
 
         systemctl daemon-reload || true
         mark_phase_done "systemd-units-installed.done"
+}
+
+resolve_sunshine_cuda_module() {
+        # Returns "on" or "off" based on SUNSHINE_ENABLE_CUDA_MODULE and Ubuntu release.
+        # auto: enable on Ubuntu 24.04 and earlier; disable on 25.10 / 26.04 because
+        # CUDA 13 headers conflict with newer glibc (rsqrt/rsqrtf), which breaks
+        # Sunshine's optional CUDA/NvFBC module during nvcc compiler detection.
+        local mode="${SUNSHINE_ENABLE_CUDA_MODULE:-auto}"
+        case "${mode}" in
+                on|off)
+                        printf '%s\n' "${mode}"
+                        return 0
+                        ;;
+                auto)
+                        ;;
+                *)
+                        log "WARNING: Unknown SUNSHINE_ENABLE_CUDA_MODULE='${mode}'; treating as auto"
+                        ;;
+        esac
+
+        local ver
+        ver="$(ubuntu_version_id)"
+        case "${ver}" in
+                25.10|26.04|26.10)
+                        printf 'off\n'
+                        ;;
+                *)
+                        printf 'on\n'
+                        ;;
+        esac
+}
+
+kwin_clouddeploy_env_block() {
+        # Emits systemd Environment= lines for the KWin patched-HDR vars.
+        # The patched KWin compares qEnvironmentVariable(...) to literal "1",
+        # so anything else (unset, "0", "") takes the stock code path. Emit
+        # only when the script-side var is "1" - keeps the unit file minimal
+        # and makes intent obvious at a glance.
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1\n'
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=1\n'
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA}" == "1" ]] \
+                && printf 'Environment=KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=1\n'
+        return 0
+}
+
+clouddeploy_repo_asset_path() {
+        # Locate a file shipped alongside the deploy script in the
+        # CloudDeploy-mover repo (e.g. "patches/kwin-...patch",
+        # "scripts/validate-hdr-drm-state.py"). When the script is run from
+        # a full repo checkout this is just the local path; when the script
+        # was curl'd by itself we fall back to fetching the file from
+        # origin/${CLOUDDEPLOY_REPO_BRANCH} via, in order:
+        #   1. gh CLI if it is installed and authenticated (works for both
+        #      public and private repos);
+        #   2. authenticated curl using GH_TOKEN/GITHUB_TOKEN against the
+        #      GitHub contents API (works for private repos);
+        #   3. public raw.githubusercontent.com fetch (only works once the
+        #      repo is public).
+        # Downloaded files are cached under
+        # /var/lib/clouddeploy/repo-cache/<relpath> so subsequent calls in
+        # the same deploy don't re-fetch.
+        local relpath="$1"
+        [[ -n "${relpath}" ]] || return 1
+
+        local script_dir cache_dir cache_path candidate
+        script_dir="$(dirname "$(readlink -f "$0")")"
+        for candidate in \
+                "${script_dir}/${relpath}" \
+                "${CLOUDDEPLOY_REPO_DIR:-}/${relpath}" \
+                "/usr/local/share/clouddeploy/${relpath}"; do
+                if [[ -n "${candidate}" && -f "${candidate}" ]]; then
+                        printf '%s\n' "${candidate}"
+                        return 0
+                fi
+        done
+
+        cache_dir="/var/lib/clouddeploy/repo-cache"
+        cache_path="${cache_dir}/${relpath}"
+        if [[ -f "${cache_path}" && -s "${cache_path}" ]]; then
+                printf '%s\n' "${cache_path}"
+                return 0
+        fi
+        install -d -m 0755 "$(dirname "${cache_path}")"
+
+        local repo_owner_repo
+        repo_owner_repo="${CLOUDDEPLOY_REPO_URL##*github.com/}"
+        repo_owner_repo="${repo_owner_repo%.git}"
+        repo_owner_repo="${repo_owner_repo%/}"
+
+        local raw_url="${CLOUDDEPLOY_REPO_URL%/}/raw/${CLOUDDEPLOY_REPO_BRANCH}/${relpath}"
+        local api_url="https://api.github.com/repos/${repo_owner_repo}/contents/${relpath}?ref=${CLOUDDEPLOY_REPO_BRANCH}"
+
+        if command -v gh >/dev/null 2>&1 && gh auth status >/dev/null 2>&1; then
+                log "Fetching ${relpath} from ${repo_owner_repo}@${CLOUDDEPLOY_REPO_BRANCH} via gh"
+                if gh api "repos/${repo_owner_repo}/contents/${relpath}?ref=${CLOUDDEPLOY_REPO_BRANCH}" \
+                                -H "Accept: application/vnd.github.v3.raw" \
+                                > "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        local gh_token="${GH_TOKEN:-${GITHUB_TOKEN:-}}"
+        if [[ -n "${gh_token}" ]] && command -v curl >/dev/null 2>&1; then
+                log "Fetching ${relpath} from ${repo_owner_repo}@${CLOUDDEPLOY_REPO_BRANCH} via authenticated curl"
+                if curl -fsSL \
+                                -H "Authorization: token ${gh_token}" \
+                                -H "Accept: application/vnd.github.v3.raw" \
+                                "${api_url}" -o "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        if command -v curl >/dev/null 2>&1; then
+                log "Fetching ${relpath} from public ${raw_url}"
+                if curl -fsSL "${raw_url}" -o "${cache_path}.tmp" 2>/dev/null \
+                        && [[ -s "${cache_path}.tmp" ]]; then
+                        mv "${cache_path}.tmp" "${cache_path}"
+                        printf '%s\n' "${cache_path}"
+                        return 0
+                fi
+                rm -f "${cache_path}.tmp"
+        fi
+
+        return 1
+}
+
+require_clouddeploy_repo_asset() {
+        # Wrapper that dies with a clear message when an asset is not
+        # locatable in a clone or fetchable from the v2 branch.
+        local relpath="$1"
+        local path
+        if path="$(clouddeploy_repo_asset_path "${relpath}")"; then
+                printf '%s\n' "${path}"
+                return 0
+        fi
+        die "Could not locate ${relpath} alongside CloudDeploy-wayland.sh or fetch it from ${CLOUDDEPLOY_REPO_URL%/}/tree/${CLOUDDEPLOY_REPO_BRANCH}. Either: (a) run CloudDeploy-wayland.sh from a full git clone of NoviceAtPython/CloudDeploy-mover (branch ${CLOUDDEPLOY_REPO_BRANCH}) so ${relpath} is on disk next to it; or (b) set GH_TOKEN/GITHUB_TOKEN to a token with read access to the private repo and re-run; or (c) install the repo at /usr/local/share/clouddeploy/${relpath%%/*}/. When ${CLOUDDEPLOY_REPO_URL##*/} is made public, plain anonymous curl will also work."
+}
+
+ensure_apt_deb_src_enabled() {
+        # apt source kwin requires deb-src to be enabled. Ubuntu 24.04+ uses
+        # the deb822 format at /etc/apt/sources.list.d/ubuntu.sources where
+        # Types: deb must be widened to Types: deb deb-src; older releases
+        # use /etc/apt/sources.list with commented "# deb-src ..." lines.
+        local changed=0
+        local f
+
+        if [[ -f /etc/apt/sources.list.d/ubuntu.sources ]]; then
+                if grep -qE '^Types:[[:space:]]+deb[[:space:]]*$' /etc/apt/sources.list.d/ubuntu.sources; then
+                        sed -i -E 's/^Types:[[:space:]]+deb[[:space:]]*$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources
+                        changed=1
+                fi
+        fi
+
+        for f in /etc/apt/sources.list /etc/apt/sources.list.d/*.list; do
+                [[ -f "${f}" ]] || continue
+                if grep -qE '^#[[:space:]]*deb-src[[:space:]]+' "${f}"; then
+                        sed -i -E 's/^#[[:space:]]*(deb-src[[:space:]]+)/\1/' "${f}"
+                        changed=1
+                fi
+        done
+
+        if [[ "${changed}" == "1" ]]; then
+                log "Enabled deb-src for kwin source fetch; running apt-get update"
+                apt-get "${APT_DPKG_OPTIONS[@]}" update -y || die "apt-get update failed after enabling deb-src"
+        fi
+}
+
+build_install_patched_kwin() {
+        # Builds and installs the CloudDeploy patched KWin with NVIDIA private
+        # HDR support. Idempotent: skips if ${PATCHED_KWIN_MARKER} already
+        # exists. After a successful install, drops the marker so
+        # require_patched_kwin_if_hdr stops blocking ENABLE_HDR=1.
+        [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] || {
+                log "KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR != 1; skipping patched KWin build"
+                return 0
+        }
+
+        if patched_kwin_installed; then
+                log "Patched KWin marker already present at ${PATCHED_KWIN_MARKER}; skipping rebuild"
+                return 0
+        fi
+
+        local build_dir="${KWIN_PATCHED_BUILD_DIR:-/usr/local/src/clouddeploy-kwin}"
+        local patch_file_name="${KWIN_PATCH_FILE_NAME:-kwin-clouddeploy-nvidia-private-hdr.patch}"
+
+        log "Building patched KWin with NVIDIA private HDR support in ${build_dir}"
+
+        # 1. Build tooling + kwin build dependencies.
+        apt_install_wait dpkg-dev fakeroot devscripts patch
+        ensure_apt_deb_src_enabled
+        log "Installing kwin build-dependencies (apt-get build-dep -y kwin)"
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" build-dep -y kwin \
+                || die "apt-get build-dep -y kwin failed; cannot build patched KWin"
+
+        # 2. apt source kwin into the workdir.
+        install -d -m 0755 "${build_dir}"
+        (
+                cd "${build_dir}"
+                find . -maxdepth 1 -type d -name 'kwin-*' -exec rm -rf {} + 2>/dev/null || true
+                log "Fetching kwin source via apt source into ${build_dir}"
+                apt-get "${APT_DPKG_OPTIONS[@]}" source kwin \
+                        || die "apt source kwin failed; ensure deb-src is enabled and the kwin source package is available"
+        )
+
+        local source_dir
+        source_dir="$(find "${build_dir}" -maxdepth 1 -type d -name 'kwin-*' | head -n1)"
+        [[ -n "${source_dir}" ]] || die "Could not locate unpacked kwin source under ${build_dir}"
+        log "kwin source unpacked at ${source_dir}"
+
+        # 3. Locate the patch file. Works both for repo-checkout runs and
+        #    for raw curl downloads (auto-fetches from origin/v2 when the
+        #    patches/ directory isn't on disk next to the script).
+        local patch_file
+        patch_file="$(require_clouddeploy_repo_asset "patches/${patch_file_name}")"
+
+        # 3a. Dry-run the patch first. If the unified diff is malformed (bad
+        #     hunk counts, blank context lines without a leading space) or
+        #     the kwin source tree has drifted from KWin 6.4.x, fail BEFORE
+        #     we modify anything. The fresh-VM run hit a malformed-hunk
+        #     bug here that left the tree half-patched and required a manual
+        #     cleanup, so we never start the real apply unless dry-run is
+        #     clean.
+        log "Dry-run patch check (patch -p1 --dry-run < ${patch_file})"
+        local dry_run_log="/var/tmp/clouddeploy-cuda/kwin-patch-dry-run.log"
+        install -d -m 0755 "$(dirname "${dry_run_log}")"
+        if ! (cd "${source_dir}" && patch -p1 --dry-run < "${patch_file}") > "${dry_run_log}" 2>&1; then
+                log "patch -p1 --dry-run FAILED. Tail of ${dry_run_log}:"
+                tail -n 40 "${dry_run_log}" 2>/dev/null || true
+                die "Patch ${patch_file_name} is malformed or does not apply to ${source_dir} (KWin source). See ${dry_run_log}. Either the patch file is broken (blank context lines without a leading space, stale hunk counts, etc.) or the kwin source tree has drifted from the KWin 6.4.x layout the patch was written against. Run scripts/validate-kwin-patch.sh locally to reproduce and fix before re-running CloudDeploy."
+        fi
+        log "Dry-run patch check: OK"
+
+        log "Applying KWin patch from ${patch_file}"
+        (
+                cd "${source_dir}"
+                patch -p1 --forward < "${patch_file}" \
+                        || die "patch -p1 failed to apply ${patch_file_name} to ${source_dir} even though --dry-run succeeded. The kwin source tree may have been modified between the dry-run and the real apply, or disk is full."
+        )
+
+        # 4. Build. dpkg-buildpackage on Ubuntu accepts running as root; we
+        #    skip checks (nocheck) for speed since the patch only changes
+        #    DRM property writes and KWin's own tests are not load-bearing
+        #    for our deploy.
+        log "Building patched kwin (dpkg-buildpackage; can take 20+ minutes)"
+        (
+                cd "${source_dir}"
+                DEB_BUILD_OPTIONS="nocheck parallel=$(nproc)" \
+                        dpkg-buildpackage -us -uc -b \
+                        || die "dpkg-buildpackage failed for patched kwin under ${source_dir}"
+        )
+
+        # 5. Stop services that hold the running kwin_wayland before we
+        #    swap the binaries underneath it.
+        log "Stopping KWin/Sunshine services before installing patched kwin .debs"
+        systemctl stop sunshine-headless.service plasma-shell-realvt.service kwin-realvt.service 2>/dev/null || true
+        pkill -9 -u "${HEADLESS_USER}" -x kwin_wayland 2>/dev/null || true
+
+        # 6. Install the generated kwin/libkwin .debs (and the rest of the
+        #    binary packages from the same source) so co-installed runtime
+        #    libraries stay in sync.
+        local -a deb_files
+        mapfile -t deb_files < <(find "${build_dir}" -maxdepth 1 -type f -name '*.deb')
+        [[ "${#deb_files[@]}" -gt 0 ]] || die "No kwin .deb files were produced under ${build_dir}"
+        log "Installing ${#deb_files[@]} patched kwin .deb file(s)"
+        wait_for_apt
+        DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y --allow-downgrades "${deb_files[@]}" \
+                || die "apt-get install failed for patched kwin .deb files under ${build_dir}"
+
+        # Hold the installed kwin/libkwin packages so a later apt upgrade
+        # doesn't silently swap the patched binaries back to stock.
+        local deb pkg_name
+        for deb in "${deb_files[@]}"; do
+                pkg_name="$(dpkg-deb -f "${deb}" Package 2>/dev/null || true)"
+                if [[ -n "${pkg_name}" ]]; then
+                        apt-mark hold "${pkg_name}" >/dev/null 2>&1 || true
+                fi
+        done
+
+        # 7. Pin patched KWin versions in apt preferences. apt-mark hold alone
+        #    can be cleared by --allow-change-held-packages; a Pin-Priority of
+        #    1001 keeps apt from upgrading these packages even with that flag.
+        write_patched_kwin_apt_pin
+
+        # 8. Sanity check.
+        if command -v kwin_wayland >/dev/null 2>&1; then
+                log "kwin_wayland --version after patched install:"
+                kwin_wayland --version 2>&1 | head -n5 || true
+        else
+                die "kwin_wayland binary is missing after patched kwin install"
+        fi
+
+        # 9. Marker. validate_hdr_final_state still decides whether the
+        #    install actually produced the documented HDR good state.
+        install -d -m 0755 "$(dirname "${PATCHED_KWIN_MARKER}")"
+        {
+                printf 'patched-kwin-installed=1\n'
+                printf 'patch-file=%s\n' "${patch_file}"
+                printf 'source-dir=%s\n' "${source_dir}"
+                printf 'timestamp=%s\n' "$(date -Iseconds 2>/dev/null || date -u +%FT%TZ)"
+                if command -v kwin_wayland >/dev/null 2>&1; then
+                        printf 'kwin-version=%s\n' "$(kwin_wayland --version 2>/dev/null | head -n1 || true)"
+                fi
+        } > "${PATCHED_KWIN_MARKER}"
+        log "Wrote patched KWin marker at ${PATCHED_KWIN_MARKER}"
+}
+
+write_patched_kwin_apt_pin() {
+        # Write /etc/apt/preferences.d/99-clouddeploy-patched-kwin pinning
+        # every currently-installed kwin*/libkwin* package at its present
+        # version with Pin-Priority 1001 - high enough that apt won't even
+        # consider upgrading to a higher version from the Ubuntu archive.
+        # Per-package blocks (not a single shared one) so a future revision
+        # that builds with mixed versions doesn't write an invalid pin.
+        local pin_file="/etc/apt/preferences.d/99-clouddeploy-patched-kwin"
+        install -d -m 0755 "$(dirname "${pin_file}")"
+
+        local -a pkg_names
+        local -A pkg_versions
+        local pkg version
+        while read -r pkg version; do
+                [[ -n "${pkg}" && -n "${version}" ]] || continue
+                case "${pkg}" in
+                        kwin*|libkwin*) ;;
+                        *) continue ;;
+                esac
+                pkg_names+=("${pkg}")
+                pkg_versions["${pkg}"]="${version}"
+        done < <(dpkg-query -W -f='${Package} ${Version}\n' 'kwin*' 'libkwin*' 2>/dev/null \
+                | awk '$2 != ""')
+
+        if [[ "${#pkg_names[@]}" -eq 0 ]]; then
+                log "WARNING: no kwin/libkwin packages currently installed; skipping ${pin_file}. apt-mark hold remains active but a determined upgrade with --allow-change-held-packages could still swap them."
+                return 0
+        fi
+
+        {
+                printf '# CloudDeploy patched KWin pin (auto-generated by build_install_patched_kwin)\n'
+                printf '# Pin-Priority 1001 forces apt to keep the installed patched version\n'
+                printf '# of every kwin*/libkwin* package even when a higher version is in the\n'
+                printf '# Ubuntu archive. Removing this file (or lowering the priority) re-enables\n'
+                printf '# apt to replace the patched build with stock kwin from questing/whatever.\n'
+                printf '# Generated %s for %d package(s).\n' "$(date -Iseconds 2>/dev/null || date -u +%FT%TZ)" "${#pkg_names[@]}"
+                printf '\n'
+                for pkg in "${pkg_names[@]}"; do
+                        printf 'Package: %s\n' "${pkg}"
+                        printf 'Pin: version %s\n' "${pkg_versions[${pkg}]}"
+                        printf 'Pin-Priority: 1001\n'
+                        printf '\n'
+                done
+        } > "${pin_file}"
+        chmod 0644 "${pin_file}"
+        log "Wrote apt pin ${pin_file} for ${#pkg_names[@]} kwin/libkwin packages: ${pkg_names[*]}"
 }
 
 install_sunshine_from_fork_if_requested() {
@@ -1793,6 +3431,32 @@ install_sunshine_from_fork_if_requested() {
                         configure_git_safe_directories
                         [[ -d "${SUNSHINE_BUILD_DIR}/.git" ]] || die "${SUNSHINE_BUILD_DIR} is missing .git after checkout"
                         git -C "${SUNSHINE_BUILD_DIR}" rev-parse --show-toplevel >/dev/null
+
+                        # Hard-reset to the pinned known-good HDR commit. The
+                        # branch tip can move (diagnostic branch); the pin is
+                        # what makes "ENABLE_HDR=1 deploy => Moonlight overlay
+                        # shows HDR" reproducible. Set SUNSHINE_FORK_COMMIT=""
+                        # to follow the branch tip instead.
+                        if [[ -n "${SUNSHINE_FORK_COMMIT}" ]]; then
+                                if git -C "${SUNSHINE_BUILD_DIR}" cat-file -e "${SUNSHINE_FORK_COMMIT}^{commit}" 2>/dev/null; then
+                                        git -C "${SUNSHINE_BUILD_DIR}" reset --hard "${SUNSHINE_FORK_COMMIT}"
+                                        log "Pinned Sunshine fork to known-good HDR commit ${SUNSHINE_FORK_COMMIT}"
+                                else
+                                        # The pinned commit isn't reachable from the
+                                        # fetched branch tip. Fetch the specific SHA
+                                        # by ref (works for any commit in the repo's
+                                        # default fetch refspec), then reset.
+                                        if git -C "${SUNSHINE_BUILD_DIR}" fetch origin "${SUNSHINE_FORK_COMMIT}" 2>/dev/null; then
+                                                git -C "${SUNSHINE_BUILD_DIR}" reset --hard "${SUNSHINE_FORK_COMMIT}"
+                                                log "Pinned Sunshine fork to known-good HDR commit ${SUNSHINE_FORK_COMMIT} (fetched by SHA)"
+                                        else
+                                                die "SUNSHINE_FORK_COMMIT=${SUNSHINE_FORK_COMMIT} is not reachable from ${SUNSHINE_FORK_REPO} branch ${SUNSHINE_FORK_BRANCH}. Either update the pin in CloudDeploy-wayland.sh or set SUNSHINE_FORK_COMMIT=\"\" to follow the branch tip."
+                                        fi
+                                fi
+                        else
+                                log "SUNSHINE_FORK_COMMIT empty: following ${SUNSHINE_FORK_BRANCH} tip ($(git -C "${SUNSHINE_BUILD_DIR}" rev-parse --short HEAD))"
+                        fi
+
                         git -C "${SUNSHINE_BUILD_DIR}" submodule update --init --recursive
                         log "Applying Ubuntu 24.04 Doxygen compatibility patch for Sunshine fork build"
                         local doxyconfig_file
@@ -1806,21 +3470,78 @@ install_sunshine_from_fork_if_requested() {
                                 fi
                         done
 
+                        local sunshine_cuda_module
+                        sunshine_cuda_module="$(resolve_sunshine_cuda_module)"
+                        log "Sunshine fork build: SUNSHINE_ENABLE_CUDA_MODULE=${SUNSHINE_ENABLE_CUDA_MODULE} (resolved=${sunshine_cuda_module}) on $(ubuntu_os_summary)"
+
                         local -a cmake_cuda_args
                         cmake_cuda_args=()
                         if [[ -d /usr/local/cuda ]]; then
+                                export CUDA_HOME=/usr/local/cuda
+                                export CUDA_PATH=/usr/local/cuda
+                                export CUDAToolkit_ROOT=/usr/local/cuda
                                 export PATH="/usr/local/cuda/bin:${PATH}"
                                 export LD_LIBRARY_PATH="/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
                                 cmake_cuda_args+=("-DCUDAToolkit_ROOT=/usr/local/cuda" "-DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda")
+                                if [[ -x /usr/local/cuda/bin/nvcc ]]; then
+                                        local nvcc_release
+                                        nvcc_release="$(/usr/local/cuda/bin/nvcc --version 2>/dev/null | sed -nE 's/.*release ([0-9.]+).*/\1/p' | head -n1)"
+                                        log "Sunshine fork build: nvcc release ${nvcc_release:-unknown} from /usr/local/cuda/bin/nvcc"
+                                fi
+                        else
+                                log "Sunshine fork build: /usr/local/cuda is missing; CUDA env exports skipped"
                         fi
+
+                        local -a cmake_sunshine_cuda_args
+                        case "${sunshine_cuda_module}" in
+                                off)
+                                        cmake_sunshine_cuda_args=("-DSUNSHINE_ENABLE_CUDA=OFF" "-DCUDA_FAIL_ON_MISSING=OFF")
+                                        log "Sunshine fork build: CUDA/NvFBC module disabled. DRM/KMS/Wayland + NVENC streaming path remains enabled."
+                                        ;;
+                                on)
+                                        cmake_sunshine_cuda_args=("-DSUNSHINE_ENABLE_CUDA=ON" "-DCUDA_FAIL_ON_MISSING=ON")
+                                        log "Sunshine fork build: CUDA/NvFBC module forced on; configure will fail if nvcc detection or compile fails."
+                                        ;;
+                                *)
+                                        cmake_sunshine_cuda_args=()
+                                        ;;
+                        esac
+
+                        local sunshine_build_subdir="${SUNSHINE_BUILD_DIR}/build"
+                        local cuda_mode_marker="${sunshine_build_subdir}/.clouddeploy-cuda-mode"
+                        local cuda_configure_pending="${sunshine_build_subdir}/.clouddeploy-configure-pending"
+                        local previous_cuda_mode=""
+                        if [[ -f "${cuda_mode_marker}" ]]; then
+                                previous_cuda_mode="$(<"${cuda_mode_marker}")"
+                        fi
+                        if [[ -d "${sunshine_build_subdir}" ]] \
+                                && { [[ -f "${cuda_configure_pending}" ]] \
+                                        || { [[ -n "${previous_cuda_mode}" ]] && [[ "${previous_cuda_mode}" != "${sunshine_cuda_module}" ]]; }; }; then
+                                if [[ -f "${cuda_configure_pending}" ]]; then
+                                        log "Sunshine fork build: previous configure did not complete; wiping ${sunshine_build_subdir}"
+                                else
+                                        log "Sunshine fork build: CUDA module changed (${previous_cuda_mode} -> ${sunshine_cuda_module}); wiping ${sunshine_build_subdir}"
+                                fi
+                                rm -rf "${sunshine_build_subdir}"
+                        fi
+
                         configure_git_safe_directories
+                        install -d -m 0755 "${sunshine_build_subdir}"
+                        : > "${cuda_configure_pending}"
                         (
                                 cd "${SUNSHINE_BUILD_DIR}"
                                 cmake -S . -B build -G Ninja \
                                         -DCMAKE_BUILD_TYPE=Release \
                                         -DBUILD_TESTS=OFF \
                                         -DSUNSHINE_BUILD_TESTS=OFF \
+                                        "${cmake_sunshine_cuda_args[@]}" \
                                         "${cmake_cuda_args[@]}"
+                        )
+                        rm -f "${cuda_configure_pending}"
+                        printf '%s\n' "${sunshine_cuda_module}" > "${cuda_mode_marker}"
+                        log "Sunshine fork build: configure complete (CUDA module=${sunshine_cuda_module}); DRM/KMS/Wayland/NVENC streaming path enabled."
+                        (
+                                cd "${SUNSHINE_BUILD_DIR}"
                                 cmake --build build --target sunshine -j "${SUNSHINE_BUILD_JOBS}"
                         )
 
@@ -1828,9 +3549,42 @@ install_sunshine_from_fork_if_requested() {
                         built_bin="$(find "${SUNSHINE_BUILD_DIR}/build" -type f -name sunshine -perm -111 2>/dev/null | head -n1)"
                         [[ -x "${built_bin}" ]] || die "Could not find built Sunshine binary in ${SUNSHINE_BUILD_DIR}/build"
 
+                        # Install the source-built binary to both the
+                        # CloudDeploy-internal path AND the generic
+                        # /usr/local/bin/sunshine path. The service uses
+                        # SUNSHINE_INSTALL_BIN, but /usr/local/bin/sunshine
+                        # shadows any stale packaged /usr/bin/sunshine in
+                        # ${PATH} so manual `sunshine` invocations and the
+                        # web UI's "Open Sunshine" both pick the patched
+                        # fork build. This avoids the libminiupnpc / libicu
+                        # version-skew failure mode that recurs when the
+                        # apt-installed Sunshine library ABI drifts away
+                        # from what the source build linked against.
                         install -m 0755 "${built_bin}" "${SUNSHINE_INSTALL_BIN}"
+                        install -m 0755 "${built_bin}" /usr/local/bin/sunshine
                         if command -v setcap >/dev/null 2>&1; then
-                                setcap cap_sys_admin,cap_sys_nice+ep "${SUNSHINE_INSTALL_BIN}" || true
+                                # CAP_SYS_ADMIN:        KMS framebuffer handle access
+                                #                       (drm_info / KMS capture) +
+                                #                       DRM master handoff. Without
+                                #                       it Sunshine logs "Failed to
+                                #                       gain CAP_SYS_ADMIN" +
+                                #                       "missing_fb_handle" and
+                                #                       falls back to
+                                #                       /dev/dri/card0 Virtual-1
+                                #                       1024x768 on a multi-GPU VM.
+                                # CAP_NET_BIND_SERVICE: bind Sunshine's privileged
+                                #                       ports (47984 RTSP, etc.)
+                                #                       when not running as root.
+                                # CAP_SYS_NICE:         NVENC encode threads use
+                                #                       SCHED_FIFO-ish priority for
+                                #                       stable 4K120 latency. The
+                                #                       known-good live-VM install
+                                #                       had it; preserve here so
+                                #                       deploys exactly match.
+                                for sunshine_bin_target in "${SUNSHINE_INSTALL_BIN}" /usr/local/bin/sunshine; do
+                                        setcap cap_sys_admin,cap_net_bind_service,cap_sys_nice+ep "${sunshine_bin_target}" || true
+                                        log "setcap on ${sunshine_bin_target}: $(getcap "${sunshine_bin_target}" 2>/dev/null || true)"
+                                done
                         fi
 
                         [[ -d "${SUNSHINE_BUILD_DIR}/build/assets" ]] || die "Sunshine fork build assets missing: ${SUNSHINE_BUILD_DIR}/build/assets"
@@ -1894,8 +3648,27 @@ install_optional_apt_package_if_available() {
         fi
 }
 
+libnvidia_egl_gbm_already_provided_by_gl_server() {
+        # On Ubuntu 25.10 the libnvidia-gl-${TARGET_NVIDIA_DRIVER_MAJOR}-server package
+        # ships /usr/lib/x86_64-linux-gnu/libnvidia-egl-gbm.so.1.x.y itself. Installing
+        # the standalone libnvidia-egl-gbm1 package then fails with a dpkg file-overwrite
+        # conflict. Detect that case and skip the standalone install.
+        local pkg
+        for pkg in $(dpkg-query -W -f='${db:Status-Abbrev} ${binary:Package}\n' 'libnvidia-gl-*-server' 2>/dev/null \
+                | awk '$1 == "ii" { print $2 }'); do
+                if dpkg -L "${pkg}" 2>/dev/null | grep -qE '/libnvidia-egl-gbm[.]so'; then
+                        log "libnvidia-egl-gbm.so is already provided by ${pkg}; skipping libnvidia-egl-gbm1 install to avoid dpkg file conflict."
+                        return 0
+                fi
+        done
+        return 1
+}
+
 ensure_nvidia_egl_helper_packages() {
         install_optional_apt_package_if_available "libnvidia-egl-wayland1"
+        if libnvidia_egl_gbm_already_provided_by_gl_server; then
+                return 0
+        fi
         install_optional_apt_package_if_available "libnvidia-egl-gbm1"
 }
 
@@ -2267,17 +4040,83 @@ apt_update_retry() {
         return "${update_rc}"
 }
 
+_clouddeploy_apt_progress_pid=""
+start_apt_progress_reporter() {
+        # Background heartbeat for long apt-get install runs that would
+        # otherwise look frozen from the operator's terminal. Tails
+        # /var/log/dpkg.log every ${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}
+        # seconds and prints the last changed line. Only enabled for
+        # batches with >= ${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15} packages
+        # (override either via env to tune). No-ops when /var/log/dpkg.log
+        # is unreadable or when one is already running.
+        local pkg_count="$1"
+        local threshold="${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15}"
+        local interval="${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}"
+        [[ -z "${_clouddeploy_apt_progress_pid}" ]] || return 0
+        [[ "${pkg_count}" -ge "${threshold}" ]] || return 0
+        [[ -r /var/log/dpkg.log ]] || return 0
+
+        (
+                # In the background subshell, detach from the trap and
+                # disable -e so a momentarily-missing dpkg.log line doesn't
+                # kill the reporter.
+                trap - ERR
+                set +eE
+                local last_line="" cur idle=0
+                while sleep "${interval}"; do
+                        cur="$(tail -n1 /var/log/dpkg.log 2>/dev/null || true)"
+                        if [[ -n "${cur}" && "${cur}" != "${last_line}" ]]; then
+                                printf '[apt-progress %s] %s\n' "$(date '+%T')" "${cur}"
+                                last_line="${cur}"
+                                idle=0
+                        else
+                                idle=$((idle + 1))
+                                printf '[apt-progress %s] dpkg.log idle for %d×%ss (last: %s)\n' \
+                                        "$(date '+%T')" "${idle}" "${interval}" "${last_line:-none yet}"
+                        fi
+                done
+        ) &
+        _clouddeploy_apt_progress_pid=$!
+        disown "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+}
+
+stop_apt_progress_reporter() {
+        if [[ -n "${_clouddeploy_apt_progress_pid}" ]]; then
+                kill "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+                wait "${_clouddeploy_apt_progress_pid}" 2>/dev/null || true
+                _clouddeploy_apt_progress_pid=""
+        fi
+}
+
 apt_install_wait() {
-        local install_out install_rc
+        local install_out install_rc pkg_count=$#
+        local sample
+        sample="$(printf '%s\n' "$@" | head -n 6 | tr '\n' ' ')"
+        if (( pkg_count > 6 )); then
+                log "apt-get install: ${pkg_count} packages (sample: ${sample}...)"
+        else
+                log "apt-get install: ${pkg_count} packages (${sample})"
+        fi
+        if (( pkg_count >= "${CLOUDDEPLOY_APT_PROGRESS_THRESHOLD:-15}" )); then
+                log "Large package batch incoming; dpkg-log heartbeat enabled. Output may go quiet for several minutes - this is normal. Watch /var/log/dpkg.log if needed."
+        fi
 
         wait_for_apt
         repair_dpkg_state_if_needed
-        install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+
+        start_apt_progress_reporter "${pkg_count}"
+        install_out="$(DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+        stop_apt_progress_reporter
         printf '%s\n' "${install_out}"
+
         if [[ "${install_rc}" -ne 0 ]]; then
                 log "apt-get install failed; attempting dpkg repair and one retry"
                 repair_dpkg_state_if_needed
-                install_out="$(DEBIAN_FRONTEND=noninteractive apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+                start_apt_progress_reporter "${pkg_count}"
+                install_out="$(DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a NEEDRESTART_SUSPEND=1 \
+                        apt-get "${APT_DPKG_OPTIONS[@]}" install -y "$@" 2>&1)" && install_rc=0 || install_rc=$?
+                stop_apt_progress_reporter
                 printf '%s\n' "${install_out}"
         fi
         return "${install_rc}"
@@ -2301,16 +4140,34 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-hdr = ${ENABLE_HDR}
-fps = [60, ${TARGET_FPS}]
-resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
+# Intentionally NOT writing 'hdr = ...', 'fps = ...', or 'resolutions = ...':
+# Sunshine logs
+#   Warning: Unrecognized configurable option [hdr]
+#   Warning: Unrecognized configurable option [fps]
+#   Warning: Unrecognized configurable option [resolutions]
+# for all three. The HDR negotiation happens via Moonlight's launch
+# request and the Sunshine fork enforces AV1 Main10 / P010 / BT.2020 PQ
+# in src/rtsp.cpp + src/video.cpp (commit 464bccf1; see
+# docs/SUNSHINE-HDR-NEGOTIATION.md). The fps/resolution offered to the
+# client come from KWin's EDID + the active mode line, not from
+# sunshine.conf - writing them here just produces noise in the journal.
 stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 EOF
+        # CSRF allowlist: localhost + 127.0.0.1 are needed for the
+        # Sunshine web UI when accessed via SSH tunnel or local browser
+        # on the host. The Tailscale IP is added when available so
+        # remote PIN-pairing over Tailscale works. Without these origins
+        # Sunshine's PIN endpoint rejects the POST with a CSRF error.
+        local -a csrf_origins=(
+                "https://localhost:47990"
+                "https://127.0.0.1:47990"
+        )
         if [[ -n "${ts_ip}" ]]; then
-                printf 'csrf_allowed_origins = https://%s:47990\n' "${ts_ip}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+                csrf_origins+=("https://${ts_ip}:47990")
         fi
+        printf 'csrf_allowed_origins = %s\n' "$(IFS=,; printf '%s' "${csrf_origins[*]}")" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
         chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 }
 
@@ -2409,10 +4266,13 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TAILSCALE_AUTHKEY=%q\n' "${TAILSCALE_AUTHKEY}"
         printf 'SUNSHINE_DEB_URL=%q\n' "https://github.com/LizardByte/Sunshine/releases/download/v2025.924.154138/sunshine-ubuntu-24.04-amd64.deb"
         printf 'FORCED_CONNECTOR=%q\n' "DP-1"
+        printf 'FORCE_CONNECTOR_AUTO=%q\n' "0"
+        printf 'CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=%q\n' "0"
         printf 'TARGET_WIDTH=%q\n' "3840"
         printf 'TARGET_HEIGHT=%q\n' "2160"
         printf 'TARGET_FPS=%q\n' "120"
         printf 'ENABLE_HDR=%q\n' "0"
+        printf 'ENABLE_PLASMA6=%q\n' "0"
         printf 'EDID_PROFILE=%q\n' "auto"
         printf 'KWIN_VTNR=%q\n' "7"
         printf 'KWIN_WAYLAND_DISPLAY=%q\n' "wayland-0"
@@ -2429,15 +4289,40 @@ install -m 0600 /dev/null "${ENV_FILE}"
         printf 'TARGET_NVIDIA_DRIVER_MAJOR=%q\n' "580"
         printf 'INSTALL_CUDA_TOOLKIT=%q\n' "1"
         printf 'CUDA_TOOLKIT_PACKAGE=%q\n' "cuda-toolkit"
+        printf 'CUDA_INSTALL_METHOD=%q\n' "auto"
+        printf 'REQUIRE_CUDA_TOOLKIT=%q\n' "1"
+        printf 'CUDA_RUNFILE_VERSION=%q\n' "13.0.2"
+        printf 'CUDA_RUNFILE_DRIVER_VERSION=%q\n' "580.95.05"
+        printf 'CUDA_RUNFILE_URL=%q\n' "https://developer.download.nvidia.com/compute/cuda/13.0.2/local_installers/cuda_13.0.2_580.95.05_linux.run"
         printf 'FORCE_DRIVER_UPGRADE=%q\n' "1"
-                        printf 'SUNSHINE_SOURCE_MODE=%q\n' "fork"
+        printf 'SUNSHINE_SOURCE_MODE=%q\n' "fork"
         printf 'SUNSHINE_FORK_REPO=%q\n' "https://github.com/NoviceAtPython/Sunshine.git"
         printf 'SUNSHINE_DIAGNOSTIC_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
         printf 'SUNSHINE_CLEAN_FORK_BRANCH=%q\n' "clouddeploy-clean-pairing-stream-fix"
         printf 'SUNSHINE_FORK_BRANCH=%q\n' "codex/sunshine-pairing-diagnostics"
+        # Pinned known-good HDR commit. Update only when a newer fork
+        # commit has been validated end-to-end (Moonlight overlay reads
+        # "AV1 10-bit HDR"). See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md.
+        printf 'SUNSHINE_FORK_COMMIT=%q\n' "464bccf1b6e33bf35138136c6138fd9851e6d906"
         printf 'SUNSHINE_BUILD_DIR=%q\n' "/opt/sunshine-src"
         printf 'SUNSHINE_BUILD_JOBS=%q\n' "2"
         printf 'SUNSHINE_INSTALL_BIN=%q\n' "/usr/local/bin/sunshine-clouddeploy"
+        printf 'SUNSHINE_ENABLE_CUDA_MODULE=%q\n' "auto"
+        # Default both HDR knobs to "${ENABLE_HDR}" so flipping ENABLE_HDR=1
+        # in this file automatically enables Sunshine's HDR control-packet
+        # synthesis (without that, Moonlight's overlay labels the stream
+        # SDR even when the bitstream is BT.2020+SMPTE2084).
+        printf 'SUNSHINE_FORCE_AV1_HDR10=%q\n' "${ENABLE_HDR:-0}"
+        printf 'SUNSHINE_SYNTHESIZE_HDR10_METADATA=%q\n' "${ENABLE_HDR:-0}"
+        printf 'CLOUDDEPLOY_AUTO_DIST_UPGRADE=%q\n' "0"
+        printf 'CLOUDDEPLOY_TARGET_UBUNTU_VERSION=%q\n' "25.10"
+        printf 'CLOUDDEPLOY_ACCEPT_NON_LTS=%q\n' "0"
+        printf 'CLOUDDEPLOY_DIRECT_APT_CODENAME_UPGRADE=%q\n' "auto"
+        printf 'CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_MODESET_PLANE_PROPS=%q\n' "0"
+        printf 'KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR_METADATA=%q\n' "0"
+        printf 'PATCHED_KWIN_MARKER=%q\n' "/var/lib/clouddeploy/patched-kwin-installed"
         printf 'ENABLE_USER_NOPASSWD_SUDO=%q\n' "1"
         printf 'ALLOW_ROOT_SESSION=%q\n' "0"
 } > "${ENV_FILE}"
@@ -2469,6 +4354,10 @@ if [[ "${HEADLESS_USER}" == "root" && "${ALLOW_ROOT_SESSION}" != "1" ]]; then
         [[ -n "${HEADLESS_USER}" ]] || { echo "HEADLESS_USER resolved to root and no real UID>=1000 user was found" >&2; exit 1; }
 fi
 STREAM_MODE="${STREAM_MODE:-plasma}"
+ENABLE_PLASMA6="${ENABLE_PLASMA6:-0}"
+if [[ "${ENABLE_PLASMA6}" == "1" && "${STREAM_MODE}" == "plasma" ]]; then
+        STREAM_MODE="plasma6"
+fi
 PLASMA_LAUNCH_MODE="${PLASMA_LAUNCH_MODE:-startplasma}"
 FORCED_CONNECTOR="${FORCED_CONNECTOR:-DP-1}"
 TARGET_WIDTH="${TARGET_WIDTH:-3840}"
@@ -2511,8 +4400,8 @@ if [[ -z "${SUNSHINE_DRM_DEVICE}" || "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
         exit 1
 fi
 
-case "${STREAM_MODE}" in
-        plasma|kwin|realvt)
+        case "${STREAM_MODE}" in
+        plasma|plasma6|kwin|realvt)
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 COMPOSITOR_LOG_UNIT="kwin-realvt.service"
                 ;;
@@ -2525,7 +4414,7 @@ case "${STREAM_MODE}" in
                 exit 1
                 ;;
         *)
-                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, kwin, weston." >&2
+                echo "Unsupported STREAM_MODE='${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston." >&2
                 exit 1
                 ;;
 esac
@@ -2563,16 +4452,21 @@ capture = kms
 adapter_name = ${SUNSHINE_DRM_DEVICE}
 hevc_mode = ${SUNSHINE_HEVC_MODE}
 av1_mode = ${SUNSHINE_AV1_MODE}
-hdr = ${ENABLE_HDR}
-fps = [60, ${TARGET_FPS}]
-resolutions = [1920x1080, 2560x1440, ${TARGET_WIDTH}x${TARGET_HEIGHT}]
+# Intentionally NOT writing 'hdr = ...', 'fps = ...', 'resolutions = ...':
+# Sunshine logs "Unrecognized configurable option" for all three. The
+# HDR negotiation flows through Moonlight's launch request + the
+# Sunshine fork's encode-selection path (commit 464bccf1; see
+# docs/SUNSHINE-HDR-NEGOTIATION.md). fps/resolution come from KWin's
+# active mode + EDID.
 stream_audio = disabled
 address_family = ipv4
 ping_timeout = 60000
 CONF
+csrf_origins="https://localhost:47990,https://127.0.0.1:47990"
 if [[ -n "${TS_IP}" ]]; then
-        printf 'csrf_allowed_origins = https://%s:47990\n' "${TS_IP}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
+        csrf_origins="${csrf_origins},https://${TS_IP}:47990"
 fi
+printf 'csrf_allowed_origins = %s\n' "${csrf_origins}" >> "${HOME_DIR}/.config/sunshine/sunshine.conf"
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.config/sunshine/sunshine.conf"
 
 systemctl reset-failed plasma-realvt.service kwin-realvt.service plasma-shell-realvt.service weston-kms-session.service sunshine-headless.service || true
@@ -2881,6 +4775,124 @@ echo "Pairing helper used Sunshine's API only; it did not inject sunshine_state.
 EOF
         chmod 0755 /usr/local/sbin/clouddeploy-pair-pin
 
+        cat > /usr/local/sbin/clouddeploy-validate-hdr-stream <<'EOF'
+#!/usr/bin/env bash
+# clouddeploy-validate-hdr-stream
+#
+# Grep the Sunshine journal for the markers that prove the HDR control
+# packet reached Moonlight after a successful Moonlight client connect.
+# Run this AFTER opening the stream from Moonlight at least once - the
+# control packet is only emitted when a client session starts. With no
+# active client this script just reports what was last seen in the journal.
+#
+# Exit codes:
+#   0 - All HDR markers seen at least once (HDR success state).
+#   1 - HDR enabled in CloudDeploy but one or more markers missing.
+#   2 - HDR not enabled in CloudDeploy; informational dump only.
+#
+# Required markers (when ENABLE_HDR=1):
+#   * "NVIDIA private HDR via NV_INPUT_COLORSPACE=BT.2100 PQ"
+#     OR  "NVIDIA private HDR via NV_CRTC_REGAMMA_TF=PQ"
+#   * "Encode selection:"  with selected_colorspace=HDR, _bit_depth=10-bit,
+#     _pix_fmt=p010
+#   * "HDR metadata fallback" or "HDR control message ... SYNTHESIZED HDR10"
+#     (proves the Sunshine fork synthesised HDR10 defaults on the NVIDIA
+#     private DRM path - this is what flips Moonlight's overlay)
+#   * "Sent HDR mode control packet to Moonlight: enabled=1"
+#     (this is THE ground truth Moonlight reads for the overlay)
+set -euo pipefail
+
+ENV_FILE="/etc/clouddeploy-wayland.env"
+if [[ -f "${ENV_FILE}" ]]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "${ENV_FILE}"
+        set +a
+fi
+
+ENABLE_HDR="${ENABLE_HDR:-0}"
+SINCE="${1:-15 minutes ago}"
+
+journal="$(journalctl -u sunshine-headless.service --since "${SINCE}" --no-pager 2>/dev/null || true)"
+if [[ -z "${journal}" ]]; then
+        echo "No sunshine-headless.service journal entries since ${SINCE}." >&2
+        exit 1
+fi
+
+mark() {
+        local name="$1"
+        local pattern="$2"
+        local match
+        match="$(printf '%s\n' "${journal}" | grep -E "${pattern}" | tail -n1 || true)"
+        if [[ -n "${match}" ]]; then
+                printf '  [OK]   %s\n        %s\n' "${name}" "${match}"
+                return 0
+        else
+                printf '  [MISS] %s\n' "${name}"
+                return 1
+        fi
+}
+
+echo "=== clouddeploy-validate-hdr-stream (since: ${SINCE}, ENABLE_HDR=${ENABLE_HDR}) ==="
+
+ok=1
+mark "NVIDIA private HDR detected on active CRTC/plane" \
+        'is_hdr: NVIDIA private HDR via (NV_CRTC_REGAMMA_TF=PQ|NV_INPUT_COLORSPACE=BT.2100 PQ|NV_INPUT_COLORSPACE=BT2100 PQ)' || ok=0
+mark "Encode selection chose HDR colorspace" \
+        'Encode selection:.*selected_colorspace=HDR' || ok=0
+mark "Encode selection chose 10-bit depth" \
+        'Encode selection:.*selected_bit_depth=10-bit' || ok=0
+mark "Encode selection chose P010 pix_fmt" \
+        'Encode selection:.*selected_pix_fmt=p010' || ok=0
+mark "Sunshine fork synthesised HDR10 static metadata" \
+        'HDR metadata fallback: standard DRM HDR_OUTPUT_METADATA blob is 0|SYNTHESIZED HDR10 defaults' || ok=0
+mark "Moonlight client received HDR control packet enabled=1" \
+        'Sent HDR mode control packet to Moonlight: enabled=1' || ok=0
+mark "NvEnc colour-config emitted for AV1 (BT.2020 + PQ)" \
+        'NvEnc color-config: codec=AV1' || ok=0
+
+# Failure signals - if any of these are present, HDR is definitely off
+# even if a subset of the [OK] markers above hit on a stale earlier run.
+echo
+echo "=== HDR negative markers (must NOT appear when HDR is good) ==="
+neg_hit=0
+neg() {
+        local name="$1"
+        local pattern="$2"
+        local match
+        match="$(printf '%s\n' "${journal}" | grep -E "${pattern}" | tail -n1 || true)"
+        if [[ -n "${match}" ]]; then
+                printf '  [HIT]  %s\n        %s\n' "${name}" "${match}"
+                neg_hit=1
+        else
+                printf '  [ok]   %s (not seen)\n' "${name}"
+        fi
+}
+neg "Sunshine fell back to AV1 SDR" \
+        'Color coding: SDR \(Rec\. 601\)|Color coding: SDR \(Rec\. 709\)' || true
+neg "HDR control packet sent with enabled=0" \
+        'Sent HDR mode control packet to Moonlight: enabled=0|Sent HDR mode: false|Sent HDR mode: 0' || true
+
+if [[ "${neg_hit}" -ne 0 ]]; then
+        ok=0
+fi
+
+echo
+if [[ "${ENABLE_HDR}" != "1" ]]; then
+        echo "ENABLE_HDR is not 1 in ${ENV_FILE} - informational dump only."
+        exit 2
+fi
+
+if [[ "${ok}" -eq 1 ]]; then
+        echo "RESULT: HDR streaming markers all confirmed. Moonlight overlay should read 'AV1 10-bit HDR'."
+        exit 0
+else
+        echo "RESULT: One or more HDR streaming markers missing. Connect Moonlight, start a stream, then re-run this validator with a fresh --since window." >&2
+        exit 1
+fi
+EOF
+        chmod 0755 /usr/local/sbin/clouddeploy-validate-hdr-stream
+
         systemctl daemon-reload
 }
 
@@ -2896,6 +4908,11 @@ KNOWN_SUNSHINE_SAMPLE_LINE=""
 KNOWN_SUNSHINE_EGL_LINE=""
 KNOWN_SUNSHINE_GL_LINE=""
 KNOWN_SUNSHINE_FAILURE_LINE=""
+KNOWN_SUNSHINE_PIXEL_FORMAT_LINE=""
+KNOWN_SUNSHINE_COLOR_DEPTH_LINE=""
+KNOWN_SUNSHINE_HDR_FORMAT_LINE=""
+KNOWN_SUNSHINE_KMS_CONNECTOR_LINE=""
+KNOWN_SUNSHINE_WRONG_CONNECTOR_LINE=""
 LAST_WESTON_LOG=""
 LAST_SUNSHINE_LOG=""
 LAST_SUNSHINE_START_SINCE=""
@@ -2923,7 +4940,7 @@ refresh_streaming_log_markers() {
         local sunshine_since="${1:-}"
 
         case "${STREAM_MODE}" in
-                plasma)
+                plasma|plasma6)
                         LAST_WESTON_LOG="$(journalctl -u kwin-realvt.service -n 260 --no-pager 2>/dev/null || true)"
                         local support_info
                         support_info="$(kwin_support_information || true)"
@@ -2991,8 +5008,31 @@ refresh_streaming_log_markers() {
         KNOWN_SUNSHINE_GL_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'GL: renderer:.*NVIDIA|GL renderer.*NVIDIA|OpenGL renderer.*NVIDIA|renderer: NVIDIA GeForce' \
                 | tail -n1 || true)"
+        KNOWN_SUNSHINE_PIXEL_FORMAT_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'pixel_format=|pixel format|DRM_FORMAT|fourcc=|format=(XR24|AR24|AB30|XB30|P010|P012|XB4H|AR30|XR30)' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_COLOR_DEPTH_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'Color depth:|10-bit|Main10|P010|P012|hevc_nvenc|av1_nvenc' \
+                | tail -n1 || true)"
+        KNOWN_SUNSHINE_HDR_FORMAT_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'pixel_format=(AB30|XB30|P010|P012|XB4H|AR30|XR30)|format=(AB30|XB30|P010|P012|XB4H|AR30|XR30)|DRM_FORMAT_(ARGB2101010|XRGB2101010|P010|P012)' \
+                | tail -n1 || true)"
         KNOWN_SUNSHINE_FAILURE_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
                 | grep -Ei 'llvmpipe|Couldn'\''t open EGL display|Couldn'\''t initialize EGL display|Encoder \[nvenc\] failed|Couldn'\''t find any working encoder|Fatal: Unable to find display or encoder|Missing file: /usr/local/assets/web/index[.]html' \
+                | tail -n1 || true)"
+        # STREAM_DIAG line that names the connector Sunshine actually bound to.
+        # Used to detect the failure mode where Sunshine fell back to
+        # /dev/dri/card0 connector=Virtual-1 instead of the NVIDIA card on
+        # FORCED_CONNECTOR.
+        KNOWN_SUNSHINE_KMS_CONNECTOR_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'STREAM_DIAG.*kms[[:space:]]*capture[[:space:]]*selected.*connector=|drm_device=.*connector=' \
+                | tail -n1 || true)"
+        # Same line but only when the chosen connector is NOT FORCED_CONNECTOR.
+        # If non-empty, Sunshine picked the wrong output and the deploy must
+        # not be claimed successful.
+        KNOWN_SUNSHINE_WRONG_CONNECTOR_LINE="$(printf '%s\n' "${LAST_SUNSHINE_LOG}" \
+                | grep -Ei 'STREAM_DIAG.*kms[[:space:]]*capture[[:space:]]*selected.*connector=|drm_device=.*connector=' \
+                | grep -Eiv "connector=${FORCED_CONNECTOR}([[:space:]]|$)" \
                 | tail -n1 || true)"
 }
 
@@ -3141,12 +5181,219 @@ wait_for_sunshine_post_start_markers() {
         return 1
 }
 
+install_clouddeploy_pipewire_virtual_sink() {
+        # Ensure at least one PipeWire sink exists so Sunshine always has a
+        # capture surface. Cloud VMs typically have no real HDA/USB audio
+        # device. Moonlight receives the stream and the client (Windows etc.)
+        # routes audio to whatever physical headset/MixAmp the user wants -
+        # the VM only needs a working source/sink for Sunshine to capture.
+        [[ -n "${HOME_DIR:-}" ]] || return 0
+        local conf_dir="${HOME_DIR}/.config/pipewire/pipewire.conf.d"
+        install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${HOME_DIR}/.config/pipewire"
+        install -d -m 0755 -o "${HEADLESS_USER}" -g "${HEADLESS_USER}" "${conf_dir}"
+        cat > "${conf_dir}/99-clouddeploy-virtual-sink.conf" <<'EOF'
+# CloudDeploy: PipeWire null sink so Sunshine always has a capture surface
+# even when no real HDA/USB audio device is attached. Sunshine captures
+# from the monitor source on this sink; Moonlight ships the audio stream
+# to the client which routes it to whatever physical output the user has.
+context.objects = [
+    {   factory = adapter
+        args = {
+            factory.name              = support.null-audio-sink
+            node.name                 = CloudDeployVirtualSink
+            node.description          = "CloudDeploy Virtual Sink"
+            media.class               = "Audio/Sink"
+            object.linger             = true
+            audio.position            = "FL,FR"
+            audio.channels            = 2
+            audio.rate                = 48000
+            audio.format              = "F32LE"
+            monitor.channel-volumes   = true
+        }
+    }
+]
+EOF
+        chown "${HEADLESS_USER}:${HEADLESS_USER}" "${conf_dir}/99-clouddeploy-virtual-sink.conf"
+        chmod 0644 "${conf_dir}/99-clouddeploy-virtual-sink.conf"
+        log "Installed PipeWire null sink config at ${conf_dir}/99-clouddeploy-virtual-sink.conf"
+}
+
+print_audio_diagnostics() {
+        echo "=== Audio stack diagnostics ==="
+        local pkg
+        for pkg in pipewire wireplumber pipewire-pulse pulseaudio-utils; do
+                printf '  %s: ' "${pkg}"
+                if dpkg_package_configured_ii "${pkg}"; then
+                        echo "installed"
+                else
+                        echo "NOT installed"
+                fi
+        done
+
+        if [[ -n "${HEADLESS_USER:-}" ]] && id "${HEADLESS_USER}" >/dev/null 2>&1; then
+                local headless_uid
+                headless_uid="$(id -u "${HEADLESS_USER}")"
+                local runtime_dir="/run/user/${headless_uid}"
+
+                echo
+                echo "Systemd user units for ${HEADLESS_USER}:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        systemctl --user --no-pager --full status pipewire wireplumber pipewire-pulse 2>&1 \
+                        | sed -n '1,30p' || true
+
+                echo
+                echo "pactl info:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl info 2>&1 | sed -n '1,12p' || true
+
+                echo
+                echo "pactl list short sinks:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl list short sinks 2>&1 || true
+
+                echo
+                echo "pactl list short sources:"
+                runuser -u "${HEADLESS_USER}" -- env XDG_RUNTIME_DIR="${runtime_dir}" \
+                        pactl list short sources 2>&1 || true
+        else
+                echo "HEADLESS_USER not resolved; skipping pactl diagnostics."
+        fi
+}
+
+print_experimental_dkms_hdr_metadata_notice() {
+        [[ "${CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA}" == "1" ]] || return 0
+        log "CLOUDDEPLOY_EXPERIMENTAL_NVIDIA_DKMS_HDR_METADATA=1 was requested."
+        log "  No NVIDIA DKMS HDR metadata patches are bundled in this revision."
+        log "  The metadata path remained experimental (NV_HDR_STATIC_METADATA blob 0 is expected in the working state)."
+        log "  See docs/HDR-NVIDIA-PRIVATE.md for the documented best-next experiment if you want to resume metadata work."
+        log "  Deployment continues with the stock NVIDIA driver and metadata off."
+}
+
+patched_kwin_installed() {
+        # Detect whether the CloudDeploy patched KWin with NVIDIA private HDR
+        # support is on this system. The build pipeline drops
+        # ${PATCHED_KWIN_MARKER} on a successful install. Until the patch is
+        # integrated, this returns non-zero and require_patched_kwin_if_hdr
+        # refuses ENABLE_HDR=1.
+        [[ -f "${PATCHED_KWIN_MARKER}" ]]
+}
+
+require_patched_kwin_if_hdr() {
+        # Called AFTER build_install_patched_kwin has had a chance to run,
+        # so a fresh ENABLE_HDR=1 VM is allowed to build the patched KWin on
+        # its first pass. Two failure modes, both fatal:
+        #   * ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR != 1 -
+        #     the user explicitly disabled the patched path, so the build
+        #     phase was skipped and no marker will ever land. Stock KWin
+        #     would hit "the driver rejected the output configuration".
+        #   * KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 but ${PATCHED_KWIN_MARKER}
+        #     is missing - the build pipeline did not complete successfully.
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" != "1" ]]; then
+                die "ENABLE_HDR=1 but KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}. The stock KWin connector HDR path causes NVIDIA driver rejection. Either leave KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR unset (it inherits ENABLE_HDR=1) or set it to 1; set ENABLE_HDR=0 for an SDR deployment. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+
+        case "${FORCED_CONNECTOR}" in
+                Virtual*|virtual*)
+                        if [[ "${CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR}" != "1" ]]; then
+                                die "ENABLE_HDR=1 with FORCED_CONNECTOR=${FORCED_CONNECTOR}. Virtual-* connectors are virtio-gpu outputs and cannot reach the documented NVIDIA private HDR state. Set FORCED_CONNECTOR=DP-1 (or another real NVIDIA DRM connector) and re-run, or set CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1 only if you have explicitly verified the NV private DRM props exist on that virtual output (they almost certainly don't)."
+                        fi
+                        log "WARNING: ENABLE_HDR=1 with FORCED_CONNECTOR=${FORCED_CONNECTOR}; CLOUDDEPLOY_ALLOW_VIRTUAL_CONNECTOR=1 was set so proceeding anyway. The HDR validation gate will still refuse to claim success unless drm_info shows the NV private DRM props on this output."
+                        ;;
+        esac
+
+        if ! patched_kwin_installed; then
+                die "ENABLE_HDR=1 requires a patched KWin with NVIDIA private HDR support, but no patched KWin marker is present at ${PATCHED_KWIN_MARKER} after the patched-kwin phase. The build/install pipeline did not complete successfully. Check the patched-kwin phase logs; inspect /usr/local/src/clouddeploy-kwin and the dpkg-buildpackage output for apt-get build-dep / apt source / patch -p1 / dpkg-buildpackage failures. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+
+        log "ENABLE_HDR=1 prerequisites OK: KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 and patched KWin marker present at ${PATCHED_KWIN_MARKER}"
+}
+
+validate_hdr_final_state() {
+        # Runs after KWin is up and the force-mode helper has driven the
+        # ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} scale.1 path. When
+        # ENABLE_HDR=1 the deploy is only considered successful if both:
+        #   1. kscreen-doctor -o reports HDR enabled + Wide Color Gamut enabled
+        #      on ${FORCED_CONNECTOR}.
+        #   2. drm_info shows the NVIDIA private DRM properties on the
+        #      *active* CRTC and *active* primary plane driving that
+        #      connector (not just somewhere in the global dump):
+        #         active CRTC NV_CRTC_REGAMMA_TF = PQ
+        #         active primary plane NV_INPUT_COLORSPACE = BT.2100 PQ
+        #         active primary plane NV_PLANE_DEGAMMA_TF = PQ
+        #      NV_HDR_STATIC_METADATA = blob 0 is the expected good state;
+        #      anything else is noted but accepted (metadata stays experimental).
+        # If the state is not reached, the deploy fails loudly with diagnostics
+        # rather than silently continuing.
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        log "Validating final HDR state (KScreen HDR/WCG + NVIDIA private DRM props on active CRTC/plane)"
+
+        if [[ -z "${HEADLESS_USER:-}" ]] || [[ -z "${RUNTIME_DIR:-}" ]] || [[ -z "${KWIN_DISPLAY:-}" ]]; then
+                die "HDR validation: HEADLESS_USER/RUNTIME_DIR/KWIN_DISPLAY not resolved; cannot query KWin."
+        fi
+
+        local kscreen_out connector_block hdr_line wcg_line
+        kscreen_out="$(runuser -u "${HEADLESS_USER}" -- env \
+                HOME="${HOME_DIR}" \
+                USER="${HEADLESS_USER}" \
+                LOGNAME="${HEADLESS_USER}" \
+                XDG_RUNTIME_DIR="${RUNTIME_DIR}" \
+                WAYLAND_DISPLAY="${KWIN_DISPLAY}" \
+                DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus" \
+                QT_QPA_PLATFORM=wayland \
+                XDG_CURRENT_DESKTOP=KDE \
+                XDG_SESSION_TYPE=wayland \
+                kscreen-doctor -o 2>&1 || true)"
+
+        connector_block="$(printf '%s\n' "${kscreen_out}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = ($0 ~ conn) ? 1 : 0 }
+                in_block { print }
+        ')"
+        hdr_line="$(printf '%s\n' "${connector_block}" | grep -iE '^[[:space:]]*HDR[[:space:]]*:' | head -n1 || true)"
+        wcg_line="$(printf '%s\n' "${connector_block}" | grep -iE '^[[:space:]]*Wide Color Gamut[[:space:]]*:' | head -n1 || true)"
+
+        if [[ "${hdr_line}" != *"enabled"* ]] || [[ "${wcg_line}" != *"enabled"* ]]; then
+                echo "=== kscreen-doctor -o output ==="
+                printf '%s\n' "${kscreen_out}"
+                echo "=== relevant ${FORCED_CONNECTOR} block ==="
+                printf '%s\n' "${connector_block}"
+                die "HDR validation failed: KScreen does not report HDR enabled + Wide Color Gamut enabled on ${FORCED_CONNECTOR}. Observed HDR='${hdr_line:-missing}', WCG='${wcg_line:-missing}'. This usually means the stock KWin connector HDR path was hit and the NVIDIA atomic check rejected the modeset. The patched KWin must skip standard connector HDR_OUTPUT_METADATA + Colorspace and set NVIDIA private CRTC/plane props instead. See docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+        log "HDR validation: KScreen reports HDR enabled + Wide Color Gamut enabled on ${FORCED_CONNECTOR}"
+
+        if ! command -v drm_info >/dev/null 2>&1; then
+                die "HDR validation failed: drm_info is not installed; cannot verify NVIDIA private DRM properties. Install libdrm-tests (already part of base-packages) and re-run."
+        fi
+        if ! command -v python3 >/dev/null 2>&1; then
+                die "HDR validation failed: python3 is not available; cannot run scripts/validate-hdr-drm-state.py."
+        fi
+
+        local helper
+        helper="$(require_clouddeploy_repo_asset "scripts/validate-hdr-drm-state.py")"
+
+        local drm_json check_out check_rc=0
+        drm_json="$(drm_info -j 2>/dev/null || true)"
+        if [[ -z "${drm_json}" ]]; then
+                die "HDR validation failed: drm_info -j produced no output. Confirm the installed drm_info supports JSON output (Ubuntu's libdrm-tests >= 2.5)."
+        fi
+
+        check_out="$(printf '%s\n' "${drm_json}" | python3 "${helper}" "${FORCED_CONNECTOR}" 2>&1)" || check_rc=$?
+        printf '%s\n' "${check_out}"
+        if [[ "${check_rc}" -ne 0 ]]; then
+                die "HDR validation failed: active CRTC or active primary plane driving ${FORCED_CONNECTOR} does not have the documented NVIDIA private DRM properties (NV_CRTC_REGAMMA_TF=PQ on active CRTC; NV_INPUT_COLORSPACE=BT.2100 PQ + NV_PLANE_DEGAMMA_TF=PQ on active primary plane). See output above and docs/HDR-NVIDIA-PRIVATE.md."
+        fi
+        log "HDR validation: active CRTC + active primary plane confirm the documented NVIDIA private HDR state."
+}
+
 known_good_clean_reset_streaming_stack() {
         log "Running clouddeploy-reset-streaming before final validation"
         write_clouddeploy_env_file
         env \
                 HEADLESS_USER="${HEADLESS_USER}" \
                 STREAM_MODE="${STREAM_MODE}" \
+                ENABLE_PLASMA6="${ENABLE_PLASMA6}" \
                 FORCED_CONNECTOR="${FORCED_CONNECTOR}" \
                 TARGET_WIDTH="${TARGET_WIDTH}" \
                 TARGET_HEIGHT="${TARGET_HEIGHT}" \
@@ -3200,7 +5447,7 @@ validate_streaming_stack_ready() {
                 die "${target_mode} is not exposed on ${FORCED_CONNECTOR}"
         fi
         case "${STREAM_MODE}" in
-                plasma|kwin|realvt) compositor_service="kwin-realvt.service" ;;
+                plasma|plasma6|kwin|realvt) compositor_service="kwin-realvt.service" ;;
                 weston) compositor_service="weston-kms-session.service" ;;
                 *) compositor_service="$(service_for_mode)" ;;
         esac
@@ -3220,7 +5467,7 @@ validate_streaming_stack_ready() {
                 die "More than one clouddeploy-force-kwin-mode.sh helper is running (${force_count})"
         fi
 
-        if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+        if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
                 pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1 || {
                         print_server_validation_diagnostics
                         die "kwin_wayland is not running"
@@ -3287,23 +5534,83 @@ validate_streaming_stack_ready() {
                 print_server_validation_diagnostics
                 die "Sunshine failure marker observed: ${KNOWN_SUNSHINE_FAILURE_LINE}"
         fi
+
+        # Refuse to claim success if Sunshine's STREAM_DIAG line shows it
+        # bound to anything other than FORCED_CONNECTOR. On a multi-GPU VM
+        # without setcap/AmbientCapabilities, Sunshine silently falls back
+        # to /dev/dri/card0 connector=Virtual-1 1024x768 instead of the
+        # NVIDIA card on DP-1. validate_hdr_final_state would still die on
+        # the active-CRTC check later, but catching it here surfaces the
+        # cause directly.
+        if [[ -n "${KNOWN_SUNSHINE_WRONG_CONNECTOR_LINE}" ]]; then
+                print_server_validation_diagnostics
+                die "Sunshine KMS capture bound to the wrong connector (expected ${FORCED_CONNECTOR}). Observed: ${KNOWN_SUNSHINE_WRONG_CONNECTOR_LINE}. Common cause: the source-built Sunshine binary lacks file caps (setcap cap_sys_admin,cap_net_bind_service+ep) or sunshine-headless.service is missing AmbientCapabilities/CapabilityBoundingSet/NoNewPrivileges=no - check getcap ${SUNSHINE_RUNTIME_BIN:-/usr/local/bin/sunshine-clouddeploy} and systemctl cat sunshine-headless.service."
+        fi
+        if [[ -n "${KNOWN_SUNSHINE_KMS_CONNECTOR_LINE}" ]]; then
+                log "Sunshine KMS capture is bound to: ${KNOWN_SUNSHINE_KMS_CONNECTOR_LINE}"
+        fi
+
+        # All three NVENC encoders must register in the Sunshine log.
+        # h264_nvenc / hevc_nvenc / av1_nvenc together are the marker that
+        # NVENC actually initialised against the loaded NVIDIA driver
+        # (not just one codec that happened to fall back to software).
+        local -a missing_nvenc=()
+        [[ -n "${KNOWN_SUNSHINE_H264_LINE}" ]] || missing_nvenc+=("h264_nvenc")
+        [[ -n "${KNOWN_SUNSHINE_HEVC_LINE}" ]] || missing_nvenc+=("hevc_nvenc")
+        [[ -n "${KNOWN_SUNSHINE_AV1_LINE}" ]]  || missing_nvenc+=("av1_nvenc")
+        if (( ${#missing_nvenc[@]} > 0 )); then
+                print_server_validation_diagnostics
+                die "Sunshine log is missing one or more NVENC encoder markers: ${missing_nvenc[*]}. Found: h264='${KNOWN_SUNSHINE_H264_LINE:-MISSING}', hevc='${KNOWN_SUNSHINE_HEVC_LINE:-MISSING}', av1='${KNOWN_SUNSHINE_AV1_LINE:-MISSING}'. Check nvidia-smi and journalctl -u sunshine-headless for NVENC init errors."
+        fi
+        log "Sunshine NVENC encoders found: h264_nvenc, hevc_nvenc, av1_nvenc"
+
+        # ENABLE_HDR=1 requires the full HDR good state, not just SDR streaming.
+        validate_hdr_final_state
+
+        # Best-effort streaming-side HDR hint. The Sunshine fork's
+        # control-packet log "Sent HDR mode control packet to Moonlight:
+        # enabled=1" only appears once a Moonlight client actually
+        # connects and starts a session, so we cannot demand it at
+        # deploy time. Instead, log an instruction so the operator can
+        # confirm HDR end-to-end after the first connect.
+        if [[ "${ENABLE_HDR:-0}" == "1" ]]; then
+                log "HDR streaming knobs in sunshine-headless.service: SUNSHINE_FORCE_AV1_HDR10=${SUNSHINE_FORCE_AV1_HDR10:-0} SUNSHINE_SYNTHESIZE_HDR10_METADATA=${SUNSHINE_SYNTHESIZE_HDR10_METADATA:-0}"
+                log "After connecting Moonlight, run /usr/local/sbin/clouddeploy-validate-hdr-stream to confirm 'Sent HDR mode control packet to Moonlight: enabled=1' and friends. See docs/final-hdr-success/KNOWN_GOOD_SUNSHINE_STATE.md for the full marker list."
+        fi
 }
 
 print_driver_cuda_sunshine_summary() {
         local actual_driver packaged_sunshine cuda_version runtime_kind
+        local driver_family driver_source cuda_source
 
         actual_driver="$(current_nvidia_driver_version || true)"
         packaged_sunshine="$(command -v sunshine 2>/dev/null || true)"
         cuda_version="$(cuda_version_line || true)"
+        driver_family="${NVIDIA_DRIVER_PACKAGE_FAMILY}"
+        [[ "${driver_family}" != "unknown" ]] || driver_family="$(installed_nvidia_driver_package_family)"
+        driver_source="${NVIDIA_DRIVER_SOURCE}"
+        if [[ "${driver_source}" == "not selected" ]]; then
+                if dpkg-query -W -f='${Status}' cuda-keyring 2>/dev/null | grep -q 'install ok installed'; then
+                        driver_source="CUDA repo"
+                else
+                        driver_source="native Ubuntu"
+                fi
+        fi
+        cuda_source="${CUDA_TOOLKIT_SOURCE}"
         if [[ "${SUNSHINE_SOURCE_MODE}" == "fork" ]]; then
                 runtime_kind="clouddeploy fork binary"
         else
                 runtime_kind="packaged .deb Sunshine"
         fi
 
+        echo "Ubuntu version: $(ubuntu_os_summary)"
         echo "NVIDIA driver target: ${TARGET_NVIDIA_DRIVER_MAJOR}"
         echo "NVIDIA driver actual: ${actual_driver:-unknown}"
+        echo "NVIDIA driver source: ${driver_source}"
+        echo "NVIDIA driver package family: ${driver_family}"
         echo "CUDA toolkit requested: ${INSTALL_CUDA_TOOLKIT}"
+        echo "CUDA toolkit install method: ${CUDA_INSTALL_METHOD}"
+        echo "CUDA toolkit source: ${cuda_source}"
         echo "CUDA version: ${cuda_version:-not detected}"
         echo "Sunshine source mode: ${SUNSHINE_SOURCE_MODE}"
         echo "Sunshine runtime type: ${runtime_kind}"
@@ -3322,6 +5629,7 @@ print_final_validation_summary() {
         local target_mode="${TARGET_WIDTH}x${TARGET_HEIGHT}"
         local edid_file cmdline_args ts_ip web_status local_serverinfo_status tailscale_serverinfo_status
         local web_code local_serverinfo_code tailscale_serverinfo_code force_count
+        local plasma_version kwin_version plasma6_active kscreen_summary hdr_markers
 
         edid_file="${SELECTED_EDID_FILE:-$(select_phase2_edid_file || true)}"
         cmdline_args="$(tr ' ' '\n' </proc/cmdline 2>/dev/null \
@@ -3347,17 +5655,36 @@ print_final_validation_summary() {
         fi
 
         force_count="$(force_mode_helper_count)"
+        plasma_version="$(installed_plasma_version || true)"
+        kwin_version="$(installed_kwin_version || true)"
+        if plasma6_mode_active; then
+                plasma6_active="yes"
+        else
+                plasma6_active="no"
+        fi
+        kscreen_summary="$(kscreen_connector_summary || true)"
+        hdr_markers="$(live_edid_hdr_markers || true)"
         echo "Selected HEADLESS_USER: ${HEADLESS_USER}"
         echo "Selected HEADLESS_UID: ${HEADLESS_UID:-unknown}"
         echo "Selected HOME_DIR: ${HOME_DIR:-unknown}"
         echo "Selected RUNTIME_DIR: ${RUNTIME_DIR:-unknown}"
         echo "clouddeploy-force-kwin-mode.sh process count: ${force_count}"
+        echo "Plasma version: ${plasma_version:-not detected}"
+        echo "KWin version: ${kwin_version:-not detected}"
+        echo "Plasma 6 experimental mode active: ${plasma6_active}"
         echo "Service kwin-realvt: $(systemctl is-active kwin-realvt.service 2>/dev/null || echo unknown)"
         echo "Service plasma-shell-realvt: $(systemctl is-active plasma-shell-realvt.service 2>/dev/null || echo unknown)"
         echo "Service sunshine-headless: $(systemctl is-active sunshine-headless.service 2>/dev/null || echo unknown)"
         echo "EDID file active: ${edid_file:-unknown}"
         echo "Kernel cmdline EDID/NVIDIA args: ${cmdline_args:-missing expected args}"
         echo "KWin reported geometry/refresh: ${KNOWN_WESTON_MODE_LINE:-not observed}"
+        echo "KScreen ${FORCED_CONNECTOR} mode/scale: ${kscreen_summary:-not observed}"
+        echo "Live EDID HDR markers:"
+        if [[ -n "${hdr_markers}" ]]; then
+                printf '%s\n' "${hdr_markers}"
+        else
+                echo "not observed"
+        fi
         echo "Process kwin_wayland: $(pgrep -a -u "${HEADLESS_USER}" -x kwin_wayland | head -n1 || echo not observed)"
         echo "Process Xwayland: $(pgrep -a -u "${HEADLESS_USER}" -x Xwayland | head -n1 || echo not observed)"
         echo "Process kactivitymanagerd: $(pgrep -a -u "${HEADLESS_USER}" -f 'kactivitymanagerd' | head -n1 || echo not observed)"
@@ -3369,13 +5696,22 @@ print_final_validation_summary() {
         echo "Sunshine non-black KMS sample: ${KNOWN_SUNSHINE_SAMPLE_LINE:-not observed}"
         echo "Sunshine EGL NVIDIA marker: ${KNOWN_SUNSHINE_EGL_LINE:-not observed}"
         echo "Sunshine GL NVIDIA marker: ${KNOWN_SUNSHINE_GL_LINE:-not observed}"
+        echo "Sunshine KMS framebuffer pixel format: ${KNOWN_SUNSHINE_PIXEL_FORMAT_LINE:-not observed}"
+        echo "Sunshine encoder/color depth: ${KNOWN_SUNSHINE_COLOR_DEPTH_LINE:-not observed}"
+        if [[ -n "${KNOWN_SUNSHINE_HDR_FORMAT_LINE}" ]]; then
+                echo "HDR-capable KMS framebuffer observed: ${KNOWN_SUNSHINE_HDR_FORMAT_LINE}"
+        elif [[ -n "${hdr_markers}" ]] \
+                && printf '%s\n' "${KNOWN_SUNSHINE_COLOR_DEPTH_LINE}" | grep -Eiq '10-bit|Main10|P010|P012' \
+                && printf '%s\n' "${KNOWN_SUNSHINE_PIXEL_FORMAT_LINE}" | grep -Eiq 'pixel_format=AR24|format=AR24|AR24'; then
+                echo "HDR EDID and 10-bit encoder available, but compositor framebuffer is still AR24/SDR."
+        fi
         echo "Sunshine H.264 encoder: ${KNOWN_SUNSHINE_H264_LINE:-not observed}"
         echo "Sunshine HEVC encoder: ${KNOWN_SUNSHINE_HEVC_LINE:-not observed}"
         echo "Sunshine AV1 encoder: ${KNOWN_SUNSHINE_AV1_LINE:-not observed}"
         echo "Sunshine web UI over Tailscale: ${web_status}"
         echo "Sunshine Moonlight serverinfo local: ${local_serverinfo_status}"
         echo "Sunshine Moonlight serverinfo over Tailscale: ${tailscale_serverinfo_status}"
-        echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR off, AV1 preferred"
+        echo "Moonlight target: ${target_mode}, ${TARGET_FPS} FPS, HDR $(if [[ "${ENABLE_HDR}" == "1" ]]; then echo on; else echo off; fi), AV1 preferred"
 }
 
 print_known_good_checklist() {
@@ -3483,6 +5819,7 @@ install_optional_apps_nonfatal() {
 # Start
 # =========================
 require_root
+acquire_clouddeploy_lock
 ensure_headless_user_context
 ensure_headless_user_admin_access
 
@@ -3507,6 +5844,45 @@ else
         HOME_DIR=""
 fi
 
+# Early FORCE_CONNECTOR_AUTO resolution: best-effort, /sys/class/drm may not
+# yet enumerate NVIDIA connectors before the driver loads. The
+# display-detection phase re-resolves once the driver is up.
+maybe_resolve_force_connector
+
+# Validate that the runtime launchers/helpers the known-good restart path
+# expects are actually present on disk. If a prior CloudDeploy run wrote
+# ${SENTINEL} but the launchers are missing (e.g. the live-VM scenario
+# where the EDID reboot fired before the launcher heredocs ran, leaving
+# kwin-realvt.service / sunshine-headless.service hitting status=203/EXEC),
+# drop the sentinel and fall through to the full install path which
+# regenerates everything in order.
+_cd_required_launchers=(
+        "${HOME_DIR:-}/.local/bin/start-kwin-realvt.sh"
+        "${HOME_DIR:-}/.local/bin/start-plasmashell-realvt.sh"
+        "${HOME_DIR:-}/.local/bin/start-sunshine-headless.sh"
+        /usr/local/bin/clouddeploy-force-kwin-mode.sh
+        /usr/local/bin/clouddeploy-wait-sunshine-session.sh
+)
+_cd_missing_launchers=()
+if [[ -n "${HOME_DIR}" ]]; then
+        for _cd_launcher in "${_cd_required_launchers[@]}"; do
+                if [[ ! -x "${_cd_launcher}" ]]; then
+                        _cd_missing_launchers+=("${_cd_launcher}")
+                fi
+        done
+fi
+if [[ -f "$SENTINEL" ]] \
+        && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]] \
+        && [[ "${#_cd_missing_launchers[@]}" -gt 0 ]]; then
+        log "SENTINEL ${SENTINEL} matches but required launchers/helpers are missing:"
+        for _cd_launcher in "${_cd_missing_launchers[@]}"; do
+                log "  missing: ${_cd_launcher}"
+        done
+        log "Dropping SENTINEL and falling through to the full install path so launchers regenerate before any service is enabled (avoids status=203/EXEC on kwin-realvt.service after an EDID reboot)."
+        rm -f "${SENTINEL}" 2>/dev/null || true
+fi
+unset _cd_required_launchers _cd_missing_launchers _cd_launcher
+
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         log "CloudDeploy-wayland has already run on this machine for version $SCRIPT_VERSION. Restarting in the known-good order and validating..."
         [[ -n "${HOME_DIR}" ]] || die "Could not determine home directory for ${HEADLESS_USER}"
@@ -3529,6 +5905,7 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
         fi
 
         install_clouddeploy_helpers
+        install_clouddeploy_pipewire_virtual_sink
         if [[ "${COMPOSITOR_SERVICE}" == "kwin-realvt.service" ]]; then
                 systemctl enable kwin-realvt.service plasma-shell-realvt.service sunshine-headless.service || true
         else
@@ -3559,6 +5936,8 @@ if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$SCRIPT_VERSION" ]]; then
 
         print_driver_cuda_sunshine_summary
         print_final_validation_summary
+        print_audio_diagnostics
+        print_experimental_dkms_hdr_metadata_notice
 
         if command -v tailscale >/dev/null 2>&1; then
                 TS_IP="$(tailscale ip -4 2>/dev/null | head -n1 || true)"
@@ -3622,24 +6001,72 @@ ensure_headless_user_admin_access
 loginctl enable-linger "${HEADLESS_USER}" 2>/dev/null || true
 chown -R "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}"
 
+if [[ "${CLOUDDEPLOY_AUTO_DIST_UPGRADE}" == "1" ]]; then
+        set_phase "ubuntu-upgrade"
+        log "Auto Ubuntu release upgrade requested (target ${CLOUDDEPLOY_TARGET_UBUNTU_VERSION}, current $(ubuntu_os_summary))"
+        maybe_upgrade_ubuntu
+fi
+
+print_experimental_dkms_hdr_metadata_notice
+
 set_phase "base-packages"
 repair_dpkg_state_if_needed
 apt_update_retry
+require_plasma6_available_from_native_repos
+mapfile -t KDE_PLASMA_PACKAGES < <(kde_plasma_package_list)
+
+# When the patched-KWin build is already installed on this VM (continuation
+# resume after the patched-kwin phase succeeded), do NOT ask apt to install
+# kwin-* / libkwin-* / plasma-workspace-wayland (which pulls kwin-wayland)
+# again - the Pin-Priority 1001 file under /etc/apt/preferences.d would block
+# the upgrade anyway, but skipping them entirely keeps apt-get's dependency
+# resolver from churning. The launcher/service paths still get kwin_wayland
+# from the patched build.
+if patched_kwin_installed; then
+        log "Patched KWin marker present (${PATCHED_KWIN_MARKER}); filtering kwin*/libkwin* out of base-packages KDE list"
+        _filtered_kde=()
+        for _kde_pkg in "${KDE_PLASMA_PACKAGES[@]}"; do
+                case "${_kde_pkg}" in
+                        kwin*|libkwin*) log "  skipping ${_kde_pkg} (held by patched-kwin pin)";;
+                        *) _filtered_kde+=("${_kde_pkg}");;
+                esac
+        done
+        KDE_PLASMA_PACKAGES=("${_filtered_kde[@]}")
+        unset _filtered_kde _kde_pkg
+fi
+
+log "Installing base packages including KDE/Plasma 6 (${#KDE_PLASMA_PACKAGES[@]} KDE packages). This phase unpacks hundreds of MB and is typically the longest quiet stretch of CloudDeploy. The dpkg-log heartbeat will print progress every ${CLOUDDEPLOY_APT_PROGRESS_INTERVAL:-30}s; tail /var/log/dpkg.log from another SSH session for line-by-line. The script is NOT stuck - do not start a second CloudDeploy run (the flock at /run/clouddeploy-wayland.lock would refuse it anyway)."
 apt_install_wait \
         curl wget ca-certificates gnupg software-properties-common \
-        pciutils jq libcap2-bin edid-decode libdrm-tests mesa-utils-extra kmscube \
+        pciutils jq libcap2-bin edid-decode mesa-utils-extra kmscube \
         dbus-user-session dbus-x11 \
-        plasma-desktop plasma-workspace plasma-workspace-wayland kwin-wayland kscreen qdbus-qt5 kde-spectacle weston xwayland seatd \
-        pipewire wireplumber xdg-desktop-portal xdg-desktop-portal-kde \
+        "${KDE_PLASMA_PACKAGES[@]}" \
+        pipewire wireplumber \
         grim imagemagick ffmpeg tcpdump pulseaudio-utils \
         ubuntu-drivers-common
+
+# drm_info binary: ships in libdrm-tests on Ubuntu 24.04 and earlier, but
+# was split out into the drm-info package on 25.10/questing. Install
+# whichever one apt actually has; we need the drm_info binary for
+# validate_hdr_final_state's active-CRTC/plane verification.
+install_optional_apt_package_if_available "drm-info"
+install_optional_apt_package_if_available "libdrm-tests"
+if ! command -v drm_info >/dev/null 2>&1; then
+        log "WARNING: drm_info binary not available after installing drm-info / libdrm-tests. HDR validation will fail later. Check apt-cache search drm[-_]info on this Ubuntu release."
+fi
+validate_plasma6_runtime_commands
 mark_phase_done "base-packages.done"
 mark_phase_done "kde-installed.done"
 
 set_phase "nvidia-repository"
 repair_dpkg_state_if_needed
-log "Ensuring CUDA/NVIDIA apt repository is available"
-ensure_cuda_ubuntu_repo
+log "Detecting CUDA/NVIDIA apt repository support for $(ubuntu_os_summary)"
+if [[ "$(ubuntu_version_id)" == "24.04" ]]; then
+        ensure_cuda_ubuntu_repo
+else
+        NVIDIA_DRIVER_SOURCE="native Ubuntu"
+        log "Ubuntu $(ubuntu_version_id) detected; CUDA repo setup is deferred until CUDA toolkit phase so native NVIDIA driver packages are preferred."
+fi
 
 set_phase "nvidia-driver"
 log "CUDA toolkit install is deferred until nvidia-smi works."
@@ -3667,6 +6094,21 @@ SUNSHINE_RUNTIME_BIN="$(sunshine_runtime_bin)"
 [[ -x "${SUNSHINE_RUNTIME_BIN}" ]] || die "Sunshine runtime binary is not executable: ${SUNSHINE_RUNTIME_BIN}"
 log "Using Sunshine runtime binary: ${SUNSHINE_RUNTIME_BIN}"
 ensure_nvidia_egl_vulkan_runtime_config
+
+if [[ "${KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR}" == "1" ]] && ! patched_kwin_installed; then
+        set_phase "patched-kwin"
+        build_install_patched_kwin
+        mark_phase_done "patched-kwin.done"
+fi
+
+# Always gate ENABLE_HDR=1 on the patched-kwin marker, regardless of how we
+# got here. If KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=1 we just built it (or
+# the marker was already there from a previous run). If ENABLE_HDR=1 but
+# KWIN_CLOUDDEPLOY_NVIDIA_PRIVATE_HDR=0 was set explicitly by the operator,
+# we never ran the build and this fires the config-error path. ENABLE_HDR=0
+# is a no-op.
+require_patched_kwin_if_hdr
+
 set_phase "systemd-units"
 install_clouddeploy_systemd_units
 
@@ -3686,6 +6128,12 @@ set_phase "display-detection"
 log "Detecting NVIDIA BusID"
 NVIDIA_BUSID="${NVIDIA_BUSID:-$(detect_nvidia_busid || true)}"
 [[ -n "${NVIDIA_BUSID}" ]] || die "Could not detect NVIDIA BusID."
+
+# Re-resolve FORCE_CONNECTOR_AUTO now that the NVIDIA driver is loaded so the
+# value written to /etc/clouddeploy-wayland.env reflects /sys/class/drm with
+# nvidia connectors enumerated. Helper scripts and systemd units source the
+# env file and pick this value up.
+maybe_resolve_force_connector
 
 log "Detecting NVIDIA DRM card node"
 if [[ "${SUNSHINE_DRM_DEVICE}" == "auto" ]]; then
@@ -3713,19 +6161,24 @@ validate_phase2_display_state "${SELECTED_EDID_FILE}"
 mark_phase_done "edid-installed.done"
 
 case "${SESSION_BACKEND}" in
-        kwin|plasma|realvt|weston)
+        kwin|plasma|plasma6|realvt|weston)
                 ;;
         gamescope)
                 die "SESSION_BACKEND=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: plasma, kwin, weston."
+                die "Unsupported SESSION_BACKEND '${SESSION_BACKEND}'. Supported now: plasma, plasma6, kwin, weston."
                 ;;
 esac
 
 case "${STREAM_MODE}" in
         plasma)
                 log "STREAM_MODE=plasma: reliable KWin real-VT session plus Plasma shell on forced ${FORCED_CONNECTOR}"
+                COMPOSITOR_SERVICE="kwin-realvt.service"
+                ;;
+        plasma6)
+                log "STREAM_MODE=plasma6: experimental native Plasma 6/KWin 6 HDR probe on real VT${KWIN_VTNR}"
+                require_plasma6_available_from_native_repos
                 COMPOSITOR_SERVICE="kwin-realvt.service"
                 ;;
         kwin|realvt)
@@ -3740,7 +6193,7 @@ case "${STREAM_MODE}" in
                 die "STREAM_MODE=gamescope is reserved for the later game/HDR path."
                 ;;
         *)
-                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: plasma, kwin, weston."
+                die "Unsupported STREAM_MODE '${STREAM_MODE}'. Supported now: plasma, plasma6, kwin, weston."
                 ;;
 esac
 
@@ -3993,6 +6446,69 @@ kwin_mode_ready() {
         [[ "\${refresh}" =~ ^(119|120) ]] || return 1
 }
 
+# Apply mode + scale.1 (+ optional position.0,0). Plasma 6 sometimes rejects
+# the position argument on virtual/headless outputs even though everything else
+# is fine; if that happens, retry without it. The scale.1 piece is the part
+# that actually unblocks Sunshine preflight (KWin must report Geometry as the
+# full ${TARGET_WIDTH}x${TARGET_HEIGHT}, not a scaled-down logical size).
+apply_kscreen_mode() {
+        local sel="\$1"
+        if kscreen-doctor "\${sel}.enable" "\${sel}.mode.\${MODE_ID}" "\${sel}.scale.1" "\${sel}.position.0,0"; then
+                return 0
+        fi
+        echo "kscreen-doctor rejected position.0,0 for \${sel}; retrying without position argument."
+        kscreen-doctor "\${sel}.enable" "\${sel}.mode.\${MODE_ID}" "\${sel}.scale.1"
+}
+
+# If ENABLE_HDR=1, attempt to turn on HDR + Wide Color Gamut after the
+# ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} scale.1 mode is set. KWin may reject HDR on the headless
+# DRM virtual output ("the driver rejected the output configuration"); in that
+# case we log HDR_REJECTED_BY_DRIVER and continue as SDR.
+maybe_apply_hdr() {
+        [[ "${ENABLE_HDR}" == "1" ]] || return 0
+
+        local sel
+        if [[ -n "\${OUTPUT_ID:-}" ]]; then
+                sel="output.\${OUTPUT_ID}"
+        else
+                sel="output.${FORCED_CONNECTOR}"
+        fi
+
+        echo "HDR_PROBE: ENABLE_HDR=1; attempting hdr.enable + wcg.enable + sdr-brightness.300 on \${sel}"
+        local hdr_attempt
+        hdr_attempt="\$(kscreen-doctor "\${sel}.hdr.enable" "\${sel}.wcg.enable" "\${sel}.sdr-brightness.300" 2>&1)" || true
+        printf '%s\n' "\${hdr_attempt}"
+
+        if printf '%s\n' "\${hdr_attempt}" | grep -qi 'the driver rejected the output configuration'; then
+                echo "HDR_REJECTED_BY_DRIVER: KWin rejected HDR output config; continuing as ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} SDR."
+                return 0
+        fi
+
+        sleep 1
+        local outinfo hdr_state wcg_state
+        outinfo="\$(kscreen-doctor -o 2>&1 || true)"
+        printf '%s\n' "\${outinfo}"
+        hdr_state="\$(printf '%s\n' "\${outinfo}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = (\$0 ~ conn) ? 1 : 0 }
+                in_block && /HDR:/ { print; exit }
+        ')"
+        wcg_state="\$(printf '%s\n' "\${outinfo}" | awk -v conn="${FORCED_CONNECTOR}" '
+                /^Output:/ { in_block = (\$0 ~ conn) ? 1 : 0 }
+                in_block && /Wide Color Gamut:/ { print; exit }
+        ')"
+
+        if [[ "\${hdr_state}" == *"enabled"* && "\${wcg_state}" == *"enabled"* ]]; then
+                echo "HDR_ENABLED: kscreen-doctor reports HDR + Wide Color Gamut enabled on ${FORCED_CONNECTOR}."
+        else
+                echo "HDR_NOT_CONFIRMED: HDR/WCG did not report as enabled; continuing as ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} SDR (hdr=\"\${hdr_state:-unknown}\", wcg=\"\${wcg_state:-unknown}\")."
+        fi
+}
+
+finalize_success() {
+        maybe_apply_hdr || true
+        exit 0
+}
+
 for _ in \$(seq 1 20); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x kwin_wayland >/dev/null 2>&1; then
                 break
@@ -4009,22 +6525,55 @@ done
 
 if kwin_mode_ready; then
         echo "KWin already reports ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
-        exit 0
+        finalize_success
 fi
 
 OUT="\$(kscreen-doctor -o 2>&1 || true)"
 echo "\${OUT}"
 
 OUTPUT_ID="\$(printf '%s\n' "\${OUT}" | sed -nE 's/.*Output: ([0-9]+) ${FORCED_CONNECTOR}.*/\\1/p' | head -n1)"
-MODE_ID="\$(printf '%s\n' "\${OUT}" | grep -oE '[0-9]+:${TARGET_WIDTH}x${TARGET_HEIGHT}@1(19|20)([.][0-9]+)?' | head -n1 | cut -d: -f1)"
+
+# Scan every <ID>:<W>x<H>@<FPS> token kscreen-doctor emits, keep the one
+# whose resolution matches TARGET_WIDTH x TARGET_HEIGHT and whose FPS is
+# closest to TARGET_FPS. Plasma 6 lists 3840x2160 at both 60 Hz (mode 1)
+# and 120 Hz (mode 2); the previous regex blindly grabbed the first match
+# and forced 60 Hz. We pick by FPS distance so TARGET_FPS=120 reliably
+# selects the 120 Hz mode no matter what order kscreen-doctor prints them.
+MODE_ID="\$(printf '%s\n' "\${OUT}" | awk -v w="${TARGET_WIDTH}" -v h="${TARGET_HEIGHT}" -v target_fps="${TARGET_FPS}" '
+        function abs(x) { return x < 0 ? -x : x }
+        {
+                s = \$0
+                while (match(s, /[0-9]+:[0-9]+x[0-9]+@[0-9]+([.][0-9]+)?/)) {
+                        tok = substr(s, RSTART, RLENGTH)
+                        s = substr(s, RSTART + RLENGTH)
+                        split(tok, parts, /[:x@]/)
+                        id = parts[1] + 0
+                        tw = parts[2] + 0
+                        th = parts[3] + 0
+                        fps = parts[4] + 0
+                        if (tw == w && th == h) {
+                                diff = abs(fps - target_fps)
+                                if (best_diff == "" || diff < best_diff) {
+                                        best_diff = diff
+                                        best_id = id
+                                }
+                        }
+                }
+        }
+        END { if (best_id != "") print best_id }
+')"
 
 [[ -n "\${OUTPUT_ID}" ]] || OUTPUT_ID="1"
-[[ -n "\${MODE_ID}" ]] || MODE_ID="1"
+if [[ -z "\${MODE_ID}" ]]; then
+        echo "WARNING: could not parse a ${TARGET_WIDTH}x${TARGET_HEIGHT}@~${TARGET_FPS} mode from kscreen-doctor -o; falling back to mode.1 which may be a lower refresh rate. Output:" >&2
+        printf '%s\n' "\${OUT}" >&2
+        MODE_ID="1"
+fi
 
 echo "Forcing ${FORCED_CONNECTOR} to ${TARGET_WIDTH}x${TARGET_HEIGHT}@${TARGET_FPS} using output.\${OUTPUT_ID}.mode.\${MODE_ID}"
 
-if ! kscreen-doctor "output.\${OUTPUT_ID}.enable" "output.\${OUTPUT_ID}.mode.\${MODE_ID}" "output.\${OUTPUT_ID}.scale.1" "output.\${OUTPUT_ID}.position.0,0"; then
-        kscreen-doctor "output.${FORCED_CONNECTOR}.enable" "output.${FORCED_CONNECTOR}.mode.\${MODE_ID}" "output.${FORCED_CONNECTOR}.scale.1" "output.${FORCED_CONNECTOR}.position.0,0" || true
+if ! apply_kscreen_mode "output.\${OUTPUT_ID}"; then
+        apply_kscreen_mode "output.${FORCED_CONNECTOR}" || true
 fi
 
 sleep 2
@@ -4033,7 +6582,7 @@ if ! kscreen-doctor -o; then
 fi
 if kwin_mode_ready; then
         echo "KWin supportInformation confirms ${FORCED_CONNECTOR} ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish; force-mode helper succeeded."
-        exit 0
+        finalize_success
 fi
 {
         echo "KWin did not report ${FORCED_CONNECTOR} at ${TARGET_WIDTH}x${TARGET_HEIGHT}@120-ish after force-mode." >&2
@@ -4187,7 +6736,7 @@ verify_sunshine_kms_config() {
 }
 
 case "${STREAM_MODE}" in
-        plasma|kwin|realvt)
+        plasma|plasma6|kwin|realvt)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
@@ -4220,7 +6769,7 @@ done
         exit 1
 }
 
-if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
+if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "realvt" ]]; then
         /usr/local/bin/clouddeploy-force-kwin-mode.sh || true
 
         for _ in \$(seq 1 60); do
@@ -4311,7 +6860,7 @@ verify_sunshine_kms_config() {
 }
 
 start_kde_shell_bits() {
-        [[ "${STREAM_MODE}" == "plasma" ]] || return 0
+        [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" ]] || return 0
 
         local kactivitymanagerd="/usr/lib/x86_64-linux-gnu/libexec/kactivitymanagerd"
         if ! pgrep -u "${HEADLESS_USER}" -f 'kactivitymanagerd' >/dev/null 2>&1; then
@@ -4342,7 +6891,7 @@ start_kde_shell_bits() {
 }
 
 case "${STREAM_MODE}" in
-        plasma)
+        plasma|plasma6)
                 export XDG_RUNTIME_DIR="${RUNTIME_DIR}"
                 export WAYLAND_DISPLAY="${KWIN_DISPLAY}"
                 export DBUS_SESSION_BUS_ADDRESS="unix:path=${RUNTIME_DIR}/bus"
@@ -4377,7 +6926,7 @@ FORCE_ATTEMPTED=0
 SESSION_MARKER_LOGGED=0
 for _ in \$(seq 1 120); do
         if [[ -S "\${XDG_RUNTIME_DIR}/\${WAYLAND_DISPLAY}" ]] && pgrep -u "${HEADLESS_USER}" -x "\${WAIT_PROCESS}" >/dev/null 2>&1; then
-                if [[ "${STREAM_MODE}" == "plasma" ]] \
+                if [[ "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" ]] \
                         && ! pgrep -u "${HEADLESS_USER}" -f 'ksmserver|kded5|kded6|plasma_session' >/dev/null 2>&1; then
                         if [[ "\${SESSION_MARKER_LOGGED}" == "0" ]]; then
                                 echo "KDE session service marker not observed yet; continuing because KWin DBus/mode validation is authoritative."
@@ -4385,7 +6934,7 @@ for _ in \$(seq 1 120); do
                         fi
                 fi
 
-                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "realvt" ]]; then
+                if [[ "${STREAM_MODE}" == "kwin" || "${STREAM_MODE}" == "plasma" || "${STREAM_MODE}" == "plasma6" || "${STREAM_MODE}" == "realvt" ]]; then
                         if [[ "\${FORCE_ATTEMPTED}" == "0" ]]; then
                                 /usr/local/bin/clouddeploy-force-kwin-mode.sh || echo "WARNING: clouddeploy-force-kwin-mode failed; waiting for KWin mode validation."
                                 FORCE_ATTEMPTED=1
@@ -4430,6 +6979,20 @@ echo "=== nvidia-smi ==="
 nvidia-smi || true
 
 echo
+echo "=== Plasma/KWin versions ==="
+if command -v plasmashell >/dev/null 2>&1; then
+        plasmashell --version || true
+else
+        dpkg-query -W -f='plasma-workspace \${Version}\n' plasma-workspace 2>/dev/null || true
+fi
+if command -v kwin_wayland >/dev/null 2>&1; then
+        kwin_wayland --version || true
+else
+        dpkg-query -W -f='kwin-wayland \${Version}\n' kwin-wayland 2>/dev/null || true
+fi
+echo "Plasma 6 experimental mode active: $(if [[ "${STREAM_MODE}" == "plasma6" || "${ENABLE_PLASMA6}" == "1" ]]; then echo yes; else echo no; fi)"
+
+echo
 echo "=== /dev/dri ==="
 ls -l /dev/dri || true
 
@@ -4466,6 +7029,18 @@ cat /sys/class/drm/card*-${FORCED_CONNECTOR}/status 2>/dev/null || true
 echo
 echo "=== Connector modes (${FORCED_CONNECTOR}) ==="
 cat /sys/class/drm/card*-${FORCED_CONNECTOR}/modes 2>/dev/null || true
+
+echo
+echo "=== Live EDID HDR markers (${FORCED_CONNECTOR}) ==="
+if command -v edid-decode >/dev/null 2>&1; then
+        for edid_path in /sys/class/drm/card*-${FORCED_CONNECTOR}/edid; do
+                [[ -s "\${edid_path}" ]] || continue
+                edid-decode "\${edid_path}" 2>/dev/null \
+                        | grep -Ei 'HDR|EOTF|PQ|HLG|BT[.]2020|Static Metadata|SMPTE ST 2084' || true
+        done
+else
+        echo "edid-decode not found"
+fi
 
 echo
 echo "=== KScreen output ==="
@@ -4537,7 +7112,7 @@ fi
 echo
 echo "=== Sunshine journal markers ==="
 journalctl -u sunshine-headless.service -n 220 --no-pager \
-        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|Nvenc initialized|Found H[.]264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Mismatch|pair|pin|error|fatal' || true
+        | grep -Ei 'Desktop resolution|Resolution:|Logical size|Name: ${FORCED_CONNECTOR}|Monitor 0|Screencasting with KMS|Found monitor|pixel_format|format=(XR24|AR24|AB30|XB30|P010|P012|XB4H|AR30|XR30)|Color depth|10-bit|Nvenc initialized|Found H[.]264|Found HEVC|Found AV1|sample_all_black|EGL|GL: renderer|llvmpipe|Mismatch|pair|pin|error|fatal' || true
 EOF
 
 chown "${HEADLESS_USER}:${HEADLESS_USER}" "${HOME_DIR}/.local/bin/clouddeploy-kms-status.sh"
@@ -4554,9 +7129,12 @@ if [[ -f "${HOME_DIR}/.config/sunshine/sunshine_state.json" ]]; then
        "${HOME_DIR}/.config/sunshine/sunshine_state.json.bak.$(date +%s)"
 fi
 
-log "Ensuring Sunshine has cap_sys_admin for KMS capture"
+log "Ensuring Sunshine has cap_sys_admin + cap_net_bind_service for KMS capture"
 if command -v setcap >/dev/null 2>&1 && [[ -x "${SUNSHINE_RUNTIME_BIN}" ]]; then
-        setcap cap_sys_admin,cap_sys_nice+ep "$(readlink -f "${SUNSHINE_RUNTIME_BIN}")" || true
+        sunshine_real_bin="$(readlink -f "${SUNSHINE_RUNTIME_BIN}")"
+        setcap cap_sys_admin,cap_net_bind_service+ep "${sunshine_real_bin}" || true
+        log "getcap ${sunshine_real_bin}: $(getcap "${sunshine_real_bin}" 2>/dev/null || true)"
+        unset sunshine_real_bin
 fi
 
 if [[ -n "${SUNSHINE_PASS}" ]]; then
@@ -4668,6 +7246,7 @@ Environment=KWIN_FORCE_SW_CURSOR=1
 Environment=KWIN_USE_OVERLAYS=0
 Environment=GBM_BACKEND=nvidia-drm
 Environment=__GLX_VENDOR_LIBRARY_NAME=nvidia
+$(kwin_clouddeploy_env_block)
 
 PermissionsStartOnly=true
 ExecStartPre=-/usr/bin/systemctl stop getty@tty${KWIN_VTNR}.service
@@ -4768,6 +7347,15 @@ User=${HEADLESS_USER}
 Group=${HEADLESS_USER}
 SupplementaryGroups=video render input
 WorkingDirectory=${HOME_DIR}
+
+# CAP_SYS_ADMIN for DRM framebuffer handles / KMS capture; CAP_NET_BIND_SERVICE
+# for privileged listening ports. NoNewPrivileges=no preserves the file caps;
+# AmbientCapabilities + CapabilityBoundingSet make them effective. See the
+# install_clouddeploy_systemd_units copy of this service for the matching
+# rationale block (kept in sync to avoid divergence between the two paths).
+NoNewPrivileges=no
+AmbientCapabilities=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_NET_BIND_SERVICE
 
 Environment=HOME=${HOME_DIR}
 Environment=USER=${HEADLESS_USER}
@@ -4889,6 +7477,7 @@ fi
 systemctl restart tailscaled 2>/dev/null || true
 
 install_clouddeploy_helpers
+install_clouddeploy_pipewire_virtual_sink
 known_good_clean_reset_streaming_stack
 
 validate_streaming_stack_ready
@@ -4898,6 +7487,8 @@ log "Final validation markers"
 
 print_driver_cuda_sunshine_summary
 print_final_validation_summary
+print_audio_diagnostics
+print_experimental_dkms_hdr_metadata_notice
 
 echo "$SCRIPT_VERSION" > "$SENTINEL"
 
