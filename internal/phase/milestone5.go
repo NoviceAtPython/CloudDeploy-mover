@@ -1860,6 +1860,28 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 	if len(flatpakFailures) > 0 {
 		details["flatpak_warnings"] = flatpakFailures
 	}
+	// Controller parity for flatpak'd launchers/games. The virtual
+	// controller is a kernel device (uinput/uhid) so it is visible to
+	// everything, and the PlayStation HIDAPI env is applied session-wide
+	// via ~/.config/environment.d - but flatpak sandboxes inherit
+	// neither the host session env nor host device nodes by default. A
+	// global flatpak override gives every flatpak app the same
+	// PROTON_ENABLE_HIDRAW / SDL_JOYSTICK_HIDAPI_* env and access to the
+	// controller device, so a game launched through Heroic/Lutris/
+	// Bottles (or any flatpak) behaves like the native/Steam path.
+	if !deps.DryRun {
+		ovErr := run(ctx, deps, "", []string{
+			"flatpak", "override",
+			"--env=PROTON_ENABLE_HIDRAW=1",
+			"--env=SDL_JOYSTICK_HIDAPI_PS5=1",
+			"--env=SDL_JOYSTICK_HIDAPI_PS4=1",
+			"--device=all",
+		}, time.Minute, false)
+		details["flatpak_controller_override"] = ovErr == nil
+		if ovErr != nil {
+			details["flatpak_controller_override_warning"] = ovErr.Error()
+		}
+	}
 	if !deps.DryRun {
 		desk := deps.Profile.EffectiveDesktop()
 		shortcuts, shortcutErr := ensureDesktopShortcuts(ctx, deps, desk.User, []string{
