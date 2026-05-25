@@ -356,6 +356,58 @@ run_apply() {
     esac
 }
 
+# tty_usable returns 0 only if a controlling terminal can actually be
+# OPENED for reading. `[[ -r /dev/tty ]]` is not enough: the node exists
+# and looks readable under systemd/cron/cloud-init, but opening it fails
+# with "No such device or address" because there is no controlling
+# terminal. We must try the open to know.
+tty_usable() {
+    [[ -e /dev/tty ]] || return 1
+    ( exec 3< /dev/tty ) 2>/dev/null
+}
+
+# load_existing_secrets pulls SUNSHINE_USER / SUNSHINE_PASS /
+# TAILSCALE_AUTHKEY out of an already-provisioned secrets.env so the
+# documented flow (write /etc/clouddeploy/secrets.env, then run
+# bootstrap) does NOT re-prompt for values that are already on disk.
+# Values already present in the environment win. Handles both the bare
+# KEY=value form (README example) and the KEY='value' single-quoted form
+# that write_secrets_file emits (including the '\'' escape).
+load_existing_secrets() {
+    local path="$1"
+    [[ -r "${path}" ]] || return 0
+    local line k v q bs esc
+    q="'"
+    bs="\\"
+    # The 4-char sequence write_secrets_file emits for one embedded
+    # single quote: close-quote, backslash, quote, open-quote.
+    esc="${q}${bs}${q}${q}"
+    while IFS= read -r line || [[ -n "${line}" ]]; do
+        line="${line%$'\r'}"
+        case "${line}" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        k="${line%%=*}"
+        v="${line#*=}"
+        case "${k}" in
+            SUNSHINE_USER|SUNSHINE_PASS|TAILSCALE_AUTHKEY) ;;
+            *) continue ;;
+        esac
+        # Strip one layer of surrounding single quotes, then unescape the
+        # '\'' sequence write_secrets_file uses for embedded quotes.
+        if [[ "${v}" == "${q}"*"${q}" ]]; then
+            v="${v:1:${#v}-2}"
+            v="${v//${esc}/${q}}"
+        fi
+        # Environment value wins; only adopt the file value if unset.
+        if [[ -z "${!k:-}" ]]; then
+            export "${k}=${v}"
+        fi
+    done < "${path}"
+}
+
 prompt_secrets() {
     # Only relevant for unattended / auto-reboot paths. The whole
     # point of this prompt is "ask the operator once at the terminal
@@ -369,6 +421,11 @@ prompt_secrets() {
 
     local secrets_path
     secrets_path="${CLOUDDEPLOY_SECRETS_ENV:-/etc/clouddeploy/secrets.env}"
+
+    # Honor a pre-provisioned secrets.env (the README quick-start writes
+    # it before running bootstrap). Without this, an unattended run would
+    # ignore the file and hang on the credential prompt below.
+    load_existing_secrets "${secrets_path}"
 
     # Check whether the active profile actually wants Tailscale. The
     # selected YAML lives at <repo>/config/profiles/<PROFILE>.yaml.
@@ -394,17 +451,15 @@ prompt_secrets() {
     local sunshine_user="${SUNSHINE_USER:-cloudgamer}"
     local sunshine_pass="${SUNSHINE_PASS:-}"
     if [[ -z "${sunshine_pass}" ]]; then
-        log "Sunshine Web UI credentials are needed once so resume can run 'sunshine --creds'."
-        if [[ -r /dev/tty ]]; then
+        if tty_usable; then
+            log "Sunshine Web UI credentials are needed once so resume can run 'sunshine --creds'."
             read -rp "Sunshine username [${sunshine_user}]: " entered_user < /dev/tty
             [[ -n "${entered_user:-}" ]] && sunshine_user="${entered_user}"
             read -rsp "Sunshine password (blank to skip credential setup): " sunshine_pass < /dev/tty
             echo >/dev/tty
         else
-            read -rp "Sunshine username [${sunshine_user}]: " entered_user
-            [[ -n "${entered_user:-}" ]] && sunshine_user="${entered_user}"
-            read -rsp "Sunshine password (blank to skip credential setup): " sunshine_pass
-            echo
+            log "No SUNSHINE_PASS in ${secrets_path} or the environment and no terminal to prompt."
+            log "Continuing; 'clouddeployctl apply' reports a clear error if a password is required."
         fi
     fi
 
@@ -429,15 +484,14 @@ prompt_secrets() {
     # Interactive prompt. Use -s so the key never echoes to the TTY.
     # `< /dev/tty` (where available) forces the prompt to the
     # terminal even if stdin is a pipe (`curl ... | bash`).
-    log "Profile ${PROFILE} has Tailscale enabled and unattended/auto-reboot is on."
-    log "Tailscale auth key is needed once now so the post-reboot resume can log Tailscale in."
     local key=""
-    if [[ -r /dev/tty ]]; then
+    if tty_usable; then
+        log "Profile ${PROFILE} has Tailscale enabled and unattended/auto-reboot is on."
+        log "Tailscale auth key is needed once now so the post-reboot resume can log Tailscale in."
         read -rsp "Tailscale auth key (blank to skip Tailscale): " key < /dev/tty
         echo >/dev/tty
     else
-        read -rsp "Tailscale auth key (blank to skip Tailscale): " key
-        echo
+        log "Profile ${PROFILE} enables Tailscale but no TAILSCALE_AUTHKEY was provided and there is no terminal to prompt; Tailscale phase will skip nonfatally."
     fi
     if [[ -z "${key}" ]]; then
         log "No auth key entered; Tailscale phase will skip nonfatally."
