@@ -3,6 +3,11 @@
 //
 // Lifecycle:
 //
+//  0. In unattended/auto-reboot mode, apply may install the unit before
+//     the first risky phase. That preinstalled unit protects against
+//     package-upgrade reboots that happen before a phase can return
+//     ErrRebootRequired.
+//
 //  1. A phase that needs a reboot (e.g. nvidia-driver, edid) sets
 //     state.RebootNeeded = true + state.ResumeTarget = phase-name,
 //     persists state, and returns phase.ErrRebootRequired.

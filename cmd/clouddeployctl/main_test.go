@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/phase"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/state"
 )
 
@@ -57,6 +59,42 @@ func TestApplyOrder_Milestone5AfterDRMValidateOptionalAppsLast(t *testing.T) {
 	}
 	if index["optional_apps"] != len(applyPhases())-1 {
 		t.Fatalf("optional_apps must be last; index=%d len=%d", index["optional_apps"], len(applyPhases()))
+	}
+}
+
+func TestContinuationArgsFromDeps_UnattendedImpliesAutoReboot(t *testing.T) {
+	args, max := continuationArgsFromDeps(&phase.Deps{
+		Profile: &config.Profile{
+			Profile: "hdr-4k120-cuda-auto-unattended-optional",
+			Deploy: config.DeployConfig{
+				Unattended:     true,
+				MaxAutoReboots: 4,
+			},
+		},
+		StatePath:  "/var/lib/clouddeploy/state.json",
+		ConfigDir:  "/opt/clouddeploy-mover/config",
+		Unattended: true,
+	})
+	if !args.Unattended || !args.AutoReboot {
+		t.Fatalf("unattended deploy must render unattended+auto-reboot continuation args: %+v", args)
+	}
+	if args.Profile != "hdr-4k120-cuda-auto-unattended-optional" {
+		t.Fatalf("profile not propagated: %+v", args)
+	}
+	if args.StatePath != "/var/lib/clouddeploy/state.json" || args.ConfigDir != "/opt/clouddeploy-mover/config" {
+		t.Fatalf("paths not propagated: %+v", args)
+	}
+	if max != 4 {
+		t.Fatalf("max auto reboots: got %d want 4", max)
+	}
+}
+
+func TestContinuationArgsFromDeps_InteractiveDoesNotPreinstall(t *testing.T) {
+	args, _ := continuationArgsFromDeps(&phase.Deps{
+		Profile: &config.Profile{Profile: "hdr-4k120"},
+	})
+	if args.AutoReboot || args.Unattended {
+		t.Fatalf("interactive deploy should not preinstall continuation: %+v", args)
 	}
 }
 

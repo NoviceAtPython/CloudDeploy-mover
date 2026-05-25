@@ -409,10 +409,12 @@ apt world; it only acts when profile.ubuntu_version differs from the
 host VERSION_ID AND deploy.auto_upgrade_ubuntu=true. See
 docs/V2-V3-PARITY.md for the supported upgrade hops.
 
-When a phase requests a reboot, apply writes state, schedules a
-reboot via the clouddeploy-continue.service, and exits 2. After the
-reboot the continuation service invokes 'clouddeployctl resume' which
-picks up where apply left off.
+In unattended/auto-reboot mode, apply installs the continuation service
+before the first phase so even an unexpected package-upgrade reboot can
+resume. When a phase explicitly requests a reboot, apply refreshes that
+service, schedules the reboot, and exits 2. After the reboot the
+continuation service invokes 'clouddeployctl resume' which picks up
+where apply left off.
 
 Note: deploy.auto_reboot defaults to false unless explicitly set to true
 in the active profile or via --auto-reboot / CLOUDDEPLOY_AUTO_REBOOT=1.
@@ -480,6 +482,9 @@ in the active profile or via --auto-reboot / CLOUDDEPLOY_AUTO_REBOOT=1.
 			}
 
 			if err := preflightUnattendedCredentials(deps); err != nil {
+				return err
+			}
+			if err := installContinuationForAutoResume(ctx, deps); err != nil {
 				return err
 			}
 
@@ -572,15 +577,14 @@ func runPhasesAndBanner(ctx context.Context, deps *phase.Deps, isResume bool) er
 		}
 	}
 	// Clean final completion. NOW we can safely disable the
-	// continuation unit (only on resume; apply never installed it on
-	// its own without a phase needing reboot, but Disable is
-	// idempotent so the apply path can also call it safely).
-	if isResume {
-		if err := disableContinuationIfPresent(ctx, deps); err != nil {
-			// Non-fatal: the deploy reached terminal-done. We log
-			// rather than fail the whole apply.
-			fmt.Printf("resume: warning: failed to clean up continuation unit: %v\n", err)
-		}
+	// continuation unit. This runs for both resume and apply because
+	// unattended/auto-reboot apply preinstalls the unit before the first
+	// risky phase. That early unit protects against unexpected package
+	// upgrade reboots before a phase can return ErrRebootRequired.
+	if err := disableContinuationIfPresent(ctx, deps); err != nil {
+		// Non-fatal: the deploy reached terminal-done. We log rather
+		// than fail the whole apply.
+		fmt.Printf("warning: failed to clean up continuation unit: %v\n", err)
 	}
 	fmt.Print(partialApplyBanner)
 	// Surface the one-command pairing path: write the SSH-login MOTD and
@@ -658,6 +662,29 @@ func disableContinuationIfPresent(ctx context.Context, deps *phase.Deps) error {
 	}
 	fmt.Println("resume: deploy fully complete; disabling continuation service")
 	return svc.Disable(ctx)
+}
+
+// installContinuationForAutoResume preinstalls the resume unit before the
+// first deploy phase when the run is unattended or auto-rebooting. This is
+// intentionally earlier than handleRebootRequired: dist-upgrade can reboot or
+// terminate the transient parent process before a phase gets to return
+// ErrRebootRequired, especially while replacing systemd/kernel packages. With
+// the unit already enabled, the next boot can still run `clouddeployctl resume`
+// and recover the running phase from state.
+func installContinuationForAutoResume(ctx context.Context, deps *phase.Deps) error {
+	args, _ := continuationArgsFromDeps(deps)
+	if !args.AutoReboot && !args.Unattended {
+		return nil
+	}
+	svc := &reboot.Service{
+		Runner: deps.Runner,
+		DryRun: deps.DryRun,
+	}
+	fmt.Println("Installing continuation service for unattended/auto-reboot recovery...")
+	if err := svc.Install(ctx, args); err != nil {
+		return fmt.Errorf("install early continuation unit: %w", err)
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------------
@@ -2169,27 +2196,7 @@ func handleRebootRequired(ctx context.Context, deps *phase.Deps) error {
 		DryRun: deps.DryRun,
 	}
 
-	profileName := ""
-	maxAutoReboots := 8
-	autoReboot := deps.AutoReboot
-	unattended := deps.Unattended
-	configDir := deps.ConfigDir
-	if deps.Profile != nil {
-		profileName = deps.Profile.Profile
-		if deps.Profile.Deploy.MaxAutoReboots > 0 {
-			maxAutoReboots = deps.Profile.Deploy.MaxAutoReboots
-		}
-		if deps.Profile.Deploy.AutoReboot {
-			autoReboot = true
-		}
-		if deps.Profile.Deploy.Unattended {
-			unattended = true
-			autoReboot = true
-		}
-	}
-	if unattended {
-		autoReboot = true
-	}
+	args, maxAutoReboots := continuationArgsFromDeps(deps)
 	if deps.State != nil {
 		target := deps.State.ResumeTarget
 		deps.State.RecordRebootRequest(target, maxAutoReboots)
@@ -2205,20 +2212,12 @@ func handleRebootRequired(ctx context.Context, deps *phase.Deps) error {
 			return fmt.Errorf("persist reboot counters: %w", err)
 		}
 	}
-	args := reboot.Args{
-		Profile:    profileName,
-		StatePath:  deps.StatePath,
-		ConfigDir:  configDir,
-		AutoReboot: autoReboot,
-		Unattended: unattended,
-	}
-
 	fmt.Println("Installing continuation service...")
 	if err := svc.Install(ctx, args); err != nil {
 		return fmt.Errorf("install continuation unit: %w", err)
 	}
 
-	if autoReboot {
+	if args.AutoReboot {
 		fmt.Println("auto-reboot enabled: Scheduling reboot now...")
 		if err := svc.Reboot(ctx); err != nil {
 			return fmt.Errorf("auto-reboot failed: %w", err)
@@ -2229,6 +2228,44 @@ func handleRebootRequired(ctx context.Context, deps *phase.Deps) error {
 	fmt.Println("(deploy.auto_reboot is false or no profile loaded.)")
 	fmt.Println("Please run `sudo reboot` manually, then `sudo clouddeployctl resume`.")
 	return phase.ErrRebootRequired
+}
+
+func continuationArgsFromDeps(deps *phase.Deps) (reboot.Args, int) {
+	profileName := ""
+	maxAutoReboots := 8
+	autoReboot := false
+	unattended := false
+	statePath := ""
+	configDir := ""
+	if deps != nil {
+		autoReboot = deps.AutoReboot
+		unattended = deps.Unattended
+		statePath = deps.StatePath
+		configDir = deps.ConfigDir
+		if deps.Profile != nil {
+			profileName = deps.Profile.Profile
+			if deps.Profile.Deploy.MaxAutoReboots > 0 {
+				maxAutoReboots = deps.Profile.Deploy.MaxAutoReboots
+			}
+			if deps.Profile.Deploy.AutoReboot {
+				autoReboot = true
+			}
+			if deps.Profile.Deploy.Unattended {
+				unattended = true
+				autoReboot = true
+			}
+		}
+	}
+	if unattended {
+		autoReboot = true
+	}
+	return reboot.Args{
+		Profile:    profileName,
+		StatePath:  statePath,
+		ConfigDir:  configDir,
+		AutoReboot: autoReboot,
+		Unattended: unattended,
+	}, maxAutoReboots
 }
 
 // -----------------------------------------------------------------------------
