@@ -864,9 +864,86 @@ func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 		updateSunshineCSRF(ctx, deps, ip)
 		details["sunshine_try_restart_after_csrf"] = run(ctx, deps, "", []string{"systemctl", "try-restart", "sunshine-headless.service"}, time.Minute, true) == nil
 	}
+	// Reconnect on boot. tailscaled is enabled so the daemon starts, but
+	// after a Vast instance stop/start the node can land in NeedsLogin
+	// (ephemeral key, or saved state insufficient) so the VM is
+	// unreachable until someone re-runs `tailscale up`. Install a boot
+	// oneshot that re-authenticates from the saved authkey, mirroring how
+	// Sunshine auto-starts. Only created here, i.e. only when Tailscale
+	// was actually brought up.
+	if err := ensureTailscaleBootReconnect(ctx, deps, cfg.SSH); err != nil {
+		details["boot_reconnect_warning"] = err.Error()
+	} else {
+		details["boot_reconnect_unit"] = "clouddeploy-tailscale-up.service"
+	}
 	deps.State.MarkDone(TailscaleName, details)
 	_ = deps.PersistState()
 	return nil
+}
+
+const tailscaleUpScriptPath = "/usr/local/bin/clouddeploy-tailscale-up.sh"
+const tailscaleUpServicePath = "/etc/systemd/system/clouddeploy-tailscale-up.service"
+
+// ensureTailscaleBootReconnect installs and enables a boot oneshot that
+// re-runs `tailscale up` from the saved authkey, so the VM rejoins the
+// tailnet automatically after an instance stop/start. Best-effort:
+// failure here does not fail the (already-connected) tailscale phase.
+func ensureTailscaleBootReconnect(ctx context.Context, deps *Deps, ssh bool) error {
+	if deps.DryRun {
+		return nil
+	}
+	if err := os.WriteFile(tailscaleUpScriptPath, []byte(renderTailscaleUpScript(ssh)), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(tailscaleUpServicePath, []byte(renderTailscaleUpService()), 0o644); err != nil {
+		return err
+	}
+	_ = run(ctx, deps, "", []string{"systemctl", "daemon-reload"}, time.Minute, true)
+	return run(ctx, deps, "", []string{"systemctl", "enable", "clouddeploy-tailscale-up.service"}, time.Minute, true)
+}
+
+// renderTailscaleUpScript reconnects the tailnet on boot. It waits for
+// tailscaled, then `tailscale up` with the authkey from secrets.env
+// (loaded by the unit's EnvironmentFile). The authkey'd attempt falls
+// back to a keyless `tailscale up` that reuses saved state, so it works
+// for reusable keys and for already-registered nodes alike.
+func renderTailscaleUpScript(ssh bool) string {
+	sshFlag := ""
+	if ssh {
+		sshFlag = " --ssh"
+	}
+	return `#!/usr/bin/env bash
+# Managed by CloudDeploy v3 - reconnect Tailscale after an instance
+# stop/start so the VM is reachable again without manual re-auth.
+set -u
+for _ in $(seq 1 30); do
+  tailscale status >/dev/null 2>&1 && break
+  sleep 1
+done
+key="${TAILSCALE_AUTHKEY:-}"
+if [ -n "$key" ]; then
+  tailscale up` + sshFlag + ` --authkey "$key" || tailscale up` + sshFlag + ` || true
+else
+  tailscale up` + sshFlag + ` || true
+fi
+`
+}
+
+func renderTailscaleUpService() string {
+	return `[Unit]
+Description=CloudDeploy Tailscale reconnect on boot
+Wants=network-online.target tailscaled.service
+After=network-online.target tailscaled.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=-/etc/clouddeploy/secrets.env
+ExecStart=` + tailscaleUpScriptPath + `
+
+[Install]
+WantedBy=multi-user.target
+`
 }
 
 type PipeWireAudio struct{}

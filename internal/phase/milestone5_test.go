@@ -992,6 +992,34 @@ func TestTailscaleResumeAfterRebootReadsSecretsEnvImportedKey(t *testing.T) {
 	}
 }
 
+func TestRenderTailscaleBootReconnect(t *testing.T) {
+	svc := renderTailscaleUpService()
+	for _, want := range []string{
+		"Description=CloudDeploy Tailscale reconnect on boot",
+		"After=network-online.target tailscaled.service",
+		"EnvironmentFile=-/etc/clouddeploy/secrets.env",
+		"ExecStart=/usr/local/bin/clouddeploy-tailscale-up.sh",
+		"WantedBy=multi-user.target",
+	} {
+		if !strings.Contains(svc, want) {
+			t.Fatalf("tailscale boot service missing %q:\n%s", want, svc)
+		}
+	}
+	sc := renderTailscaleUpScript(true)
+	for _, want := range []string{
+		`key="${TAILSCALE_AUTHKEY:-}"`,
+		`tailscale up --ssh --authkey "$key"`,
+		"tailscale status",
+	} {
+		if !strings.Contains(sc, want) {
+			t.Fatalf("tailscale up script (ssh) missing %q:\n%s", want, sc)
+		}
+	}
+	if strings.Contains(renderTailscaleUpScript(false), "--ssh") {
+		t.Fatalf("non-ssh tailscale up script must not contain --ssh:\n%s", renderTailscaleUpScript(false))
+	}
+}
+
 func TestTailscaleWithAuthKeyButNoIPDoesNotMarkDone(t *testing.T) {
 	deps := milestone5Deps(t)
 	t.Setenv("TAILSCALE_AUTHKEY", "fixture-authkey")
