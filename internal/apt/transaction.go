@@ -244,9 +244,19 @@ func (tc *TxContext) Purge(ctx context.Context, packages []string) error {
 // FixBroken runs `apt-get -f install` to clear half-installed
 // packages. Used by RepairIfNeeded.
 func (tc *TxContext) FixBroken(ctx context.Context) error {
-	argv := append([]string{"apt-get"}, tc.tx.yes()...)
-	argv = append(argv, "-f", "install")
+	argv := fixBrokenArgv(tc.tx.yes())
 	return tc.runOrErr(ctx, "apt-fix-broken", argv)
+}
+
+func fixBrokenArgv(yes []string) []string {
+	argv := append([]string{"apt-get"}, yes...)
+	argv = append(argv,
+		"-o", "Dpkg::Options::=--force-confdef",
+		"-o", "Dpkg::Options::=--force-confold",
+		"-o", "Dpkg::Options::=--force-overwrite",
+	)
+	argv = append(argv, "-f", "install")
+	return argv
 }
 
 // DpkgConfigureAll runs `dpkg --configure -a` to finish any
@@ -285,7 +295,9 @@ func (tc *TxContext) Audit(ctx context.Context) (AuditState, error) {
 
 // RepairIfNeeded runs `dpkg --audit`, and if anything looks
 // half-installed, runs `dpkg --configure -a` followed by
-// `apt-get -f install`. Safe to call multiple times.
+// `apt-get -f install`. If configure fails first due unresolved
+// dependencies from an interrupted dist-upgrade, run fix-broken anyway
+// and retry configure. Safe to call multiple times.
 func (tc *TxContext) RepairIfNeeded(ctx context.Context) error {
 	audit, err := tc.Audit(ctx)
 	if err != nil {
@@ -297,7 +309,14 @@ func (tc *TxContext) RepairIfNeeded(ctx context.Context) error {
 		return nil
 	}
 	if err := tc.DpkgConfigureAll(ctx); err != nil {
-		return fmt.Errorf("dpkg --configure -a failed: %w", err)
+		firstConfigureErr := err
+		if fixErr := tc.FixBroken(ctx); fixErr != nil {
+			return fmt.Errorf("dpkg --configure -a failed: %w; apt-get -f install also failed: %v", firstConfigureErr, fixErr)
+		}
+		if retryErr := tc.DpkgConfigureAll(ctx); retryErr != nil {
+			return fmt.Errorf("dpkg --configure -a failed: %w; after apt-get -f install retry failed: %v", firstConfigureErr, retryErr)
+		}
+		return nil
 	}
 	if err := tc.FixBroken(ctx); err != nil {
 		return fmt.Errorf("apt-get -f install failed: %w", err)

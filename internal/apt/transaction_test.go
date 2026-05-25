@@ -119,6 +119,21 @@ func TestTxContext_RepairIfNeeded_NoOp(t *testing.T) {
 	}
 }
 
+func TestFixBrokenArgvUsesNoninteractiveOverwriteOptions(t *testing.T) {
+	got := strings.Join(fixBrokenArgv([]string{"-y"}), " ")
+	for _, want := range []string{
+		"apt-get -y",
+		"Dpkg::Options::=--force-confdef",
+		"Dpkg::Options::=--force-confold",
+		"Dpkg::Options::=--force-overwrite",
+		"-f install",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("fix-broken argv missing %q: %s", want, got)
+		}
+	}
+}
+
 // TestTxContext_InstallEmpty - Install([]) is a no-op.
 func TestTxContext_InstallEmpty(t *testing.T) {
 	tx, _ := txEnvironment(t)
