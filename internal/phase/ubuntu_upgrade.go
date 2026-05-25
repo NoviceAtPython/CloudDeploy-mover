@@ -1013,6 +1013,18 @@ func runHardenedDistUpgrade(ctx context.Context, deps *Deps) runner.Result {
 			"-y",
 			"-o", "Dpkg::Options::=--force-confdef",
 			"-o", "Dpkg::Options::=--force-confold",
+			// --force-overwrite handles the "trying to overwrite FILE,
+			// which is also in package X" class of failure. Vast/cloud
+			// base images often ship PPA builds of PipeWire/Mesa/etc.
+			// that own files the archive version relocated to a
+			// different package (observed: pipewire-pulse 1.4.7 vs the
+			// jammy PPA's pipewire-bin 1.0.7 both shipping
+			// pipewire-pulse.1.gz). Without this the whole dist-upgrade
+			// aborts at unpack time. The colliding files are
+			// content-compatible (man pages, helper binaries), so
+			// letting the newer package win is safe and is what a manual
+			// operator would do anyway.
+			"-o", "Dpkg::Options::=--force-overwrite",
 			"--allow-downgrades",
 			"--allow-remove-essential",
 			"--allow-change-held-packages",
@@ -1096,6 +1108,10 @@ func runDpkgRecovery(ctx context.Context, deps *Deps, log *slog.Logger, firstFai
 			"-y",
 			"-o", "Dpkg::Options::=--force-confdef",
 			"-o", "Dpkg::Options::=--force-confold",
+			// Same cross-package file-overwrite guard as the main
+			// dist-upgrade; the recovery rerun must clear the identical
+			// conflict or it just fails the same way.
+			"-o", "Dpkg::Options::=--force-overwrite",
 			"-f", "install",
 		},
 		Env:     []string{"DEBIAN_FRONTEND=noninteractive", "APT_LISTCHANGES_FRONTEND=none", "NEEDRESTART_MODE=a"},
