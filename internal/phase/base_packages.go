@@ -41,6 +41,14 @@ var BasePackagesList = []string{
 	// dmsetup is needed for LVM-on-cloud-VM hosts; harmless on others.
 	// procps for ps / lock-holder enumeration.
 	"procps",
+	// ffmpeg: the gpu-capture-capability-probe shells out to the
+	// `ffmpeg` CLI for its h264_nvenc / hevc_main10_nvenc smoke tests.
+	// It is NOT shipped by the base cloud images (and the Sunshine fork
+	// bundles its own libav, not the CLI), so without this the probe
+	// failed_fatal on a clean deploy with "failed to execute ffmpeg:
+	// No such file or directory". Installing it here (well before the
+	// probe phase) keeps the probe self-sufficient.
+	"ffmpeg",
 }
 
 // BasePackages is the apt-install bootstrap phase. Idempotent: when
