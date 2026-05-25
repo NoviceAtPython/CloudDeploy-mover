@@ -733,6 +733,10 @@ STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/
 `, nil
 		},
 		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
+		// Persistent all-black journal: the resample loop exhausts and
+		// the phase still fails. Tiny interval keeps the test fast.
+		BlackResampleInterval: time.Millisecond,
+		BlackResampleAttempts: 2,
 	}
 	err := ph.Run(context.Background(), deps)
 	if err == nil {
@@ -747,6 +751,51 @@ STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/
 	}
 	if details["sample_pixel_format"] != "AB30" {
 		t.Fatalf("sample_pixel_format detail: got %v want AB30", details["sample_pixel_format"])
+	}
+}
+
+func TestStreamValidateResamplesPastTransientAllBlack(t *testing.T) {
+	// The first KMS sample is all-black (Plasma hasn't painted yet).
+	// The resample loop restarts Sunshine and re-reads the journal; the
+	// second read shows a non-black frame, so the phase must PASS rather
+	// than fail on the stale black sample. This is the compositor-paint
+	// race the live clean-room deploy hit.
+	deps := milestone5Deps(t)
+	deps.DryRun = false
+	markers := `
+STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=3840 height=2160 pixel_format=AB30
+Found monitor for DRM screencasting
+Desktop resolution: 3840x2160
+hevc_nvenc initialized successfully
+Color coding: HDR (Rec. 2020 + SMPTE 2084 PQ)
+Color depth: 10-bit
+selected_pix_fmt=p010
+`
+	calls := 0
+	ph := StreamValidate{
+		ServiceActiveFn: func(context.Context, *Deps) error { return nil },
+		ListenersFn:     func(context.Context, *Deps) (string, error) { return "tcp LISTEN 0 4096 0.0.0.0:47989", nil },
+		ServerInfoFn:    func(context.Context, *Deps, string) (string, error) { return goodHDRServerInfo, nil },
+		JournalFn: func(context.Context, *Deps) (string, error) {
+			calls++
+			if calls == 1 {
+				return markers + "STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/0/0 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1\n", nil
+			}
+			return markers + "STREAM_DIAG kms sample sample_all_black=false sample_nonblack=254 sample_avg_rgb=88/120/200 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1\n", nil
+		},
+		WebUIStatusFn:         func(context.Context, *Deps, string) (int, error) { return 307, nil },
+		BlackResampleInterval: time.Millisecond,
+		BlackResampleAttempts: 4,
+	}
+	if err := ph.Run(context.Background(), deps); err != nil {
+		t.Fatalf("expected resample to clear the transient all-black and pass; got %v", err)
+	}
+	details := deps.State.Get(StreamValidateName).Details
+	if details["black_resample_attempted"] != true {
+		t.Fatalf("expected black_resample_attempted=true; got %v", details["black_resample_attempted"])
+	}
+	if details["sample_nonblack"] != 254 {
+		t.Fatalf("expected sample_nonblack=254 after resample; got %v", details["sample_nonblack"])
 	}
 }
 

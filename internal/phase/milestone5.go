@@ -1435,6 +1435,12 @@ type StreamValidate struct {
 	ListenersFn     func(context.Context, *Deps) (string, error)
 	RetryWindow     time.Duration
 	RetryInterval   time.Duration
+	// BlackResampleInterval / BlackResampleAttempts control the
+	// restart-and-re-sample loop used when the first KMS sample is
+	// all-black (a compositor-paint race). Defaults: 15s x 4. Tests set
+	// a tiny interval so they don't sleep for real.
+	BlackResampleInterval time.Duration
+	BlackResampleAttempts int
 }
 
 func (StreamValidate) Name() string { return StreamValidateName }
@@ -1637,8 +1643,48 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	// marker is healthy. Treat it as fatal so stream_validate can
 	// distinguish "stream reaches Moonlight but is black" from
 	// "stream is good."
+	// A first all-black sample is usually a race, not a broken stream:
+	// plasmashell starts in parallel with streaming_services, and
+	// Sunshine's startup capture probe can sample the KMS framebuffer
+	// before Plasma has painted the desktop. Rather than fail on that
+	// stale frame, restart Sunshine to force a fresh startup capture
+	// (giving the compositor time to paint) and re-read the journal a
+	// few times. Only the sample fields are refreshed; the KMS/NVENC/
+	// HDR markers validated above came from the same Sunshine config and
+	// still hold. parseSunshineStreamEvidence aggregates samples, so one
+	// non-black frame anywhere in the post-restart journal clears it.
+	if ev.SampleAllBlackSeen && ev.SampleAllBlack && !(ev.SampleNonblackSeen && ev.SampleNonblack > 0) && !deps.DryRun {
+		resampleInterval := p.BlackResampleInterval
+		if resampleInterval <= 0 {
+			resampleInterval = 15 * time.Second
+		}
+		resampleAttempts := p.BlackResampleAttempts
+		if resampleAttempts <= 0 {
+			resampleAttempts = 4
+		}
+		for attempt := 1; attempt <= resampleAttempts; attempt++ {
+			logger(deps).Warn("phase stream-validate: KMS sample all-black; restarting Sunshine to re-sample after compositor paint", "attempt", attempt)
+			_ = run(ctx, deps, "", []string{"systemctl", "restart", "sunshine-headless.service"}, time.Minute, true)
+			time.Sleep(resampleInterval)
+			_ = serviceActive(ctx, deps)
+			freshLogs, _ := journalFn(ctx, deps)
+			fresh := parseSunshineStreamEvidence(freshLogs)
+			if fresh.SampleNonblackSeen && fresh.SampleNonblack > 0 {
+				ev.SampleAllBlack = fresh.SampleAllBlack
+				ev.SampleNonblackSeen = true
+				ev.SampleNonblack = fresh.SampleNonblack
+				ev.SampleAvgRGB = fresh.SampleAvgRGB
+				break
+			}
+		}
+		details["black_resample_attempted"] = true
+		details["sample_all_black"] = ev.SampleAllBlack
+		details["sample_nonblack_seen"] = ev.SampleNonblackSeen
+		details["sample_nonblack"] = ev.SampleNonblack
+		details["sample_avg_rgb"] = ev.SampleAvgRGB
+	}
 	if ev.SampleAllBlackSeen && ev.SampleAllBlack && !(ev.SampleNonblackSeen && ev.SampleNonblack > 0) {
-		return failPhase(deps, StreamValidateName, details, "Sunshine KMS sample is all-black", fmt.Errorf("sample_all_black=true sample_nonblack=%d avg_rgb=%q pixel_format=%q; the compositor is producing no visible content. Launch a visible Wayland client (e.g. plasmashell or `foot`) and re-run; if Sunshine keeps reporting all-black, the KMS plane is not the one being composited.", ev.SampleNonblack, ev.SampleAvgRGB, ev.SamplePixelFormat), true)
+		return failPhase(deps, StreamValidateName, details, "Sunshine KMS sample is all-black", fmt.Errorf("sample_all_black=true sample_nonblack=%d avg_rgb=%q pixel_format=%q after re-sampling; the compositor is producing no visible content. Launch a visible Wayland client (e.g. plasmashell or `foot`) and re-run; if Sunshine keeps reporting all-black, the KMS plane is not the one being composited.", ev.SampleNonblack, ev.SampleAvgRGB, ev.SamplePixelFormat), true)
 	}
 	if deps.Profile != nil && deps.Profile.Display.HDR {
 		if !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
