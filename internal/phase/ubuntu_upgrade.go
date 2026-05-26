@@ -53,6 +53,24 @@ const (
 	UbuntuStageRebootRequired      UbuntuUpgradeStage = "reboot-required"
 )
 
+const nouveauBlacklistPath = "/etc/modprobe.d/blacklist-nouveau-clouddeploy.conf"
+const nouveauGrubDropInPath = "/etc/default/grub.d/98-clouddeploy-blacklist-nouveau.cfg"
+
+const nouveauBlacklistBody = `# Managed by clouddeploy v3.
+# Nouveau must never bind the passed-through NVIDIA GPU during a
+# kernel-changing Ubuntu upgrade. This is especially critical for
+# Blackwell / RTX 50-series (GB20x): Ubuntu 25.10's nouveau probe can
+# oops on GB202 before the NVIDIA open kernel module is installed.
+blacklist nouveau
+options nouveau modeset=0
+install nouveau /bin/false
+`
+
+const nouveauGrubDropInBody = `# Managed by clouddeploy v3.
+# Keep nouveau out of early boot and normal module autoload paths.
+GRUB_CMDLINE_LINUX_DEFAULT="$GRUB_CMDLINE_LINUX_DEFAULT module_blacklist=nouveau modprobe.blacklist=nouveau nouveau.modeset=0"
+`
+
 // buildOSResolverDetails turns a profile + resolver result into the
 // state.Details fields the brief asks for. Always returns a non-nil
 // map; entries are only populated when the input has meaningful data.
@@ -437,6 +455,23 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 		_ = deps.PersistState()
 	}
 
+	// 1c. Nouveau hard block before any kernel-changing reboot.
+	// RTX 50-series / Blackwell is not merely "unsupported" by nouveau in
+	// this stack; the Massachusetts RTX 5090 clean-room run reached 25.10,
+	// then nouveau probed GB202 during early boot and crashed in-kernel
+	// before sshd could come up. Write both modprobe.d and GRUB cmdline
+	// guards before the dist-upgrade, then refresh boot artifacts again
+	// after the new kernel lands.
+	if !deps.DryRun {
+		if err := ensureNouveauBlacklistedForKernelSwap(ctx, deps, log, details); err != nil {
+			deps.State.MarkFailed(UbuntuUpgradeName, "blacklist nouveau before Ubuntu kernel swap", err, true)
+			_ = deps.PersistState()
+			return fmt.Errorf("phase ubuntu-upgrade: %w", err)
+		}
+		deps.State.Get(UbuntuUpgradeName).Details = details
+		_ = deps.PersistState()
+	}
+
 	// 2. + 3. + 4. + 5. inside one apt.Transaction so the policy-
 	//    rc.d guard covers the whole hop.
 	err := deps.APT.Run(ctx, func(tc *apt.TxContext) error {
@@ -538,6 +573,11 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 			details["apt_check_error"] = aptCheckErr.Error()
 			return fmt.Errorf("post-dist-upgrade `apt-get check` failed: %w", aptCheckErr)
 		}
+		if !deps.DryRun {
+			if err := refreshNouveauBootGuards(ctx, deps, log, details, "post_dist_upgrade"); err != nil {
+				return err
+			}
+		}
 		advance(UbuntuStageDistUpgradeComplete)
 		return nil
 	})
@@ -553,6 +593,53 @@ func (p UbuntuUpgrade) runDirectCodenameRewrite(ctx context.Context, deps *Deps,
 	_ = deps.PersistState()
 	log.Warn("phase ubuntu-upgrade: direct codename rewrite completed; reboot required to load new kernel + userspace")
 	return ErrRebootRequired
+}
+
+func ensureNouveauBlacklistedForKernelSwap(ctx context.Context, deps *Deps, log *slog.Logger, details map[string]any) error {
+	if err := os.MkdirAll(filepath.Dir(nouveauBlacklistPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir modprobe.d for nouveau blacklist: %w", err)
+	}
+	if err := os.WriteFile(nouveauBlacklistPath, []byte(nouveauBlacklistBody), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", nouveauBlacklistPath, err)
+	}
+	if err := os.MkdirAll(filepath.Dir(nouveauGrubDropInPath), 0o755); err != nil {
+		return fmt.Errorf("mkdir grub.d for nouveau blacklist: %w", err)
+	}
+	if err := os.WriteFile(nouveauGrubDropInPath, []byte(nouveauGrubDropInBody), 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", nouveauGrubDropInPath, err)
+	}
+	details["nouveau_blacklist_path"] = nouveauBlacklistPath
+	details["nouveau_grub_dropin_path"] = nouveauGrubDropInPath
+	details["nouveau_blacklist_written"] = true
+	return refreshNouveauBootGuards(ctx, deps, log, details, "pre_dist_upgrade")
+}
+
+func refreshNouveauBootGuards(ctx context.Context, deps *Deps, log *slog.Logger, details map[string]any, prefix string) error {
+	for _, spec := range []struct {
+		key  string
+		argv []string
+	}{
+		{"update_initramfs", []string{"update-initramfs", "-u", "-k", "all"}},
+		{"update_grub", []string{"update-grub"}},
+	} {
+		res := deps.Runner.Exec(ctx, runner.CommandSpec{
+			Argv:    spec.argv,
+			Sudo:    true,
+			Timeout: 5 * time.Minute,
+			DryRun:  deps.DryRun,
+			LogFile: "-",
+			Env:     []string{"DEBIAN_FRONTEND=noninteractive"},
+		})
+		details[prefix+"_nouveau_"+spec.key+"_ok"] = res.Err == nil
+		if res.Err != nil {
+			details[prefix+"_nouveau_"+spec.key+"_stderr"] = tailLines(res.Stderr, 20)
+			if log != nil {
+				log.Warn("phase ubuntu-upgrade: failed to refresh nouveau boot guard", "stage", prefix, "command", strings.Join(spec.argv, " "), "err", res.Err)
+			}
+			return fmt.Errorf("%s failed while refreshing nouveau boot guard: %w stderr=%q", strings.Join(spec.argv, " "), res.Err, tailLines(res.Stderr, 10))
+		}
+	}
+	return nil
 }
 
 // stageAtLeast reports whether `recorded` is the same as or after

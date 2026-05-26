@@ -42,6 +42,38 @@ func profileForUpgrade(target string, autoUpgrade, acceptNonLTS bool, directPoli
 	}
 }
 
+func TestNouveauBlacklistGuardsBlackwellKernelSwap(t *testing.T) {
+	// RTX 5090 / GB202 live regression, 2026-05-26: after the
+	// 24.04->25.10 hop, nouveau autoloaded before the NVIDIA open
+	// module was installed and oopsed the kernel during early boot.
+	// The upgrade phase must install both modprobe and kernel-cmdline
+	// guards before any kernel-changing reboot.
+	for _, want := range []string{
+		"blacklist nouveau",
+		"options nouveau modeset=0",
+		"install nouveau /bin/false",
+	} {
+		if !strings.Contains(nouveauBlacklistBody, want) {
+			t.Fatalf("nouveau modprobe blacklist missing %q:\n%s", want, nouveauBlacklistBody)
+		}
+	}
+	for _, want := range []string{
+		"module_blacklist=nouveau",
+		"modprobe.blacklist=nouveau",
+		"nouveau.modeset=0",
+	} {
+		if !strings.Contains(nouveauGrubDropInBody, want) {
+			t.Fatalf("nouveau grub drop-in missing %q:\n%s", want, nouveauGrubDropInBody)
+		}
+	}
+	if !strings.HasPrefix(nouveauBlacklistPath, "/etc/modprobe.d/") {
+		t.Fatalf("nouveau blacklist must live in /etc/modprobe.d, got %q", nouveauBlacklistPath)
+	}
+	if !strings.HasPrefix(nouveauGrubDropInPath, "/etc/default/grub.d/") {
+		t.Fatalf("nouveau grub drop-in must live in /etc/default/grub.d, got %q", nouveauGrubDropInPath)
+	}
+}
+
 func TestUbuntuUpgrade_NoTarget_IsSkipped(t *testing.T) {
 	deps := upgradeDeps(t, profileForUpgrade("", false, false, ""))
 	ph := UbuntuUpgrade{
