@@ -26,7 +26,9 @@ Validated on a live Vast.ai RTX 4090 VM:
 
 Known gaps:
 
-- Microphone input has not been tested and probably does not work yet.
+- Microphone / voice input does not stream through Moonlight — neither
+  Moonlight nor Sunshine implements a client-to-host mic path. You do not need
+  one; see "Voice Chat And Microphone" below.
 - This is not a general-purpose Linux desktop installer.
 - Some cloud GPU hosts expose broken PCIe/MSI topology; `nvidia-smi` can work
   while NVENC hangs. Pick VM-capable hosts with sane GPU passthrough.
@@ -158,16 +160,20 @@ clouddeployctl state show
 clouddeployctl doctor sunshine
 ```
 
-Pair Moonlight with one command — no raw bash or web UI required:
+Pairing is one command. It is not a live prompt at the end of the deploy
+because the deploy reboots several times and finishes unattended in the
+background — there is no terminal attached at the moment it completes. So when
+it finishes it prints your Tailscale IP and the single command that does the
+pairing, and that same hint is shown on every SSH login:
 
 ```bash
 sudo clouddeployctl pair
 ```
 
-It prints your Tailscale IP to add in Moonlight, waits for the 4-digit PIN
-Moonlight shows, and submits it to Sunshine for you (credentials are read from
-`/etc/clouddeploy/secrets.env`). After a successful deploy this same hint is
-also shown on every SSH login. If you prefer, the Sunshine web UI on
+That command is the in-terminal pairing step: it shows the Tailscale IP to add
+in Moonlight, waits for the 4-digit PIN Moonlight displays, and submits it to
+Sunshine for you (credentials are read from `/etc/clouddeploy/secrets.env`). No
+raw bash needed. If you prefer, the Sunshine web UI on
 `https://<tailscale-ip>:47990` still works too.
 
 Steam should be launched from the desktop icon or application menu so the
@@ -189,6 +195,30 @@ Controller support is intentionally metadata-driven:
 The important regression guard is `/dev/hidraw*` access. Without it,
 Steam/SDL/Proton silently fall back to evdev-only PlayStation handling, which
 can cause duplicated or scrambled input.
+
+## Voice Chat And Microphone
+
+There is no microphone / voice-input path into the VM, and you do not need one.
+Neither Moonlight nor Sunshine implements client-to-host mic capture (verified
+against current upstream Sunshine), so your headset mic does not travel to the
+VM — and routing it there would be the wrong design anyway.
+
+Run your voice app (Discord, etc.) on your **local** machine with your headset,
+and run only the game on the VM:
+
+- Game audio streams to you through Moonlight via the `clouddeploy-surround71`
+  7.1 sink — full quality.
+- Your voice goes straight from your headset into Discord and out to your
+  friends — one hop, no extra encode.
+
+Pushing the mic onto the VM would add a second network hop and a second Opus
+transcode, so keeping voice local is both simpler and higher quality. You hear
+game audio and friends mixed together on your PC exactly like a normal local
+gaming session. (Discord is still in the optional VM app list for convenience,
+but for voice chat, local is the better path.)
+
+The only case this does not cover is a game with its own in-game voice chat
+that captures from the system mic *on the VM*. That has no supported path today.
 
 ## Useful Commands
 
