@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	osuser "os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -288,6 +290,45 @@ func ensureGamingEnvironment(user string) error {
 	if err := os.WriteFile(path, []byte(gamingEnvironmentBody), 0o644); err != nil {
 		return err
 	}
+	return chownHomePathToUser(user, path)
+}
+
+// chownHomePathToUser repairs ownership after root-run deploy code creates
+// directories under a user's home via os.MkdirAll. It chowns every path
+// component from /home/<user> down to (and including) target to that user.
+//
+// Without this, os.MkdirAll run as root leaves the created parents (notably
+// ~/.config and ~/.local/share/applications) owned by root, which silently
+// blocks the user's own apps from writing their config/data - Chrome, Steam,
+// JDownloader, etc. then fail to start and never draw a window, and the
+// desktop menu can't refresh its cache so app icons go missing.
+func chownHomePathToUser(user, target string) error {
+	u, err := osuser.Lookup(user)
+	if err != nil {
+		return err
+	}
+	uid, err := strconv.Atoi(u.Uid)
+	if err != nil {
+		return err
+	}
+	gid, err := strconv.Atoi(u.Gid)
+	if err != nil {
+		return err
+	}
+	home := filepath.Clean(filepath.Join("/home", user))
+	target = filepath.Clean(target)
+	rel, err := filepath.Rel(home, target)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(os.PathSeparator)) {
+		// target is not under the home dir; chown it directly.
+		return os.Chown(target, uid, gid)
+	}
+	p := home
+	for _, part := range strings.Split(rel, string(os.PathSeparator)) {
+		p = filepath.Join(p, part)
+		if err := os.Chown(p, uid, gid); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -350,7 +391,11 @@ func ensureSteamDesktopOverride(user string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, "steam.desktop"), wrapSteamDesktopEntry(body), 0o644)
+	dst := filepath.Join(dir, "steam.desktop")
+	if err := os.WriteFile(dst, wrapSteamDesktopEntry(body), 0o644); err != nil {
+		return err
+	}
+	return chownHomePathToUser(user, dst)
 }
 
 const steamPlayStationEnvPrefix = "env PROTON_ENABLE_HIDRAW=1 SDL_JOYSTICK_HIDAPI_PS5=1 SDL_JOYSTICK_HIDAPI_PS4=1 "
