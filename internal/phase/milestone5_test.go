@@ -330,6 +330,40 @@ func TestVirtualInputUdevRuleGrantsHidrawAccessForHIDAPI(t *testing.T) {
 	}
 }
 
+func TestVirtualInputUdevSetupUsesDevnameTriggersForExistingMiscNodes(t *testing.T) {
+	// Live RTX 6000 Ada VM regression, 2026-05-26: /dev/uinput and
+	// /dev/uhid already existed before streaming_services wrote the udev
+	// rule. The old trigger used --attr-match=name=..., which did not match
+	// these virtual misc devices on Ubuntu 25.10, leaving them 0600
+	// root:root. Sunshine then received Moonlight mouse packets but could
+	// not inject the cursor. Name-match triggers hit the existing devnodes.
+	got := virtualInputUdevTriggerCommands()
+	joined := make([]string, 0, len(got))
+	for _, argv := range got {
+		joined = append(joined, strings.Join(argv, " "))
+	}
+	body := strings.Join(joined, "\n")
+	for _, want := range []string{
+		"udevadm trigger --name-match=/dev/uinput",
+		"udevadm trigger --name-match=/dev/uhid",
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("virtual input udev triggers missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "--attr-match=name=uinput") || strings.Contains(body, "--attr-match=name=uhid") {
+		t.Fatalf("virtual input udev triggers must not use non-matching attr-match form:\n%s", body)
+	}
+	for _, want := range []string{
+		`SUBSYSTEM=="misc", KERNEL=="uinput"`,
+		`SUBSYSTEM=="misc", KERNEL=="uhid"`,
+	} {
+		if !strings.Contains(virtualInputUdevRuleBody, want) {
+			t.Fatalf("virtual-input udev rule missing misc-device match %q:\n%s", want, virtualInputUdevRuleBody)
+		}
+	}
+}
+
 func TestLegacyJoydevBlacklistDisablesBogusJsControllerPath(t *testing.T) {
 	for _, want := range []string{
 		"blacklist joydev",

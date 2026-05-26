@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	osuser "os/user"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -1345,6 +1346,8 @@ const virtualInputUdevRuleBody = `# Managed by clouddeploy v3 (phase streaming_s
 # Static-node + group permissions for Moonlight controller/keyboard/gamepad input.
 KERNEL=="uinput", MODE="0660", GROUP="input", OPTIONS+="static_node=uinput"
 KERNEL=="uhid",   MODE="0660", GROUP="input", OPTIONS+="static_node=uhid"
+SUBSYSTEM=="misc", KERNEL=="uinput", MODE="0660", GROUP="input"
+SUBSYSTEM=="misc", KERNEL=="uhid",   MODE="0660", GROUP="input"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", MODE="0660", GROUP="input"
 # Sony controllers (DualSense 054c:0ce6, DualShock 4, etc.) explicit rule
 # in case the generic hidraw match runs after a vendor-specific default.
@@ -1413,13 +1416,26 @@ func ensureUinput(ctx context.Context, deps *Deps, user string, cfg config.Sunsh
 		_ = os.Remove("/etc/udev/rules.d/70-clouddeploy-uinput.rules")
 	}
 	_ = run(ctx, deps, "", []string{"udevadm", "control", "--reload-rules"}, time.Minute, true)
-	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uinput"}, time.Minute, true)
-	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=misc", "--attr-match=name=uhid"}, time.Minute, true)
+	// On Ubuntu 25.10 Vast VMs, /dev/uinput and /dev/uhid already exist
+	// by the time this phase writes the rule, but `--attr-match=name=...`
+	// does not match those virtual misc devices. The rule is correct, yet
+	// the live nodes stay 0600 root:root, so Sunshine receives Moonlight
+	// mouse packets but cannot inject a pointer into KWin. Trigger the
+	// device nodes by their devnames and keep a direct chmod/chgrp fallback
+	// below for already-created nodes.
+	for _, argv := range virtualInputUdevTriggerCommands() {
+		_ = run(ctx, deps, "", argv, time.Minute, true)
+	}
 	_ = run(ctx, deps, "", []string{"udevadm", "trigger", "--subsystem-match=hidraw"}, time.Minute, true)
 	// Add cloudgamer to the input group permanently. Without group
 	// membership the udev rule's MODE=0660,GROUP=input doesn't give
 	// the service user write access.
 	_ = run(ctx, deps, "", []string{"usermod", "-aG", "input", user}, 15*time.Second, true)
+	_ = run(ctx, deps, "", []string{"udevadm", "settle"}, time.Minute, true)
+	if !deps.DryRun {
+		details["uinput_permission_fallback_ok"] = forceInputNodePermission("/dev/uinput", details, "uinput")
+		details["uhid_permission_fallback_ok"] = forceInputNodePermission("/dev/uhid", details, "uhid")
+	}
 	details["uinput_exists"] = pathExists("/dev/uinput")
 	details["uhid_exists"] = pathExists("/dev/uhid")
 	details["uinput_user_writable"] = run(ctx, deps, "", []string{"runuser", "-u", user, "--", "test", "-w", "/dev/uinput"}, 15*time.Second, true) == nil
@@ -1429,6 +1445,39 @@ func ensureUinput(ctx context.Context, deps *Deps, user string, cfg config.Sunsh
 	details["uhid_static_node_option"] = strings.Contains(virtualInputUdevRuleBody, "static_node=uhid")
 	details["hidraw_rule_present"] = strings.Contains(virtualInputUdevRuleBody, "KERNEL==\"hidraw*\"")
 	details["uinput_group_member"] = run(ctx, deps, "", []string{"bash", "-lc", "id -nG " + shellQuote(user) + " | tr ' ' '\\n' | grep -qx input"}, 15*time.Second, true) == nil
+}
+
+func virtualInputUdevTriggerCommands() [][]string {
+	return [][]string{
+		{"udevadm", "trigger", "--name-match=/dev/uinput"},
+		{"udevadm", "trigger", "--name-match=/dev/uhid"},
+	}
+}
+
+func forceInputNodePermission(path string, details map[string]any, prefix string) bool {
+	if _, err := os.Stat(path); err != nil {
+		details[prefix+"_permission_fallback_error"] = err.Error()
+		return false
+	}
+	group, err := osuser.LookupGroup("input")
+	if err != nil {
+		details[prefix+"_permission_fallback_error"] = err.Error()
+		return false
+	}
+	gid, err := strconv.Atoi(group.Gid)
+	if err != nil {
+		details[prefix+"_permission_fallback_error"] = err.Error()
+		return false
+	}
+	if err := os.Chown(path, 0, gid); err != nil {
+		details[prefix+"_permission_fallback_error"] = err.Error()
+		return false
+	}
+	if err := os.Chmod(path, 0o660); err != nil {
+		details[prefix+"_permission_fallback_error"] = err.Error()
+		return false
+	}
+	return true
 }
 
 type deviceAccessProbe struct {
