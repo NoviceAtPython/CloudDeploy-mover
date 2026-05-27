@@ -1031,8 +1031,12 @@ func TestRenderTailscaleBootReconnect(t *testing.T) {
 	for _, want := range []string{
 		"Description=CloudDeploy Tailscale reconnect on boot",
 		"After=network-online.target tailscaled.service",
+		"StartLimitBurst=20",
 		"EnvironmentFile=-/etc/clouddeploy/secrets.env",
 		"ExecStart=/usr/local/bin/clouddeploy-tailscale-up.sh",
+		"RemainAfterExit=no",
+		"Restart=on-failure",
+		"RestartSec=15s",
 		"WantedBy=multi-user.target",
 	} {
 		if !strings.Contains(svc, want) {
@@ -1043,7 +1047,9 @@ func TestRenderTailscaleBootReconnect(t *testing.T) {
 	for _, want := range []string{
 		`key="${TAILSCALE_AUTHKEY:-}"`,
 		`tailscale up --ssh --authkey "$key"`,
-		"tailscale status",
+		"tailscale ip -4",
+		"failed to obtain a Tailscale IPv4 address",
+		"exit 1",
 	} {
 		if !strings.Contains(sc, want) {
 			t.Fatalf("tailscale up script (ssh) missing %q:\n%s", want, sc)
@@ -1051,6 +1057,34 @@ func TestRenderTailscaleBootReconnect(t *testing.T) {
 	}
 	if strings.Contains(renderTailscaleUpScript(false), "--ssh") {
 		t.Fatalf("non-ssh tailscale up script must not contain --ssh:\n%s", renderTailscaleUpScript(false))
+	}
+}
+
+func TestRenderPlasmaShellHelperWaitsForConnectableWaylandAndResetsFailures(t *testing.T) {
+	helper := renderPlasmaShellHelper("cloudgamer", "1002")
+	for _, want := range []string{
+		"wayland_ready()",
+		"socket.AF_UNIX",
+		"s.connect(sys.argv[1])",
+		"connectable wayland-0",
+		"systemctl --user reset-failed xdg-desktop-portal.service plasma-plasmashell.service",
+		"timeout 30s systemctl --user restart xdg-desktop-portal.service",
+		"systemctl --user restart plasma-plasmashell.service",
+	} {
+		if !strings.Contains(helper, want) {
+			t.Fatalf("plasmashell helper missing %q:\n%s", want, helper)
+		}
+	}
+
+	svc := renderPlasmaShellService("1002", "kwin-realvt.service")
+	for _, want := range []string{
+		"StartLimitBurst=12",
+		"Restart=on-failure",
+		"RestartSec=5s",
+	} {
+		if !strings.Contains(svc, want) {
+			t.Fatalf("plasmashell service missing %q:\n%s", want, svc)
+		}
 	}
 }
 

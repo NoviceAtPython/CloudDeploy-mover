@@ -903,11 +903,10 @@ func ensureTailscaleBootReconnect(ctx context.Context, deps *Deps, ssh bool) err
 	return run(ctx, deps, "", []string{"systemctl", "enable", "clouddeploy-tailscale-up.service"}, time.Minute, true)
 }
 
-// renderTailscaleUpScript reconnects the tailnet on boot. It waits for
-// tailscaled, then `tailscale up` with the authkey from secrets.env
-// (loaded by the unit's EnvironmentFile). The authkey'd attempt falls
-// back to a keyless `tailscale up` that reuses saved state, so it works
-// for reusable keys and for already-registered nodes alike.
+// renderTailscaleUpScript reconnects the tailnet on boot. It retries until a
+// real Tailscale IPv4 address exists, not merely until `tailscale up` returns.
+// The unit restarts on nonzero exit, so a transient boot/network race doesn't
+// leave the VM marked "successfully reconnected" while unreachable.
 func renderTailscaleUpScript(ssh bool) string {
 	sshFlag := ""
 	if ssh {
@@ -917,16 +916,28 @@ func renderTailscaleUpScript(ssh bool) string {
 # Managed by CloudDeploy v3 - reconnect Tailscale after an instance
 # stop/start so the VM is reachable again without manual re-auth.
 set -u
-for _ in $(seq 1 30); do
-  tailscale status >/dev/null 2>&1 && break
-  sleep 1
-done
+log() { printf 'clouddeploy-tailscale-up: %s\n' "$*" >&2; }
 key="${TAILSCALE_AUTHKEY:-}"
-if [ -n "$key" ]; then
-  tailscale up` + sshFlag + ` --authkey "$key" || tailscale up` + sshFlag + ` || true
-else
-  tailscale up` + sshFlag + ` || true
-fi
+for attempt in $(seq 1 24); do
+  if ip="$(tailscale ip -4 2>/dev/null | head -n1)" && [ -n "$ip" ]; then
+    log "already online at ${ip}"
+    exit 0
+  fi
+  log "attempt ${attempt}: running tailscale up"
+  if [ -n "$key" ]; then
+    tailscale up` + sshFlag + ` --authkey "$key" || tailscale up` + sshFlag + ` || true
+  else
+    tailscale up` + sshFlag + ` || true
+  fi
+  if ip="$(tailscale ip -4 2>/dev/null | head -n1)" && [ -n "$ip" ]; then
+    log "online at ${ip}"
+    exit 0
+  fi
+  sleep 5
+done
+log "failed to obtain a Tailscale IPv4 address after retries"
+tailscale status || true
+exit 1
 `
 }
 
@@ -935,12 +946,16 @@ func renderTailscaleUpService() string {
 Description=CloudDeploy Tailscale reconnect on boot
 Wants=network-online.target tailscaled.service
 After=network-online.target tailscaled.service
+StartLimitIntervalSec=5min
+StartLimitBurst=20
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+RemainAfterExit=no
 EnvironmentFile=-/etc/clouddeploy/secrets.env
 ExecStart=` + tailscaleUpScriptPath + `
+Restart=on-failure
+RestartSec=15s
 
 [Install]
 WantedBy=multi-user.target
@@ -2132,18 +2147,28 @@ set -euo pipefail
 user=%s
 uid=%s
 runtime=/run/user/${uid}
+wayland_ready() {
+  python3 - "${runtime}/wayland-0" <<'PY' >/dev/null 2>&1
+import socket
+import sys
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.settimeout(1.0)
+s.connect(sys.argv[1])
+PY
+}
 mkdir -p "${runtime}"
 chown "${user}:${user}" "${runtime}"
 chmod 0700 "${runtime}"
 systemctl start "user@${uid}.service"
-for _ in $(seq 1 45); do
-  if [ -S "${runtime}/bus" ] && [ -S "${runtime}/wayland-0" ]; then
+for _ in $(seq 1 90); do
+  if [ -S "${runtime}/bus" ] && [ -S "${runtime}/wayland-0" ] && wayland_ready; then
     break
   fi
   sleep 1
 done
-if [ ! -S "${runtime}/bus" ] || [ ! -S "${runtime}/wayland-0" ]; then
-  echo "clouddeploy-start-plasmashell: user bus or wayland-0 missing under ${runtime}" >&2
+if [ ! -S "${runtime}/bus" ] || [ ! -S "${runtime}/wayland-0" ] || ! wayland_ready; then
+  echo "clouddeploy-start-plasmashell: user bus or connectable wayland-0 missing under ${runtime}" >&2
   exit 1
 fi
 env_common=(
@@ -2163,9 +2188,17 @@ env_common=(
   "XDG_DATA_DIRS=/home/${user}/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share/:/usr/share/"
 )
 runuser -u "${user}" -- env "${env_common[@]}" systemctl --user import-environment DISPLAY WAYLAND_DISPLAY QT_QPA_PLATFORM XDG_CURRENT_DESKTOP XDG_SESSION_TYPE XDG_SESSION_DESKTOP KDE_FULL_SESSION XDG_MENU_PREFIX XDG_DATA_DIRS XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
-runuser -u "${user}" -- env "${env_common[@]}" systemctl --user restart xdg-desktop-portal.service || true
-runuser -u "${user}" -- env "${env_common[@]}" systemctl --user start plasma-plasmashell.service
-runuser -u "${user}" -- env "${env_common[@]}" systemctl --user is-active --quiet plasma-plasmashell.service
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user reset-failed xdg-desktop-portal.service plasma-plasmashell.service || true
+runuser -u "${user}" -- env "${env_common[@]}" timeout 30s systemctl --user restart xdg-desktop-portal.service || true
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user restart plasma-plasmashell.service
+for _ in $(seq 1 20); do
+  if runuser -u "${user}" -- env "${env_common[@]}" systemctl --user is-active --quiet plasma-plasmashell.service; then
+    exit 0
+  fi
+  sleep 1
+done
+runuser -u "${user}" -- env "${env_common[@]}" systemctl --user --no-pager --full status plasma-plasmashell.service || true
+exit 1
 `, shellQuote(user), shellQuote(uid))
 }
 
@@ -2177,11 +2210,15 @@ func renderPlasmaShellService(uid, compositorService string) string {
 Description=CloudDeploy visible Plasma shell for Sunshine capture
 After=%s user@%s.service
 Wants=%s user@%s.service
+StartLimitIntervalSec=2min
+StartLimitBurst=12
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/usr/local/bin/clouddeploy-start-plasmashell
+Restart=on-failure
+RestartSec=5s
 
 [Install]
 WantedBy=multi-user.target
