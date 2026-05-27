@@ -1070,6 +1070,7 @@ func TestRenderPlasmaShellHelperWaitsForConnectableWaylandAndResetsFailures(t *t
 		"systemctl --user reset-failed xdg-desktop-portal.service plasma-plasmashell.service",
 		"timeout 30s systemctl --user restart xdg-desktop-portal.service",
 		"systemctl --user restart plasma-plasmashell.service",
+		"systemctl --user start plasma-xembedsniproxy.service",
 	} {
 		if !strings.Contains(helper, want) {
 			t.Fatalf("plasmashell helper missing %q:\n%s", want, helper)

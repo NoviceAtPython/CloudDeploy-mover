@@ -2193,6 +2193,11 @@ runuser -u "${user}" -- env "${env_common[@]}" timeout 30s systemctl --user rest
 runuser -u "${user}" -- env "${env_common[@]}" systemctl --user restart plasma-plasmashell.service
 for _ in $(seq 1 20); do
   if runuser -u "${user}" -- env "${env_common[@]}" systemctl --user is-active --quiet plasma-plasmashell.service; then
+    # Plasma 6 ships xembedsniproxy but never starts it on Wayland, so legacy
+    # XEmbed tray icons (Wine systray, Java/AWT apps like JDownloader, Bottles)
+    # have no host and those apps fail to create a tray window. Start KDE's
+    # static user unit now that the SNI host (plasmashell) is up.
+    runuser -u "${user}" -- env "${env_common[@]}" systemctl --user start plasma-xembedsniproxy.service 2>/dev/null || true
     exit 0
   fi
   sleep 1
