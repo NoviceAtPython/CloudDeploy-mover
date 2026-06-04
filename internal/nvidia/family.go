@@ -298,7 +298,7 @@ func (e Evidence) requiresOpenKernelModule() bool {
 func SelectFamily(e Evidence) (Family, string, error) {
 	// 1: hard open requirement.
 	if e.requiresOpenKernelModule() {
-		f, reason := firstAvailable(e, openOnlyOrder)
+		f, reason := firstAvailable(e, openOnlyOrderFor(e))
 		if f == FamilyUnknown {
 			return FamilyUnknown, openRequiredReason(e), ErrNoOpenAvailable
 		}
@@ -354,11 +354,24 @@ func SelectFamily(e Evidence) (Family, string, error) {
 // Preference orderings. The selector walks the slice in order and
 // returns the first available family.
 var (
-	// openOnlyOrder is used when the GPU REQUIRES the open kernel
-	// module. Only *-open families are considered; closed families
-	// are deliberately absent so we hit ErrNoOpenAvailable rather
-	// than silently installing a doomed closed driver.
-	openOnlyOrder = []Family{FamilyServerOpen, FamilyNonServerOpen}
+	// openOnlyOrderServerFirst / openOnlyOrderUDAFirst are the two
+	// orderings used when the GPU REQUIRES the open kernel module
+	// (Blackwell, or a dmesg "requires open" signal). Only *-open
+	// families are considered; closed families are deliberately
+	// absent so we hit ErrNoOpenAvailable rather than silently
+	// installing a doomed closed driver.
+	//
+	// Live VM evidence (2026-06): an RTX 5090 gaming deploy with
+	// profile prefer_server=false still landed on
+	// nvidia-driver-595-server-open because the old single
+	// openOnlyOrder put server-open first unconditionally and the
+	// hard-open path never consulted the prefer_server hint. For a
+	// cloud-GAMING orchestrator the Game-Ready / UDA branch
+	// (non-server-open) is the right default; -server-open
+	// (datacenter) lags on gaming/Proton fixes. So the open-only
+	// ordering now honours PreferServerFamily.
+	openOnlyOrderServerFirst = []Family{FamilyServerOpen, FamilyNonServerOpen}
+	openOnlyOrderUDAFirst    = []Family{FamilyNonServerOpen, FamilyServerOpen}
 
 	// openFirstOrder is the SOFT PreferOpenFamily ordering: open
 	// preferred, but closed accepted as fallback for GPUs that work
@@ -374,6 +387,18 @@ var (
 	// server is the second-safest; non-server-* is the last resort.
 	defaultOrder = []Family{FamilyServerOpen, FamilyServer, FamilyNonServerOpen, FamilyNonServer}
 )
+
+// openOnlyOrderFor picks the open-only preference ordering based on
+// the profile's server hint. Data-center / server profiles
+// (PreferServerFamily) keep server-open first; every other profile
+// (the cloud-gaming default) prefers the UDA / Game Ready
+// non-server-open branch first.
+func openOnlyOrderFor(e Evidence) []Family {
+	if e.PreferServerFamily {
+		return openOnlyOrderServerFirst
+	}
+	return openOnlyOrderUDAFirst
+}
 
 // firstAvailable returns the first family in order that IsAvailable
 // reports as installable, along with a one-line "why this one" reason.

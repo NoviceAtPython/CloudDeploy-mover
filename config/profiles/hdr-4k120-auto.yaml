@@ -31,7 +31,7 @@ display:
   forced_connector: DP-1
 
 nvidia:
-  driver_major: "580"
+  driver_major: "595"
   prefer_open_family: true
   prefer_server: false
 

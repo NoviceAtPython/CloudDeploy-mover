@@ -76,6 +76,36 @@ func TestSelectFamilyDecisionMatrix(t *testing.T) {
 			want: want{family: FamilyUnknown, err: ErrNoOpenAvailable, reasonHas: "Blackwell consumer"},
 		},
 		{
+			// Live VM (2026-06): the 595 archive ships BOTH
+			// nvidia-driver-595-open and -595-server-open. A cloud
+			// gaming deploy (no prefer_server) must land on the
+			// UDA / Game Ready non-server-open branch.
+			name: "RTX 5090 + BOTH open families available + gaming default -> non-server-open (GRD/UDA)",
+			ev: Evidence{
+				PCIID:                  "10de:2b85",
+				GPUName:                "NVIDIA GeForce RTX 5090",
+				IsBlackwellConsumer:    true,
+				PreferOpenFamily:       true,
+				AvailabilityKnown:      true,
+				AvailableServerOpen:    true,
+				AvailableNonServerOpen: true,
+			},
+			want: want{family: FamilyNonServerOpen, reasonHas: "Blackwell consumer"},
+		},
+		{
+			name: "RTX 5090 + BOTH open families available + PreferServerFamily -> server-open",
+			ev: Evidence{
+				PCIID:                  "10de:2b85",
+				GPUName:                "NVIDIA GeForce RTX 5090",
+				IsBlackwellConsumer:    true,
+				PreferServerFamily:     true,
+				AvailabilityKnown:      true,
+				AvailableServerOpen:    true,
+				AvailableNonServerOpen: true,
+			},
+			want: want{family: FamilyServerOpen, reasonHas: "Blackwell consumer"},
+		},
+		{
 			name: "L4 + server available + PreferServerFamily -> server",
 			ev: Evidence{
 				PCIID:               "10de:27b8",

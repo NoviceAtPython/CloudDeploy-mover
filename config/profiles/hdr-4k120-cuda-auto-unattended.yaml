@@ -13,7 +13,12 @@ display:
   forced_connector: DP-1
 
 nvidia:
-  driver_major: "580"
+  # 595 GRD/UDA. driver_major=595 + prefer_server=false routes the
+  # Blackwell open-module selection to the Game Ready / UDA branch
+  # (nvidia-driver-595-open), verified on live RTX 5090s 2026-06.
+  # The 595 driver advertises CUDA runtime 13.2 (nvidia-smi), up from
+  # 13.0 under 580 -- automatic with the driver, not a toolkit pin.
+  driver_major: "595"
   prefer_open_family: true
   prefer_server: false
 
@@ -21,6 +26,10 @@ cuda:
   # Unattended paid-VM runs must keep going to EDID/KWin/Sunshine if
   # the CUDA detector/smoke test degrades; NVENC validation happens
   # later and is independent of the CUDA toolkit smoke binary.
+  #
+  # prefer_major=13 + prefer_newest picks the newest CUDA 13.x toolkit
+  # (>= 13.2 alongside driver 595); we intentionally do NOT pin a
+  # minor so the candidate ladder stays adaptive across archives.
   mode: optional
   method: apt
   selection_policy: latest-compatible

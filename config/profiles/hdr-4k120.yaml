@@ -25,7 +25,7 @@ display:
   forced_connector: DP-1
 
 nvidia:
-  driver_major: "580"
+  driver_major: "595"
   # The HDR-4K120 path is validated on RTX 4090 (closed module fine)
   # and RTX 5090 (Blackwell consumer, requires open). Setting
   # prefer_open_family=true is the safe default for both; the
