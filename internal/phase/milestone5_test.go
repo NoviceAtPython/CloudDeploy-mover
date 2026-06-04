@@ -265,9 +265,14 @@ func TestStreamingServicesUsesDirectKWinDependency(t *testing.T) {
 func TestSunshineWatchdogStartsOnlyWhenDown(t *testing.T) {
 	svc := renderSunshineWatchdogService()
 	for _, want := range []string{
-		"Description=CloudDeploy Sunshine availability watchdog",
 		"Type=oneshot",
-		"ExecStart=/bin/systemctl start sunshine-headless.service",
+		// Revives the COMPOSITOR first (the boot-race root cause),
+		// then Sunshine -- each only when not already active.
+		"is-active --quiet kwin-realvt.service",
+		"systemctl start kwin-realvt.service",
+		"reset-failed kwin-realvt.service",
+		"is-active --quiet sunshine-headless.service",
+		"systemctl start sunshine-headless.service",
 	} {
 		if !strings.Contains(svc, want) {
 			t.Fatalf("watchdog service missing %q:\n%s", want, svc)

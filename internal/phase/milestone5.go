@@ -2248,12 +2248,25 @@ systemctl --no-pager --full status kwin-realvt.service clouddeploy-plasmashell.s
 }
 
 func renderSunshineWatchdogService() string {
+	// Live VM evidence (2026-06, RTX 5090): after a reboot
+	// kwin-realvt.service lost the race against DRM/seat readiness,
+	// exited status=1, and (Restart=no) stayed dead -- so
+	// sunshine-headless (Wants/After kwin-realvt) never came up
+	// either. A watchdog that only started Sunshine could not
+	// recover a dead compositor.
+	//
+	// Now: revive the COMPOSITOR first, then Sunshine (which pulls
+	// clouddeploy-plasmashell via Wants), and only act on a unit
+	// that is NOT already active so a healthy live Moonlight session
+	// is never bounced. reset-failed clears any boot-race StartLimit
+	// before the start; by the time the watchdog fires (OnBootSec=
+	// 2min) DRM is long ready.
 	return `[Unit]
-Description=CloudDeploy Sunshine availability watchdog
+Description=CloudDeploy KWin+Sunshine availability watchdog
 
 [Service]
 Type=oneshot
-ExecStart=/bin/systemctl start sunshine-headless.service
+ExecStart=/bin/sh -c 'systemctl is-active --quiet kwin-realvt.service || { systemctl reset-failed kwin-realvt.service 2>/dev/null || true; systemctl start kwin-realvt.service || true; }; systemctl is-active --quiet sunshine-headless.service || { systemctl reset-failed sunshine-headless.service 2>/dev/null || true; systemctl start sunshine-headless.service || true; }'
 `
 }
 
