@@ -51,7 +51,7 @@ sunshine:
   hevc_mode: 3
   av1_mode: 3
   # The two knobs that flip Moonlight's HDR overlay on:
-  force_av1_hdr10: true
+  force_av1_hdr10: false
   synthesize_hdr10_metadata: true
 
 kwin:

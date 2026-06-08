@@ -137,6 +137,21 @@ func TestRenderSunshineConfig_HonorsExplicitGamepadMode(t *testing.T) {
 	}
 }
 
+func TestRenderSunshineConfig_HDRAutoMatchPrepCmd(t *testing.T) {
+	// Default (force off): the HDR auto-match prep-command is wired so host
+	// HDR follows the connecting client's request.
+	auto := renderSunshineConfig(config.SunshineConfig{Encoder: "nvenc", Capture: "kms"}, "/dev/dri/card1", nil)
+	if !strings.Contains(auto, "global_prep_cmd") || !strings.Contains(auto, clouddeployHdrMatchPath) {
+		t.Errorf("auto-match config should wire global_prep_cmd -> %s:\n%s", clouddeployHdrMatchPath, auto)
+	}
+	// Legacy opt-in (force on): no prep-command (would conflict with the
+	// always-HDR encode).
+	forced := renderSunshineConfig(config.SunshineConfig{Encoder: "nvenc", Capture: "kms", ForceAV1HDR10: true}, "/dev/dri/card1", nil)
+	if strings.Contains(forced, "global_prep_cmd") {
+		t.Errorf("force_av1_hdr10=true should NOT wire global_prep_cmd:\n%s", forced)
+	}
+}
+
 func TestRenderCloudDeployAudioScriptCreatesSurroundSinkAndVirtualMic(t *testing.T) {
 	cfg := config.AudioConfig{
 		VirtualSink: "clouddeploy-surround71",

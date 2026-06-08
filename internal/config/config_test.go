@@ -54,8 +54,12 @@ func TestHDRProfileSpec(t *testing.T) {
 	if !p.Display.HDR {
 		t.Fatal("hdr-4k120: display.hdr must be true")
 	}
-	if !p.Sunshine.ForceAV1HDR10 {
-		t.Error("hdr-4k120: sunshine.force_av1_hdr10 must be true")
+	// HDR auto-match: force_av1_hdr10 is OFF by default now. The host follows
+	// the connecting client's HDR request via the clouddeploy-hdr-match
+	// prep-command instead of force-forcing a 10-bit PQ stream (which garbled
+	// SDR clients). force_av1_hdr10=true remains an opt-in legacy override.
+	if p.Sunshine.ForceAV1HDR10 {
+		t.Error("hdr-4k120: sunshine.force_av1_hdr10 must be false (auto-match, not forced)")
 	}
 	if !p.Sunshine.SynthesizeHDR10Metadata {
 		t.Error("hdr-4k120: sunshine.synthesize_hdr10_metadata must be true")
@@ -602,10 +606,10 @@ func TestProfileValidatorRejectsBadInputs(t *testing.T) {
 			p.Display.HDR = true
 			p.Sunshine.ForkCommit = ""
 		}, "sunshine.fork_commit"},
-		{"hdr without force_av1_hdr10", func(p *Profile) {
+		{"hdr without synthesize_hdr10_metadata", func(p *Profile) {
 			p.Display.HDR = true
-			p.Sunshine.ForceAV1HDR10 = false
-		}, "force_av1_hdr10"},
+			p.Sunshine.SynthesizeHDR10Metadata = false
+		}, "synthesize_hdr10_metadata"},
 
 		{"hdr with hevc_mode below Main10", func(p *Profile) {
 			p.Display.HDR = true

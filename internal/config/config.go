@@ -1024,9 +1024,15 @@ func ValidateProfile(p *Profile) error {
 		if p.Sunshine.ForkCommit == "" {
 			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.fork_commit pin", p.Profile)
 		}
-		if !p.Sunshine.ForceAV1HDR10 {
-			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.force_av1_hdr10=true", p.Profile)
-		}
+		// NOTE: force_av1_hdr10 is no longer required for HDR profiles. The
+		// default HDR path now AUTO-MATCHES the client: a Sunshine
+		// global_prep_cmd (clouddeploy-hdr-match) enables host HDR/WCG only
+		// when the connecting client requested HDR, so the encode follows the
+		// client without being forced. Forcing HDR unconditionally
+		// (force_av1_hdr10=true) broke SDR clients (the host emitted a 10-bit
+		// PQ stream the SDR client decoded as garbage). force_av1_hdr10 remains
+		// an opt-in override for the old always-HDR behavior; when it is true
+		// the auto-match prep-cmd is not wired.
 		if !p.Sunshine.SynthesizeHDR10Metadata {
 			return fmt.Errorf("config: profile %q: HDR profile requires sunshine.synthesize_hdr10_metadata=true", p.Profile)
 		}

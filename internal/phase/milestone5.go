@@ -741,6 +741,12 @@ func (p SunshineConfigPhase) Run(ctx context.Context, deps *Deps) error {
 			}
 		}
 		details["credentials_dir"] = credsDir
+		conn := strings.TrimSpace(deps.Profile.Display.ForcedConnector)
+		if herr := installStreamingHelpers(desk.User, uid, conn); herr != nil {
+			details["streaming_helpers_warning"] = herr.Error()
+		} else {
+			details["streaming_helpers_installed"] = true
+		}
 	}
 	if strings.Contains(body, "\nhdr =") || strings.Contains(body, "\nfps =") || strings.Contains(body, "\nresolutions =") {
 		return failPhase(deps, SunshineConfigName, details, "invalid Sunshine config keys", fmt.Errorf("generated sunshine.conf contains invalid hdr/fps/resolutions keys"), true)
@@ -815,7 +821,126 @@ func renderSunshineConfigWithAudio(cfg config.SunshineConfig, audio config.Audio
 	if len(origins) > 0 {
 		b.WriteString("csrf_allowed_origins = " + strings.Join(origins, ",") + "\n")
 	}
+	// HDR auto-match: unless HDR is force-forced (legacy opt-in), wire a
+	// Sunshine prep-command that sets the host display HDR/WCG to the
+	// connecting client's request (clouddeploy-hdr-match reads
+	// SUNSHINE_CLIENT_HDR). This keeps the encode and the display colorspace
+	// in agreement -- SDR clients get clean SDR, HDR clients get clean HDR --
+	// instead of the forced 10-bit PQ stream that garbled SDR clients.
+	if !cfg.ForceAV1HDR10 {
+		b.WriteString(`global_prep_cmd = [{"do":"` + clouddeployHdrMatchPath + `","undo":"","elevated":"false"}]` + "\n")
+	}
 	return b.String()
+}
+
+// Streaming-UX helper scripts installed on every deploy so the Moonlight
+// experience matches the validated live box: terminal pairing, a host HDR
+// toggle, and -- the load-bearing one -- the Sunshine prep-command that makes
+// host HDR follow the connecting client.
+const (
+	clouddeployHdrMatchPath  = "/usr/local/bin/clouddeploy-hdr-match"
+	clouddeployHdrPath       = "/usr/local/bin/clouddeploy-hdr"
+	clouddeployPairPath      = "/usr/local/bin/clouddeploy-pair"
+	clouddeployMoonlightHook = "/etc/profile.d/zz-clouddeploy-moonlight.sh"
+)
+
+// renderClouddeployHdrMatch is the Sunshine global_prep_cmd: it sets the host
+// display HDR/WCG to match the connecting client (SUNSHINE_CLIENT_HDR) so the
+// encode and the display colorspace agree.
+func renderClouddeployHdrMatch(uid, conn string) string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
+# Managed by CloudDeploy v3 -- Sunshine global_prep_cmd.
+# Match host display HDR/WCG to the connecting client so the encode and the
+# display colorspace agree (no forced-HDR glitch on SDR clients).
+export XDG_RUNTIME_DIR=/run/user/%s WAYLAND_DISPLAY=wayland-0
+OUT=%s
+if [ "${SUNSHINE_CLIENT_HDR:-0}" = "1" ]; then
+  kscreen-doctor output.$OUT.hdr.enable output.$OUT.wcg.enable
+else
+  kscreen-doctor output.$OUT.hdr.disable output.$OUT.wcg.disable
+fi
+sleep 1.5   # let KWin apply the colorspace before Sunshine starts the encode
+exit 0
+`, uid, conn)
+}
+
+// renderClouddeployHdr is the operator helper to flip host HDR/SDR by hand.
+func renderClouddeployHdr(user, uid, conn string) string {
+	return fmt.Sprintf(`#!/usr/bin/env bash
+# Managed by CloudDeploy v3 -- clouddeploy-hdr on|off|dim N|status.
+set -uo pipefail
+U=%s; RT=/run/user/%s; OUT=%s
+kd(){ sudo -u "$U" env XDG_RUNTIME_DIR="$RT" WAYLAND_DISPLAY=wayland-0 kscreen-doctor "$@"; }
+case "${1:-status}" in
+  on)  kd output.$OUT.hdr.enable output.$OUT.wcg.enable && echo "HDR+WCG ON ($OUT)";;
+  off) kd output.$OUT.hdr.disable output.$OUT.wcg.disable && echo "HDR OFF -> SDR ($OUT)";;
+  dim) kd output.$OUT.sdr-brightness."${2:-203}" && echo "SDR brightness -> ${2:-203} nits";;
+  status|*) kd -o 2>/dev/null | grep -iE "Output:|HDR:|Wide Color|SDR brightness|Peak";;
+esac
+`, user, uid, conn)
+}
+
+// clouddeployPairScript pairs a Moonlight client from the terminal (no web UI).
+const clouddeployPairScript = `#!/usr/bin/env bash
+# Managed by CloudDeploy v3 -- pair a Moonlight client from the terminal.
+set -uo pipefail
+TS="$(tailscale ip -4 2>/dev/null | head -1)"
+if [ -z "${TS:-}" ]; then
+  echo
+  echo "  Tailscale is not connected -- there is no address Moonlight can reach."
+  echo "  Bring it up, then re-run clouddeploy-pair:  sudo tailscale up --authkey=tskey-..."
+  exit 1
+fi
+[ -r /etc/clouddeploy/secrets.env ] && . /etc/clouddeploy/secrets.env
+U="${SUNSHINE_USER:-clouddeploy}"; P="${SUNSHINE_PASS:-}"
+echo
+echo "  +--------------------------------------------------+"
+echo "  |  Moonlight is ACTIVE                              |"
+echo "  |  In Moonlight -> Add Host:                        |"
+printf "  |      %-44s|\n" "$TS"
+echo "  |  Click it; it shows a 4-digit PIN.               |"
+echo "  +--------------------------------------------------+"
+read -rp "  Enter PIN (or just Enter to skip): " PIN || exit 0
+[ -n "${PIN:-}" ] || { echo "  (skipped)"; exit 0; }
+read -rp "  Device name [moonlight]: " NAME || true; NAME="${NAME:-moonlight}"
+resp="$(curl -ks -u "$U:$P" -H "Content-Type: application/json" -X POST "https://127.0.0.1:47990/api/pin" -d "{\"pin\":\"$PIN\",\"name\":\"$NAME\"}")"
+echo "  server: $resp"
+echo "$resp" | grep -q "\"status\":true" && echo "  -> PAIRED. Start the Desktop stream in Moonlight." || echo "  -> not confirmed; recheck the PIN and retry."
+`
+
+// clouddeployMoonlightHookScript shows the pairing box on interactive SSH login
+// (tty only, so it never blocks automated `ssh host cmd` sessions).
+const clouddeployMoonlightHookScript = `# Managed by CloudDeploy v3 -- Moonlight pairing box on interactive login.
+case "$-" in
+  *i*) if [ -t 0 ] && command -v clouddeploy-pair >/dev/null 2>&1; then clouddeploy-pair; fi ;;
+esac
+`
+
+// installStreamingHelpers writes the pairing + HDR helper scripts and the login
+// hook so every deploy reproduces the validated live-box Moonlight UX.
+func installStreamingHelpers(user, uid, conn string) error {
+	if conn == "" {
+		conn = "DP-1"
+	}
+	if uid == "" {
+		uid = "1000"
+	}
+	files := []struct {
+		path string
+		body string
+		mode os.FileMode
+	}{
+		{clouddeployHdrMatchPath, renderClouddeployHdrMatch(uid, conn), 0o755},
+		{clouddeployHdrPath, renderClouddeployHdr(user, uid, conn), 0o755},
+		{clouddeployPairPath, clouddeployPairScript, 0o755},
+		{clouddeployMoonlightHook, clouddeployMoonlightHookScript, 0o644},
+	}
+	for _, f := range files {
+		if err := os.WriteFile(f.path, []byte(f.body), f.mode); err != nil {
+			return fmt.Errorf("install %s: %w", f.path, err)
+		}
+	}
+	return nil
 }
 
 type Tailscale struct {
