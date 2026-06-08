@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -15,6 +16,13 @@ import (
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 )
+
+// refreshMatchTolerance is how far (Hz) a reported mode refresh may sit
+// from the requested refresh and still count as the same mode. CVT
+// reduced-blanking modes land a hair under nominal (e.g. 2560x1440@120
+// is really 119.997 Hz, @60 is 59.95 Hz) and kscreen-doctor may print
+// the decimal OR a truncated integer, so we accept +/- 1.5 Hz.
+const refreshMatchTolerance = 1.5
 
 // DRMDisplayValidateName is the canonical state-key.
 const DRMDisplayValidateName = "drm_display_validate"
@@ -275,6 +283,65 @@ func ParseResolution(s string) (width, height int) {
 	return w, h
 }
 
+// parseModeString splits "WxH@R" (R may be fractional) into its
+// resolution string and refresh. ok is false on a malformed string.
+func parseModeString(s string) (res string, refresh float64, ok bool) {
+	parts := strings.SplitN(strings.TrimSpace(s), "@", 2)
+	if len(parts) != 2 {
+		return "", 0, false
+	}
+	res = strings.TrimSpace(parts[0])
+	r, err := strconv.ParseFloat(strings.TrimSpace(parts[1]), 64)
+	if err != nil || res == "" {
+		return "", 0, false
+	}
+	return res, r, true
+}
+
+// ResolveMode returns the connector's actual advertised mode string that
+// satisfies want ("WxH@R"): an exact string match if present, otherwise
+// the same resolution at a refresh within refreshMatchTolerance (to
+// tolerate CVT reduced-blanking rounding). Returns ("", false) if no
+// advertised mode matches. Exact match always wins so this never changes
+// behavior for modes that already matched exactly (e.g. CEA 4K120).
+func (c KScreenConnector) ResolveMode(want string) (string, bool) {
+	if want == "" {
+		return "", false
+	}
+	for _, m := range c.Modes {
+		if m == want {
+			return m, true
+		}
+	}
+	wRes, wRef, ok := parseModeString(want)
+	if !ok {
+		return "", false
+	}
+	for _, m := range c.Modes {
+		mRes, mRef, ok := parseModeString(m)
+		if ok && mRes == wRes && math.Abs(mRef-wRef) <= refreshMatchTolerance {
+			return m, true
+		}
+	}
+	return "", false
+}
+
+// modeResolvable is a nil-safe wrapper around (*KScreenConnector).ResolveMode.
+func modeResolvable(conn *KScreenConnector, want string) bool {
+	if conn == nil {
+		return false
+	}
+	_, ok := conn.ResolveMode(want)
+	return ok
+}
+
+// modeListResolvable reports whether `modes` advertises `want` exactly or
+// within refreshMatchTolerance.
+func modeListResolvable(modes []string, want string) bool {
+	_, ok := KScreenConnector{Modes: modes}.ResolveMode(want)
+	return ok
+}
+
 // DRMDisplayValidate is the fifth Milestone 4A phase. After
 // kwin-session brings up the compositor, this phase queries
 // `kscreen-doctor -o` (running as the headless user) and asserts
@@ -449,7 +516,7 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 	attempts := []map[string]any{}
 	repairRejected := false
 	displayHDR := deps.Profile != nil && deps.Profile.Display.HDR
-	if conn != nil && (!conn.Enabled || (wantMode != "" && !conn.HasMode(wantMode)) || (displayHDR && (!conn.HDR || !conn.WCG))) {
+	if conn != nil && (!conn.Enabled || (wantMode != "" && !modeResolvable(conn, wantMode)) || (displayHDR && (!conn.HDR || !conn.WCG))) {
 		targets := displayRepairTargets(conn, wantMode, displayHDR)
 		for _, target := range targets {
 			args, ok := kscreenApplyArgs(*conn, target)
@@ -485,7 +552,7 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 				if updated := parsed.FindConnector(connector); updated != nil {
 					conn = updated
 					details["kscreen_after_repair_excerpt"] = lastLines(rawAfter, 20)
-					if conn.Enabled && (wantMode == "" || conn.HasMode(wantMode) || target.Mode != "") {
+					if conn.Enabled && (wantMode == "" || modeResolvable(conn, wantMode) || target.Mode != "") {
 						break
 					}
 				}
@@ -576,7 +643,7 @@ func (p DRMDisplayValidate) Run(ctx context.Context, deps *Deps) error {
 			return fmt.Errorf("phase drm-display-validate: %w", err)
 		}
 	}
-	if wantMode != "" && !conn.HasMode(wantMode) {
+	if wantMode != "" && !modeResolvable(conn, wantMode) {
 		if deps.Profile != nil {
 			if target, ok := allowedDisplayFallback(deps.Profile.Display, conn.Modes); ok {
 				details["display_target_original"] = displayTargetName(deps.Profile.Display.HDR, wantMode)
@@ -989,7 +1056,7 @@ func displayRepairTargets(conn *KScreenConnector, wantMode string, wantHDR bool)
 		if mode == "" || seen[mode+"|"+fmt.Sprint(hdr)] {
 			return
 		}
-		if conn != nil && !conn.HasMode(mode) {
+		if conn != nil && !modeResolvable(conn, mode) {
 			return
 		}
 		seen[mode+"|"+fmt.Sprint(hdr)] = true
@@ -1008,7 +1075,13 @@ func kscreenApplyArgs(conn KScreenConnector, target displayTarget) ([]string, bo
 	if conn.ID == "" || target.Mode == "" {
 		return nil, false
 	}
-	modeID := conn.ModeIDs[target.Mode]
+	modeStr := target.Mode
+	if _, ok := conn.ModeIDs[modeStr]; !ok {
+		if resolved, ok := conn.ResolveMode(target.Mode); ok {
+			modeStr = resolved
+		}
+	}
+	modeID := conn.ModeIDs[modeStr]
 	if modeID == "" {
 		return nil, false
 	}

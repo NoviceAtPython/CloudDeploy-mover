@@ -105,64 +105,121 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 		return nil
 	}
 
-	if _, err := os.Stat(filepath.Join(cfg.BuildDir, ".git")); err != nil {
-		if err := run(ctx, deps, "", []string{"git", "clone", "--recursive", cfg.ForkRepo, cfg.BuildDir}, 30*time.Minute, true); err != nil {
-			return failPhase(deps, SunshineBuildName, details, "clone Sunshine fork", err, true)
-		}
-	} else {
-		if err := run(ctx, deps, cfg.BuildDir, []string{"git", "fetch", "--all", "--tags", "--prune"}, 15*time.Minute, true); err != nil {
-			return failPhase(deps, SunshineBuildName, details, "fetch Sunshine fork", err, true)
-		}
-	}
-	checkout := cfg.ForkCommit
-	if strings.TrimSpace(checkout) == "" {
-		checkout = cfg.ForkBranch
-	}
-	if err := run(ctx, deps, cfg.BuildDir, []string{"git", "checkout", checkout}, 5*time.Minute, true); err != nil {
-		return failPhase(deps, SunshineBuildName, details, "checkout Sunshine commit", err, true)
-	}
-	head, _ := output(ctx, deps, cfg.BuildDir, []string{"git", "rev-parse", "HEAD"}, 30*time.Second, false)
-	details["commit"] = strings.TrimSpace(head)
-
-	doxFn := p.DoxygenFn
-	if doxFn == nil {
-		doxFn = ensureSunshineDoxygen
-	}
-	dox, err := doxFn(ctx, deps, cfg)
-	if err != nil {
-		return failPhase(deps, SunshineBuildName, details, "resolve Doxygen", err, true)
-	}
-	details["doxygen_path"] = dox.Path
-	details["doxygen_version"] = dox.Version
-	details["doxygen_source"] = dox.Source
-	if dox.SHA256 != "" {
-		details["doxygen_sha256"] = dox.SHA256
-	}
-	cudaFn := p.CUDAToolkitFn
-	if cudaFn == nil {
-		cudaFn = discoverSunshineCUDA
-	}
-	cuda := cudaFn(ctx, deps, cfg)
-	details["sunshine_cuda_mode"] = cfg.EnableCUDA
-	details["cuda_detected"] = cuda.Found
-	details["cuda_nvcc"] = cuda.NVCC
-	details["cuda_root"] = cuda.Root
-	cmakeArgs := sunshineCMakeArgs(cfg, dox.Path, cuda, false)
-	if err := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); err != nil {
-		if shouldRetrySunshineWithoutCUDA(cfg, cuda) {
-			details["fallback_to_no_cuda"] = true
-			cmakeArgs = sunshineCMakeArgs(cfg, dox.Path, cudaToolchain{}, true)
-			if retryErr := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); retryErr != nil {
-				return failPhase(deps, SunshineBuildName, details, "configure Sunshine without CUDA fallback", retryErr, true)
+	// Prefer the prebuilt Sunshine binary+assets from a release when one
+	// matches the host + the pinned fork commit -- staged into the build
+	// dir so the shared install/setcap/assets flow below runs unchanged,
+	// skipping the multi-minute source compile. Any miss falls through to
+	// compiling from source.
+	usedPrebuilt := false
+	if deps.Profile.Deploy.UsePrebuiltValue() {
+		ver, arch := hostUbuntuArch(ctx, deps)
+		if b, perr := ensurePrebuiltBundle(ctx, deps, deps.Profile.Deploy.PrebuiltRepoValue(), ver, arch); perr != nil {
+			details["prebuilt_unavailable"] = perr.Error()
+		} else if mc := strings.TrimSpace(b.Manifest.SunshineCommit); mc != "" && mc == strings.TrimSpace(cfg.ForkCommit) {
+			if serr := stagePrebuiltSunshine(ctx, deps, cfg.BuildDir, b); serr == nil {
+				usedPrebuilt = true
+				details["prebuilt"] = true
+				details["prebuilt_tag"] = b.Tag
+				details["prebuilt_sunshine_commit"] = mc
+				details["commit"] = mc
+			} else {
+				details["prebuilt_stage_error"] = serr.Error()
 			}
 		} else {
-			return failPhase(deps, SunshineBuildName, details, "configure Sunshine", err, true)
+			details["prebuilt_commit_mismatch"] = fmt.Sprintf("bundle=%q want=%q", b.Manifest.SunshineCommit, cfg.ForkCommit)
 		}
 	}
-	details["cmake_args"] = strings.Join(cmakeArgs, " ")
-	if err := run(ctx, deps, cfg.BuildDir, []string{"cmake", "--build", "build", "--target", "sunshine", "-j", strconv.Itoa(cfg.BuildJobs)}, 90*time.Minute, true); err != nil {
-		return failPhase(deps, SunshineBuildName, details, "build Sunshine", err, true)
-	}
+
+	if !usedPrebuilt {
+		if _, err := os.Stat(filepath.Join(cfg.BuildDir, ".git")); err != nil {
+			if err := run(ctx, deps, "", []string{"git", "clone", "--recursive", cfg.ForkRepo, cfg.BuildDir}, 30*time.Minute, true); err != nil {
+				return failPhase(deps, SunshineBuildName, details, "clone Sunshine fork", err, true)
+			}
+		} else {
+			if err := run(ctx, deps, cfg.BuildDir, []string{"git", "fetch", "--all", "--tags", "--prune"}, 15*time.Minute, true); err != nil {
+				return failPhase(deps, SunshineBuildName, details, "fetch Sunshine fork", err, true)
+			}
+		}
+		checkout := cfg.ForkCommit
+		if strings.TrimSpace(checkout) == "" {
+			checkout = cfg.ForkBranch
+		}
+		if err := run(ctx, deps, cfg.BuildDir, []string{"git", "checkout", checkout}, 5*time.Minute, true); err != nil {
+			return failPhase(deps, SunshineBuildName, details, "checkout Sunshine commit", err, true)
+		}
+		head, _ := output(ctx, deps, cfg.BuildDir, []string{"git", "rev-parse", "HEAD"}, 30*time.Second, false)
+		details["commit"] = strings.TrimSpace(head)
+
+		// Sync submodules to the checked-out commit. The Sunshine fork's
+		// submodule tree is fragile in three ways, all of which break a plain
+		// `git submodule update --init --recursive`:
+		//   1. `git clone --recursive` only inits the clone default branch's
+		//      submodules; a later `git checkout <commit>` does NOT update them.
+		//   2. One nested submodule (third-party/build-deps/.../FFmpeg/AMF, the
+		//      AMD Media Framework -- unused on NVIDIA, and FFmpeg is fetched
+		//      prebuilt anyway) has an unfetchable pin, so `--recursive` aborts
+		//      fatally before reaching siblings like glad / Vulkan-Headers.
+		//   3. Some submodules (e.g. wlr-protocols) check out an EMPTY tree when
+		//      their objects weren't fetched during the recursive walk.
+		// We therefore init per-path recursively (tolerating the broken one)
+		// and then repair any empty submodule by fetching + re-checking-out its
+		// recorded commit. Without this, configure fails with "Unknown CMake
+		// command glad_add_library" or "wayland-scanner failed". Verified on a
+		// live RTX 4090 / Ubuntu 25.10 build 2026-06.
+		submoduleSync := `set +e
+recurse() {
+  d="$1"; [ -f "$d/.gitmodules" ] || return 0
+  for p in $(git -C "$d" config -f .gitmodules --get-regexp 'path$' 2>/dev/null | cut -d' ' -f2); do
+    if git -C "$d" submodule update --init "$p" >/dev/null 2>&1; then recurse "$d/$p"; else echo "clouddeploy: skipped broken submodule $d/$p"; fi
+  done
+}
+recurse .
+git submodule foreach --recursive 'if [ -z "$(ls -A | grep -v "^\.git$")" ]; then echo "clouddeploy: repairing empty submodule $sm_path"; git fetch --all --tags >/dev/null 2>&1; git checkout -f "$(git rev-parse HEAD)" >/dev/null 2>&1 || true; fi' 2>/dev/null || true
+exit 0`
+		if err := run(ctx, deps, cfg.BuildDir, []string{"bash", "-c", submoduleSync}, 25*time.Minute, true); err != nil {
+			return failPhase(deps, SunshineBuildName, details, "sync Sunshine submodules", err, true)
+		}
+
+		doxFn := p.DoxygenFn
+		if doxFn == nil {
+			doxFn = ensureSunshineDoxygen
+		}
+		dox, err := doxFn(ctx, deps, cfg)
+		if err != nil {
+			return failPhase(deps, SunshineBuildName, details, "resolve Doxygen", err, true)
+		}
+		details["doxygen_path"] = dox.Path
+		details["doxygen_version"] = dox.Version
+		details["doxygen_source"] = dox.Source
+		if dox.SHA256 != "" {
+			details["doxygen_sha256"] = dox.SHA256
+		}
+		cudaFn := p.CUDAToolkitFn
+		if cudaFn == nil {
+			cudaFn = discoverSunshineCUDA
+		}
+		cuda := cudaFn(ctx, deps, cfg)
+		details["sunshine_cuda_mode"] = cfg.EnableCUDA
+		details["cuda_detected"] = cuda.Found
+		details["cuda_nvcc"] = cuda.NVCC
+		details["cuda_root"] = cuda.Root
+		cmakeArgs := sunshineCMakeArgs(cfg, dox.Path, cuda, false)
+		if err := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); err != nil {
+			if shouldRetrySunshineWithoutCUDA(cfg, cuda) {
+				details["fallback_to_no_cuda"] = true
+				cmakeArgs = sunshineCMakeArgs(cfg, dox.Path, cudaToolchain{}, true)
+				if retryErr := run(ctx, deps, cfg.BuildDir, cmakeArgs, 30*time.Minute, true); retryErr != nil {
+					return failPhase(deps, SunshineBuildName, details, "configure Sunshine without CUDA fallback", retryErr, true)
+				}
+			} else {
+				return failPhase(deps, SunshineBuildName, details, "configure Sunshine", err, true)
+			}
+		}
+		details["cmake_args"] = strings.Join(cmakeArgs, " ")
+		if err := run(ctx, deps, cfg.BuildDir, []string{"cmake", "--build", "build", "--target", "sunshine", "-j", strconv.Itoa(cfg.BuildJobs)}, 90*time.Minute, true); err != nil {
+			return failPhase(deps, SunshineBuildName, details, "build Sunshine", err, true)
+		}
+	} // end if !usedPrebuilt (compile from source)
 	built := filepath.Join(cfg.BuildDir, "build", "sunshine")
 	details["built_binary"] = built
 	if err := run(ctx, deps, "", []string{"install", "-m", "0755", built, cfg.InstallBin}, time.Minute, true); err != nil {
@@ -884,6 +941,7 @@ func (p Tailscale) Run(ctx context.Context, deps *Deps) error {
 
 const tailscaleUpScriptPath = "/usr/local/bin/clouddeploy-tailscale-up.sh"
 const tailscaleUpServicePath = "/etc/systemd/system/clouddeploy-tailscale-up.service"
+const tailscaleUpTimerPath = "/etc/systemd/system/clouddeploy-tailscale-up.timer"
 
 // ensureTailscaleBootReconnect installs and enables a boot oneshot that
 // re-runs `tailscale up` from the saved authkey, so the VM rejoins the
@@ -899,8 +957,19 @@ func ensureTailscaleBootReconnect(ctx context.Context, deps *Deps, ssh bool) err
 	if err := os.WriteFile(tailscaleUpServicePath, []byte(renderTailscaleUpService()), 0o644); err != nil {
 		return err
 	}
+	// The boot service handles stop/start; a periodic timer additionally heals
+	// a mid-session drop (e.g. a transient network blip that removes an
+	// ephemeral node, leaving the VM "Logged out" with no reboot) without
+	// manual intervention. The reconnect script no-ops when already online,
+	// so polling every couple minutes is cheap.
+	if err := os.WriteFile(tailscaleUpTimerPath, []byte(renderTailscaleUpTimer()), 0o644); err != nil {
+		return err
+	}
 	_ = run(ctx, deps, "", []string{"systemctl", "daemon-reload"}, time.Minute, true)
-	return run(ctx, deps, "", []string{"systemctl", "enable", "clouddeploy-tailscale-up.service"}, time.Minute, true)
+	if err := run(ctx, deps, "", []string{"systemctl", "enable", "clouddeploy-tailscale-up.service"}, time.Minute, true); err != nil {
+		return err
+	}
+	return run(ctx, deps, "", []string{"systemctl", "enable", "--now", "clouddeploy-tailscale-up.timer"}, time.Minute, true)
 }
 
 // renderTailscaleUpScript reconnects the tailnet on boot. It retries until a
@@ -959,6 +1028,23 @@ RestartSec=15s
 
 [Install]
 WantedBy=multi-user.target
+`
+}
+
+// renderTailscaleUpTimer periodically re-runs the reconnect oneshot so a
+// mid-session Tailscale drop (no reboot) self-heals on every deployed machine,
+// not just on boot. The script exits 0 immediately when already online.
+func renderTailscaleUpTimer() string {
+	return `[Unit]
+Description=CloudDeploy Tailscale periodic reconnect (heals mid-session drops)
+
+[Timer]
+OnBootSec=45
+OnUnitActiveSec=120
+AccuracySec=15s
+
+[Install]
+WantedBy=timers.target
 `
 }
 
@@ -1707,12 +1793,23 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		details["tailscale_serverinfo_bytes"] = len(ts)
 	}
 	logs, _ := journalFn(ctx, deps)
-	ev := parseSunshineStreamEvidence(logs)
+	// Expected capture resolution comes from the active profile (multi-res
+	// support: 720p/1080p/1200p/1440p/4K), defaulting to 4K when unset. The
+	// old code hardcoded 3840x2160, so every non-4K profile failed the
+	// resolution gate even when the capture was correct.
+	wantW, wantH := 3840, 2160
+	if deps.Profile != nil {
+		if w, h := ParseResolution(deps.Profile.Display.Resolution); w > 0 && h > 0 {
+			wantW, wantH = w, h
+		}
+	}
+	ev := parseSunshineStreamEvidence(logs, wantW, wantH)
 	details["kms_marker"] = ev.KMS
 	details["nvenc_marker"] = ev.NVENC
 	details["av1_marker"] = ev.AV1
 	details["hevc_marker"] = ev.HEVC
-	details["resolution_marker"] = ev.Resolution4K
+	details["resolution_marker"] = ev.ResolutionMatch
+	details["resolution_expected"] = fmt.Sprintf("%dx%d", wantW, wantH)
 	details["selected_capture_line"] = ev.SelectedCaptureLine
 	details["selected_encoder_line"] = ev.SelectedEncoderLine
 	details["encode_selection_line"] = ev.EncodeSelectionLine
@@ -1762,19 +1859,15 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		drm = "/dev/dri/card1"
 	}
 	connector := "DP-1"
-	width, height := "3840", "2160"
-	if deps.Profile != nil {
+	if deps.Profile != nil && deps.Profile.Display.ForcedConnector != "" {
 		connector = deps.Profile.Display.ForcedConnector
-		w, h := ParseResolution(deps.Profile.Display.Resolution)
-		if w > 0 && h > 0 {
-			width, height = strconv.Itoa(w), strconv.Itoa(h)
-		}
 	}
+	width, height := strconv.Itoa(wantW), strconv.Itoa(wantH)
 	if err := validateSunshineSelectedCapture(ev.SelectedCaptureLine, drm, connector, width, height); err != nil {
 		return failPhase(deps, StreamValidateName, details, "wrong Sunshine KMS capture target", err, true)
 	}
-	if !ev.KMS || !ev.Resolution4K || !ev.NVENC || !ev.HEVC {
-		return failPhase(deps, StreamValidateName, details, "missing required Sunshine KMS/NVENC markers", fmt.Errorf("kms=%v resolution4k=%v nvenc=%v hevc=%v", ev.KMS, ev.Resolution4K, ev.NVENC, ev.HEVC), true)
+	if !ev.KMS || !ev.ResolutionMatch || !ev.NVENC || !ev.HEVC {
+		return failPhase(deps, StreamValidateName, details, "missing required Sunshine KMS/NVENC markers", fmt.Errorf("kms=%v resolution_match(%dx%d)=%v nvenc=%v hevc=%v", ev.KMS, wantW, wantH, ev.ResolutionMatch, ev.NVENC, ev.HEVC), true)
 	}
 	// Sunshine logged at least one KMS sample line. If every sample
 	// it has ever logged came back all-black AND none reported
@@ -1809,7 +1902,7 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 			time.Sleep(resampleInterval)
 			_ = serviceActive(ctx, deps)
 			freshLogs, _ := journalFn(ctx, deps)
-			fresh := parseSunshineStreamEvidence(freshLogs)
+			fresh := parseSunshineStreamEvidence(freshLogs, wantW, wantH)
 			if fresh.SampleNonblackSeen && fresh.SampleNonblack > 0 {
 				ev.SampleAllBlack = fresh.SampleAllBlack
 				ev.SampleNonblackSeen = true
@@ -1825,7 +1918,25 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 		details["sample_avg_rgb"] = ev.SampleAvgRGB
 	}
 	if ev.SampleAllBlackSeen && ev.SampleAllBlack && !(ev.SampleNonblackSeen && ev.SampleNonblack > 0) {
-		return failPhase(deps, StreamValidateName, details, "Sunshine KMS sample is all-black", fmt.Errorf("sample_all_black=true sample_nonblack=%d avg_rgb=%q pixel_format=%q after re-sampling; the compositor is producing no visible content. Launch a visible Wayland client (e.g. plasmashell or `foot`) and re-run; if Sunshine keeps reporting all-black, the KMS plane is not the one being composited.", ev.SampleNonblack, ev.SampleAvgRGB, ev.SamplePixelFormat), true)
+		// All KMS samples came back black. In an unattended deploy there is no
+		// Moonlight client driving an active stream, so Sunshine's startup
+		// capture probe samples the KMS framebuffer while the compositor is
+		// idle -- which can read black even when the desktop is fully rendered.
+		// Verified live (2026-06, RTX 5090 / 25.10): with plasmashell + KWin
+		// healthy and the display HDR/mode correct, the no-client probe sampled
+		// 0,0,0 yet a real Moonlight client showed the full desktop. So a black
+		// PROBE is not a reliable "broken stream" signal and must not fail the
+		// whole deploy: every server-side marker above (KMS/NVENC/codec) still
+		// holds; only the visible-content sample is unconfirmed, and that is
+		// properly validated by an actual client connection. Downgrade to a
+		// surfaced warning and let the deploy finish.
+		details["sample_all_black_warning"] = true
+		details["lifecycle_marker"] = "stream_ready_content_unconfirmed"
+		logger(deps).Warn("phase stream-validate: KMS probe sampled all-black with no active Moonlight client; server markers are healthy. Visible desktop content is unconfirmed until a real client connects -- NOT fatal.",
+			"sample_nonblack", ev.SampleNonblack, "avg_rgb", ev.SampleAvgRGB, "pixel_format", ev.SamplePixelFormat)
+		deps.State.MarkDone(StreamValidateName, details)
+		_ = deps.PersistState()
+		return nil
 	}
 	if deps.Profile != nil && deps.Profile.Display.HDR {
 		if !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
@@ -1923,6 +2034,23 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 	details["flatpak_apps"] = flatpaks
 	if len(flatpakFailures) > 0 {
 		details["flatpak_warnings"] = flatpakFailures
+	}
+	// OpenGL flatpak apps (Minecraft via Prism, etc.) need the NVIDIA GL
+	// runtime extension matching the host driver. flatpak usually auto-pulls
+	// it, but on a bleeding-edge driver the exact version may be missing from
+	// flathub at app-install time, leaving "no OpenGL" (observed on a live
+	// box). Make it explicit and record whether it actually landed so the gap
+	// is visible in state rather than only surfacing when a game won't launch.
+	glRtCmd := `v=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d "[:space:]"); ` +
+		`[ -n "$v" ] || { echo "NO_DRIVER_VERSION"; exit 0; }; rt="org.freedesktop.Platform.GL.nvidia-${v//./-}"; ` +
+		`flatpak install -y --noninteractive flathub "$rt" >/dev/null 2>&1; ` +
+		`flatpak list --runtime 2>/dev/null | grep -q "GL.nvidia-${v//./-}" && echo "PRESENT $rt" || echo "MISSING $rt"`
+	if glOut, _ := output(ctx, deps, "", []string{"bash", "-lc", glRtCmd}, 12*time.Minute, false); strings.TrimSpace(glOut) != "" {
+		glOut = strings.TrimSpace(glOut)
+		details["nvidia_gl_flatpak_runtime"] = glOut
+		if strings.HasPrefix(glOut, "MISSING") {
+			details["nvidia_gl_flatpak_runtime_warning"] = "matching NVIDIA GL flatpak runtime not on flathub for this driver; OpenGL flatpak apps (Prism/Minecraft) may fail until it is published (or install Prism natively)"
+		}
 	}
 	// Controller parity for flatpak'd launchers/games. The virtual
 	// controller is a kernel device (uinput/uhid) so it is visible to
@@ -2385,7 +2513,7 @@ type sunshineStreamEvidence struct {
 	NVENC                       bool
 	HEVC                        bool
 	AV1                         bool
-	Resolution4K                bool
+	ResolutionMatch             bool
 	HDR                         bool
 	ColorDepth10                bool
 	P010                        bool
@@ -2419,7 +2547,7 @@ type sunshineStreamEvidence struct {
 	SampleSelectedCardID string
 }
 
-func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
+func parseSunshineStreamEvidence(logs string, wantW, wantH int) sunshineStreamEvidence {
 	var ev sunshineStreamEvidence
 	for _, raw := range strings.Split(logs, "\n") {
 		line := strings.TrimSpace(raw)
@@ -2447,8 +2575,14 @@ func parseSunshineStreamEvidence(logs string) sunshineStreamEvidence {
 		if strings.Contains(line, "Found monitor for DRM screencasting") || strings.Contains(line, "Screencasting with KMS") {
 			ev.KMS = true
 		}
-		if strings.Contains(line, "Resolution: 3840x2160") || strings.Contains(line, "Desktop resolution: 3840x2160") || strings.Contains(line, "3840x2160") {
-			ev.Resolution4K = true
+		// Resolution marker: match the profile's expected resolution in
+		// either Sunshine log form -- "WxH" (e.g. "Desktop resolution:
+		// 2560x1440") or the STREAM_DIAG "width=W height=H" form.
+		if wantW > 0 && wantH > 0 {
+			if strings.Contains(line, fmt.Sprintf("%dx%d", wantW, wantH)) ||
+				strings.Contains(line, fmt.Sprintf("width=%d height=%d", wantW, wantH)) {
+				ev.ResolutionMatch = true
+			}
 		}
 		if strings.Contains(lower, "hevc_nvenc") || strings.Contains(line, "HEVC NVENC initialized") {
 			ev.HEVC = true

@@ -1,0 +1,43 @@
+# sdr-1200p120 - 16:10 high-refresh SDR.
+#
+# 1920x1200 @ 120 Hz, 8-bit SDR. The 16:10 sibling of sdr-1080p120 for
+# clients with 16:10 panels (laptops, some monitors). Stock KWin (no HDR
+# patch). 1920x1200 has no CTA VIC, so the universal SDR EDID advertises
+# it as a standard timing (60 Hz) plus a CVT reduced-blanking detailed
+# timing (120 Hz).
+
+profile: sdr-1200p120
+ubuntu_version: "25.10"
+
+display:
+  resolution: 1920x1200
+  refresh: 120
+  hdr: false
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "595"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: false
+  synthesize_hdr10_metadata: false
+
+kwin:
+  patched_hdr: false
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

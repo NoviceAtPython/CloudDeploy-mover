@@ -714,8 +714,8 @@ selected_pix_fmt=p010
 is_hdr: NVIDIA private HDR via NV_INPUT_COLORSPACE=BT.2100 PQ
 Attempting to use NVENC without CUDA support. Reverting back to GPU -> RAM -> GPU
 `
-	ev := parseSunshineStreamEvidence(logs)
-	if !ev.KMS || !ev.NVENC || !ev.HEVC || !ev.Resolution4K || !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
+	ev := parseSunshineStreamEvidence(logs, 3840, 2160)
+	if !ev.KMS || !ev.NVENC || !ev.HEVC || !ev.ResolutionMatch || !ev.HDR || !ev.ColorDepth10 || !ev.P010 {
 		t.Fatalf("evidence did not detect live good HDR HEVC sample: %+v", ev)
 	}
 	if !ev.CUDAInteropWarning {
@@ -732,7 +732,7 @@ STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=
 STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/0/0 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1
 STREAM_DIAG kms sample sample_all_black=false sample_nonblack=254 sample_avg_rgb=88/120/200 pixel_format=AB30 selected_plane=42 selected_connector=DP-1 selected_card_id=1
 `
-	ev := parseSunshineStreamEvidence(logs)
+	ev := parseSunshineStreamEvidence(logs, 3840, 2160)
 	if !ev.SampleAllBlackSeen {
 		t.Fatalf("expected SampleAllBlackSeen=true; got %+v", ev)
 	}
@@ -752,7 +752,7 @@ STREAM_DIAG kms sample sample_all_black=false sample_nonblack=254 sample_avg_rgb
 	}
 }
 
-func TestStreamValidateFailsWhenSunshineKMSSampleIsAllBlack(t *testing.T) {
+func TestStreamValidateAllBlackProbeIsNonFatal(t *testing.T) {
 	deps := milestone5Deps(t)
 	deps.DryRun = false
 	ph := StreamValidate{
@@ -772,19 +772,27 @@ STREAM_DIAG kms sample sample_all_black=true sample_nonblack=0 sample_avg_rgb=0/
 `, nil
 		},
 		WebUIStatusFn: func(context.Context, *Deps, string) (int, error) { return 307, nil },
-		// Persistent all-black journal: the resample loop exhausts and
-		// the phase still fails. Tiny interval keeps the test fast.
+		// Persistent all-black journal: the resample loop exhausts and the
+		// sample is still black. With no active Moonlight client this is the
+		// idle-compositor probe case, so the phase records a warning but does
+		// NOT fail. Tiny interval keeps the test fast.
 		BlackResampleInterval: time.Millisecond,
 		BlackResampleAttempts: 2,
 	}
 	err := ph.Run(context.Background(), deps)
-	if err == nil {
-		t.Fatalf("expected sample_all_black=true to fail")
-	}
-	if !strings.Contains(err.Error(), "all-black") {
-		t.Fatalf("error should mention all-black sample: %v", err)
+	// An all-black KMS probe with no active client is non-fatal (verified
+	// live: a real Moonlight client showed the desktop). It is surfaced as a
+	// warning so the deploy still completes and the client confirms content.
+	if err != nil {
+		t.Fatalf("all-black KMS probe should be non-fatal; got error: %v", err)
 	}
 	details := deps.State.Get(StreamValidateName).Details
+	if details["sample_all_black_warning"] != true {
+		t.Fatalf("sample_all_black_warning detail: got %v want true", details["sample_all_black_warning"])
+	}
+	if details["lifecycle_marker"] != "stream_ready_content_unconfirmed" {
+		t.Fatalf("lifecycle_marker: got %v want stream_ready_content_unconfirmed", details["lifecycle_marker"])
+	}
 	if details["sample_all_black"] != true {
 		t.Fatalf("sample_all_black detail: got %v want true", details["sample_all_black"])
 	}
@@ -844,7 +852,7 @@ STREAM_DIAG kms capture selected drm_device=/dev/dri/card1 connector=DP-1 width=
 Encode selection: codec=H.264 (videoFormat=0) client_dynamicRange=1 is_hdr_display=yes selected_colorspace=HDR (Rec. 2020 + SMPTE 2084 PQ) selected_bit_depth=10-bit selected_pix_fmt=p010 chromaSamplingType=0
 Error: h264_nvenc: dynamic range not supported
 `
-	ev := parseSunshineStreamEvidence(logs)
+	ev := parseSunshineStreamEvidence(logs, 3840, 2160)
 	if !ev.InvalidH264HDR {
 		t.Fatalf("expected invalid H.264 HDR selection to be detected: %+v", ev)
 	}

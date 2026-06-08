@@ -1,0 +1,42 @@
+# sdr-720p60 - low-bandwidth / weak-client SDR.
+#
+# 1280x720 @ 60 Hz, 8-bit SDR. The lightest streaming target: good for
+# constrained uplinks, mobile clients, or low-end GPUs. Stock KWin (no
+# HDR patch). 720p60 is advertised by the universal SDR EDID via CTA
+# VIC 4.
+
+profile: sdr-720p60
+ubuntu_version: "25.10"
+
+display:
+  resolution: 1280x720
+  refresh: 60
+  hdr: false
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "595"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: false
+  synthesize_hdr10_metadata: false
+
+kwin:
+  patched_hdr: false
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

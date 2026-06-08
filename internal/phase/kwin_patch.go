@@ -167,9 +167,41 @@ func (p KWinPatch) Run(ctx context.Context, deps *Deps) error {
 		details["patch_validated"] = true
 	}
 
-	pkgs, err := p.buildInstall(ctx, deps, cfg, patchPath, patchSHA)
-	if err != nil {
-		return p.patchFailure(deps, details, err, "build/install patched kwin", cfg)
+	var pkgs []string
+	usedPrebuilt := false
+	if deps.Profile.Deploy.UsePrebuiltValue() && !deps.DryRun {
+		ver, arch := hostUbuntuArch(ctx, deps)
+		if b, perr := ensurePrebuiltBundle(ctx, deps, deps.Profile.Deploy.PrebuiltRepoValue(), ver, arch); perr != nil {
+			details["prebuilt_unavailable"] = perr.Error()
+		} else {
+			hostKwin := ""
+			if r := deps.Runner.Exec(ctx, runner.CommandSpec{Argv: []string{"dpkg-query", "-W", "-f=${Version}", "kwin-wayland"}, LogFile: "-", Timeout: 15 * time.Second}); r.Err == nil {
+				hostKwin = strings.TrimSpace(r.Stdout)
+			}
+			// The patched .debs must match the distro's kwin source version
+			// (ABI). The manifest records "6.4.5-0ubuntu3"; the installed
+			// version carries an epoch ("4:6.4.5-0ubuntu3"), so substring-match.
+			if mv := strings.TrimSpace(b.Manifest.KWinVersion); mv != "" && strings.Contains(hostKwin, mv) {
+				if pp, ierr := installPrebuiltKWin(ctx, deps, b, cfg.HoldPackages); ierr == nil {
+					pkgs = pp
+					usedPrebuilt = true
+					details["prebuilt"] = true
+					details["prebuilt_tag"] = b.Tag
+					details["prebuilt_kwin_version"] = mv
+				} else {
+					details["prebuilt_install_error"] = ierr.Error()
+				}
+			} else {
+				details["prebuilt_kwin_mismatch"] = fmt.Sprintf("bundle=%q host=%q", b.Manifest.KWinVersion, hostKwin)
+			}
+		}
+	}
+	if !usedPrebuilt {
+		built, err := p.buildInstall(ctx, deps, cfg, patchPath, patchSHA)
+		if err != nil {
+			return p.patchFailure(deps, details, err, "build/install patched kwin", cfg)
+		}
+		pkgs = built
 	}
 	sort.Strings(pkgs)
 	details["installed_packages"] = pkgs

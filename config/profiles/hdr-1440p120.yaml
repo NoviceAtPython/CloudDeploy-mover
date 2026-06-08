@@ -1,0 +1,49 @@
+# hdr-1440p120 - HDR at the bandwidth sweet spot.
+#
+# Same end-to-end HDR path as hdr-4k120 (patched KWin NVIDIA-private PQ,
+# AV1 NVENC 10-bit, Sunshine HDR10) but at 2560x1440 @ 120 Hz. ~44% of
+# 4K's pixels, so it streams comfortably on tighter uplinks / weaker
+# client decoders while keeping true HDR.
+#
+# The universal forced EDID advertises 1440p120 as a CVT-reduced-blanking
+# detailed timing (2560x1440 has no CTA VIC). force-kwin-mode selects it
+# and enables HDR/WCG exactly as the 4K profile does.
+
+profile: hdr-1440p120
+ubuntu_version: "25.10"
+
+display:
+  resolution: 2560x1440
+  refresh: 120
+  hdr: true
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "595"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
+  encoder: nvenc
+  capture: kms
+  hevc_mode: 3
+  av1_mode: 3
+  force_av1_hdr10: true
+  synthesize_hdr10_metadata: true
+
+kwin:
+  patched_hdr: true
+  patch: patches/kwin-clouddeploy-nvidia-private-hdr.patch
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

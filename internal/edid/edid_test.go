@@ -5,37 +5,116 @@ import (
 	"testing"
 )
 
-func TestSelectFilename_HDR4K(t *testing.T) {
-	got := SelectFilename("3840x2160", 120, true)
-	if got != "virtual-4k120-hdr.bin" {
-		t.Errorf("got %q want virtual-4k120-hdr.bin", got)
+func TestSelectFilename_UniversalHDR(t *testing.T) {
+	// Every supported HDR mode resolves to the one universal HDR blob.
+	for _, refresh := range []int{60, 120} {
+		for _, res := range SupportedResolutions() {
+			got := SelectFilename(res, refresh, true)
+			if got != UniversalHDR {
+				t.Errorf("SelectFilename(%q,%d,true)=%q want %q", res, refresh, got, UniversalHDR)
+			}
+		}
 	}
 }
 
-func TestSelectFilename_SDR4K120(t *testing.T) {
-	got := SelectFilename("3840x2160", 120, false)
-	if got != "virtual-4k120-sdr.bin" {
-		t.Errorf("got %q want virtual-4k120-sdr.bin", got)
+func TestSelectFilename_UniversalSDR(t *testing.T) {
+	for _, refresh := range []int{60, 120} {
+		for _, res := range SupportedResolutions() {
+			got := SelectFilename(res, refresh, false)
+			if got != UniversalSDR {
+				t.Errorf("SelectFilename(%q,%d,false)=%q want %q", res, refresh, got, UniversalSDR)
+			}
+		}
 	}
 }
 
-func TestSelectFilename_SDR4K60(t *testing.T) {
-	got := SelectFilename("3840x2160", 60, false)
-	if got != "virtual-4k60-sdr.bin" {
-		t.Errorf("got %q want virtual-4k60-sdr.bin", got)
+func TestSelectFilename_NewMidRangeModes(t *testing.T) {
+	// The modes the old single-mode SKUs never advertised.
+	cases := []struct {
+		res     string
+		refresh int
+		hdr     bool
+		want    string
+	}{
+		{"2560x1440", 120, true, UniversalHDR},
+		{"2560x1440", 60, false, UniversalSDR},
+		{"1920x1200", 120, false, UniversalSDR},
+		{"1920x1200", 120, true, UniversalHDR},
+		{"1280x720", 60, false, UniversalSDR},
+	}
+	for _, c := range cases {
+		if got := SelectFilename(c.res, c.refresh, c.hdr); got != c.want {
+			t.Errorf("SelectFilename(%q,%d,%v)=%q want %q", c.res, c.refresh, c.hdr, got, c.want)
+		}
 	}
 }
 
-func TestSelectFilename_SDR1080p(t *testing.T) {
-	got := SelectFilename("1920x1080", 60, false)
-	if got != "virtual-1080p-sdr.bin" {
-		t.Errorf("got %q want virtual-1080p-sdr.bin", got)
+func TestSelectFilename_CaseInsensitiveResolution(t *testing.T) {
+	if got := SelectFilename("3840X2160", 120, true); got != UniversalHDR {
+		t.Errorf("uppercase 'X' should still resolve; got %q", got)
 	}
 }
 
-func TestSelectFilename_UnknownYieldsEmpty(t *testing.T) {
-	if got := SelectFilename("2560x1440", 144, false); got != "" {
-		t.Errorf("unrecognised resolution should yield empty; got %q", got)
+func TestSelectFilename_UnsupportedYieldsEmpty(t *testing.T) {
+	cases := []struct {
+		res     string
+		refresh int
+	}{
+		{"2560x1440", 240}, // 1440p240 not expressible (pixel clock > 655MHz, no VIC)
+		{"3440x1440", 120}, // ultrawide, unsupported resolution
+		{"3840x2160", 0},   // refresh not set
+		{"800x600", 60},    // below the matrix
+		{"", 120},          // empty resolution
+	}
+	for _, c := range cases {
+		if got := SelectFilename(c.res, c.refresh, false); got != "" {
+			t.Errorf("SelectFilename(%q,%d,false) should be empty; got %q", c.res, c.refresh, got)
+		}
+	}
+}
+
+func TestSupportsMode(t *testing.T) {
+	if !SupportsMode("1920x1080", 120) {
+		t.Errorf("1920x1080@120 should be supported")
+	}
+	if !IsSupportedResolution("2560x1440") {
+		t.Errorf("2560x1440 should be a supported resolution")
+	}
+	if IsSupportedResolution("1024x768") {
+		t.Errorf("1024x768 should not be a supported resolution")
+	}
+	if IsSupportedRefresh(144) {
+		t.Errorf("144 should not be a supported refresh")
+	}
+	if SupportsMode("1920x1080", 30) {
+		t.Errorf("1920x1080@30 should not be supported")
+	}
+	// High-refresh extras: feasible within the EDID detailed-timing limit.
+	for _, m := range []struct {
+		res     string
+		refresh int
+	}{{"1920x1080", 144}, {"1920x1080", 240}, {"2560x1440", 144}} {
+		if !SupportsMode(m.res, m.refresh) {
+			t.Errorf("%s@%d should be supported (high-refresh extra)", m.res, m.refresh)
+		}
+	}
+	// Not expressible in a forced EDID (pixel clock > 655MHz and no CTA VIC).
+	for _, m := range []struct {
+		res     string
+		refresh int
+	}{{"2560x1440", 240}, {"3840x2160", 144}, {"3840x2160", 240}} {
+		if SupportsMode(m.res, m.refresh) {
+			t.Errorf("%s@%d should NOT be supported (exceeds EDID timing)", m.res, m.refresh)
+		}
+	}
+}
+
+func TestFilenameForUniversal(t *testing.T) {
+	if FilenameFor("virtual-universal-hdr") != UniversalHDR {
+		t.Errorf("FilenameFor(virtual-universal-hdr)=%q want %q", FilenameFor("virtual-universal-hdr"), UniversalHDR)
+	}
+	if FilenameFor("virtual-universal-sdr") != UniversalSDR {
+		t.Errorf("FilenameFor(virtual-universal-sdr)=%q want %q", FilenameFor("virtual-universal-sdr"), UniversalSDR)
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/edid"
 	"gopkg.in/yaml.v3"
 )
 
@@ -124,6 +125,39 @@ type DeployConfig struct {
 
 	// OptionalApps enables the final nonfatal game/app install phase.
 	OptionalApps bool `yaml:"optional_apps"`
+
+	// UsePrebuilt makes the sunshine-build and kwin-patch phases install
+	// prebuilt artifacts (the compiled Sunshine fork + patched KWin .debs)
+	// from a GitHub release instead of compiling from source -- the single
+	// biggest deploy-time saver. It only engages when a release bundle
+	// matching the host's Ubuntu version + arch AND the profile's pinned
+	// versions exists; otherwise (or on any download/install error) it
+	// falls back to compiling. nil defaults to true.
+	UsePrebuilt *bool `yaml:"use_prebuilt"`
+
+	// PrebuiltRepo is the owner/name of the GitHub repo whose releases
+	// host the prebuilt bundles. Empty defaults to DefaultPrebuiltRepo.
+	PrebuiltRepo string `yaml:"prebuilt_repo"`
+}
+
+// DefaultPrebuiltRepo is the public repo whose releases host the prebuilt
+// Sunshine + KWin bundles (see the prebuilt-<os>-<arch> release tags).
+const DefaultPrebuiltRepo = "NoviceAtPython/CloudDeploy-mover"
+
+// UsePrebuiltValue resolves DeployConfig.UsePrebuilt; nil -> true.
+func (d DeployConfig) UsePrebuiltValue() bool {
+	if d.UsePrebuilt == nil {
+		return true
+	}
+	return *d.UsePrebuilt
+}
+
+// PrebuiltRepoValue resolves the prebuilt repo; empty -> DefaultPrebuiltRepo.
+func (d DeployConfig) PrebuiltRepoValue() string {
+	if strings.TrimSpace(d.PrebuiltRepo) == "" {
+		return DefaultPrebuiltRepo
+	}
+	return d.PrebuiltRepo
 }
 
 // DisplayConfig is the target output mode + HDR flag.
@@ -966,6 +1000,25 @@ func ValidateProfile(p *Profile) error {
 	}
 	if p.Deploy.MaxAutoReboots < 0 {
 		return fmt.Errorf("config: profile %q: deploy.max_auto_reboots must be >= 0", p.Profile)
+	}
+	// Display mode must be one the universal forced EDID can advertise.
+	// Only enforced when a resolution is set; an empty resolution means
+	// "use the host's real EDID" and the edid phase skips. When a forced
+	// connector is set the refresh must be a supported value too, since
+	// the EDID is the only thing telling KWin/NVIDIA which modes exist.
+	if res := strings.TrimSpace(p.Display.Resolution); res != "" {
+		if !edid.IsSupportedResolution(res) {
+			return fmt.Errorf("config: profile %q: display.resolution %q is not supported; supported: %s",
+				p.Profile, res, strings.Join(edid.SupportedResolutions(), ", "))
+		}
+		if p.Display.Refresh != 0 && !edid.SupportsMode(res, p.Display.Refresh) {
+			return fmt.Errorf("config: profile %q: display mode %s@%dHz is not supported; supported modes: %s",
+				p.Profile, res, p.Display.Refresh, strings.Join(edid.SupportedModes(), ", "))
+		}
+		if strings.TrimSpace(p.Display.ForcedConnector) != "" && !edid.SupportsMode(res, p.Display.Refresh) {
+			return fmt.Errorf("config: profile %q: display.forced_connector=%q requires a supported display.resolution@refresh (got %s@%dHz); supported: %s",
+				p.Profile, p.Display.ForcedConnector, res, p.Display.Refresh, strings.Join(edid.SupportedModes(), ", "))
+		}
 	}
 	if p.Display.HDR {
 		if p.Sunshine.ForkCommit == "" {

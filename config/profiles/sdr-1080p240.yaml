@@ -1,0 +1,45 @@
+# sdr-1080p240 - competitive high-refresh SDR.
+#
+# 1920x1080 @ 240 Hz, AV1/HEVC NVENC, 8-bit SDR, for gamers on a 240 Hz
+# client display who want maximum framerate over fidelity. SDR keeps the
+# bandwidth/latency budget free for the high frame rate.
+#
+# The universal SDR EDID advertises 1080p240 as a CVT-reduced-blanking
+# detailed timing (~533 MHz pixel clock, within the EDID 655 MHz limit).
+# NOTE: requires a 240 Hz client; not validatable without one.
+
+profile: sdr-1080p240
+ubuntu_version: "25.10"
+
+display:
+  resolution: 1920x1080
+  refresh: 240
+  hdr: false
+  forced_connector: DP-1
+
+nvidia:
+  driver_major: "595"
+  prefer_open_family: true
+  prefer_server: false
+
+cuda:
+  mode: none
+
+sunshine:
+  source: fork
+  fork_repo: https://github.com/NoviceAtPython/Sunshine
+  fork_branch: codex/sunshine-pairing-diagnostics
+  fork_commit: 8f02b1ce455ce4e7efa1b4031bb23764f2809cdb
+  encoder: nvenc
+  capture: kms
+  force_av1_hdr10: false
+  synthesize_hdr10_metadata: false
+
+kwin:
+  patched_hdr: false
+
+deploy:
+  auto_upgrade_ubuntu: true
+  accept_non_lts: true
+  direct_apt_codename_upgrade: auto
+  auto_reboot: false

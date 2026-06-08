@@ -149,6 +149,34 @@ cd CloudDeploy-mover
 PROFILE=hdr-4k120-cuda-auto-unattended-optional CLOUDDEPLOY_UNATTENDED=1 ./bootstrap.sh
 ```
 
+## Display profiles & supported resolutions
+
+The deploy drives a *virtual* display via a forced EDID, so resolution / refresh /
+HDR are a **deploy-time** choice set by the profile's `display:` block. A single
+universal EDID advertises every supported mode, so the in-VM KDE display settings
+list real options too.
+
+**Supported modes:** `1280x720`, `1920x1080`, `1920x1200`, `2560x1440`, `3840x2160`
+— each at **60** and **120** Hz, in SDR or HDR. (4K@120 is the streaming flagship;
+720p60 is the lightest target for constrained links.)
+
+Ready-made profiles:
+
+| Profile | Mode | HDR |
+|---|---|---|
+| `hdr-4k120` (+ `-cuda*` variants) | 3840x2160@120 | yes |
+| `hdr-1440p120` | 2560x1440@120 | yes |
+| `sdr-1440p120` | 2560x1440@120 | no |
+| `sdr-1200p120` | 1920x1200@120 | no |
+| `sdr-1080p120` | 1920x1080@120 | no |
+| `sdr-720p60` | 1280x720@60 | no |
+| `sdr-safe` | 1920x1080@60 (no forced EDID) | no |
+
+To run a different mode, copy a profile and edit `display.resolution` /
+`display.refresh` / `display.hdr` to any supported combination. SDR profiles skip
+the patched-KWin HDR build entirely, so they deploy faster. Config validation
+rejects unsupported resolutions/refreshes at load time with the supported list.
+
 ## After Deployment
 
 Check service state:

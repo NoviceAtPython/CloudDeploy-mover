@@ -374,7 +374,12 @@ while [ "$(date +%s)" -lt "${end}" ]; do
             m="$(echo "${entry}" | grep -oE '[0-9]+x[0-9]+@[0-9.]+' | head -n1 || true)"
             id="$(echo "${entry}" | grep -oE '^[[:space:]]*[0-9]+' | tr -d '[:space:]' || true)"
             [ -n "${m}" ] && [ -n "${id}" ] || continue
-            if [ "${m}" = "${MODE}" ] || { [ "${target_refresh}" = "120" ] && echo "${m}" | grep -Eq "^${target_res}@119(\.|$)|^${target_res}@120(\.|$)"; }; then
+            # Match the exact mode string, or the same resolution at the
+            # nominal refresh +/- rounding. kscreen-doctor reports CVT
+            # reduced-blanking modes a hair under nominal (e.g. 2560x1440
+            # @120 -> 119.997, @60 -> 59.95), so accept "@R", "@R.xx" and
+            # "@(R-1).xx" for any target refresh, not just 120.
+            if [ "${m}" = "${MODE}" ] || echo "${m}" | grep -Eq "^${target_res}@${target_refresh}(\.|$)|^${target_res}@$((target_refresh-1))\."; then
                 mode_id="${id}"
                 break
             fi
