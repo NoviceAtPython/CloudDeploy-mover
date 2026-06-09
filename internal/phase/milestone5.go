@@ -2082,6 +2082,126 @@ func (p StreamValidate) Run(ctx context.Context, deps *Deps) error {
 	return nil
 }
 
+// bottlesProvisionScript pre-installs Bottles' essential gaming components
+// (latest soda wine runner + dxvk + vkd3d) into the desktop user's Bottles data
+// dir, idempotently. It runs inside the Bottles flatpak via
+// `flatpak run --command=python3 com.usebottles.bottles -c <script>`.
+//
+// Why this exists: a freshly installed Bottles has no managed wine runner. Its
+// first-run component bootstrap fetches an online catalog and downloads ~100MB
+// of runner/dxvk/vkd3d before a bottle can be created. That async bootstrap
+// does NOT reliably complete on a headless KWin/Wayland server - reproduced
+// live, "create new bottle" silently does nothing and the CLI reports
+// "No managed runners found / Fail to install components, tried 3 times". Once
+// a runner+dxvk+vkd3d exist locally, create succeeds instantly with zero
+// network fetch (verified live: a gaming bottle was created end-to-end).
+//
+// The component catalog is read straight from the repo index (urllib), which
+// sidesteps Bottles' in-process catalog loader (its async fetch needs a running
+// GLib main loop, so it returns empty in a plain CLI context). Bottles' own
+// installer is then driven - so the on-disk layout is exactly what Bottles
+// expects - under a GLib main loop so its async download callbacks fire. The
+// step is best-effort: any failure is recorded but never aborts the deploy
+// (the GUI can still download components on demand, as before).
+const bottlesProvisionScript = `
+import sys, json, time, threading, traceback
+sys.path.insert(0, "/app/share/bottles")
+import gi
+try:
+    gi.require_version("Xdp", "1.0")
+except Exception:
+    pass
+from gi.repository import GLib
+
+REPO = "https://proxy.usebottles.com/repo/components/"
+IDX = REPO + "index.yml"
+
+import urllib.request
+try:
+    from bottles.backend.utils import yaml as byaml
+    raw = urllib.request.urlopen(IDX, timeout=25).read()
+    index = byaml.load(raw)
+except Exception as e:
+    print("PROVISION_RESULT", json.dumps({"error": "index:" + repr(e)[:120]}))
+    sys.exit(0)
+
+def latest(category, must=None):
+    items = [(k, v) for k, v in index.items()
+             if isinstance(v, dict) and v.get("Category") == category
+             and (must is None or must in k.lower())]
+    if not items:
+        return None
+    items.sort(key=lambda kv: int(str(kv[1].get("Date", "0")) or "0"), reverse=True)
+    return items[0][0]
+
+targets = []
+runner = latest("runners", "soda") or latest("runners", "caffe") or latest("runners")
+for ctype, name in (("runner", runner), ("dxvk", latest("dxvk")), ("vkd3d", latest("vkd3d"))):
+    if name:
+        targets.append((ctype, name))
+print("PROVISION_TARGETS", json.dumps(targets))
+
+try:
+    from bottles.backend.managers.manager import Manager
+    from bottles.backend.repos.component import ComponentRepo
+    m = Manager(is_cli=True)
+    good = ComponentRepo(REPO, IDX)
+except Exception as e:
+    print("PROVISION_RESULT", json.dumps({"error": "manager:" + repr(e)[:120]}))
+    sys.exit(0)
+
+state = {"done": False, "results": {}}
+
+def work():
+    try:
+        for _ in range(80):
+            if good.catalog:
+                break
+            time.sleep(0.25)
+        try:
+            m.component_manager._ComponentManager__repo = good
+        except Exception:
+            pass
+        for fn in ("check_runners", "check_dxvk", "check_vkd3d"):
+            try:
+                getattr(m, fn)(install_latest=False)
+            except Exception:
+                pass
+        have = {
+            "runner": set(getattr(m, "runners_available", []) or []),
+            "dxvk": set(getattr(m, "dxvk_available", []) or []),
+            "vkd3d": set(getattr(m, "vkd3d_available", []) or []),
+        }
+        for ctype, name in targets:
+            if name in have.get(ctype, set()):
+                state["results"][name] = "present"
+                continue
+            try:
+                res = m.component_manager.install(ctype, name)
+                ok = getattr(res, "status", res)
+                state["results"][name] = "installed" if ok else "failed"
+            except Exception as e:
+                state["results"][name] = "error:" + repr(e)[:80]
+    except Exception:
+        traceback.print_exc()
+    finally:
+        state["done"] = True
+
+loop = GLib.MainLoop()
+threading.Thread(target=work, daemon=True).start()
+
+def poll():
+    if state["done"]:
+        loop.quit()
+        return False
+    return True
+
+GLib.timeout_add(400, poll)
+GLib.timeout_add_seconds(720, loop.quit)
+loop.run()
+print("PROVISION_RESULT", json.dumps(state["results"]))
+`
+
 type OptionalApps struct{}
 
 func (OptionalApps) Name() string { return OptionalAppsName }
@@ -2159,6 +2279,28 @@ func (p OptionalApps) Run(ctx context.Context, deps *Deps) error {
 	details["flatpak_apps"] = flatpaks
 	if len(flatpakFailures) > 0 {
 		details["flatpak_warnings"] = flatpakFailures
+	}
+	// Pre-provision Bottles' essential gaming components (wine runner + dxvk +
+	// vkd3d) so the user's first "create new bottle" works instantly and
+	// offline. A fresh Bottles has no managed runner; its first-run bootstrap
+	// must fetch a catalog and download ~100MB, and that async bootstrap does
+	// not reliably complete on this headless server (observed live: create
+	// silently does nothing / "No managed runners found / Fail to install
+	// components"). Seeding the components at deploy time makes create
+	// self-contained - Bottles finds them locally and skips the fragile network
+	// bootstrap. Best-effort: never fails the phase (GUI can still download).
+	if !deps.DryRun && !strings.Contains(strings.Join(flatpakFailures, "\n"), "com.usebottles.bottles") {
+		desk := deps.Profile.EffectiveDesktop()
+		bottlesOut, bottlesErr := outputAsDesktop(ctx, deps, desk.User, uidFromState(deps),
+			[]string{"flatpak", "run", "--command=python3", "com.usebottles.bottles", "-c", bottlesProvisionScript},
+			14*time.Minute)
+		bottlesOut = strings.TrimSpace(bottlesOut)
+		if i := strings.LastIndex(bottlesOut, "PROVISION_RESULT"); i >= 0 {
+			details["bottles_components"] = strings.TrimSpace(bottlesOut[i+len("PROVISION_RESULT"):])
+		}
+		if bottlesErr != nil {
+			details["bottles_components_warning"] = firstNonEmpty(lastLines(bottlesOut, 3), bottlesErr.Error())
+		}
 	}
 	// OpenGL flatpak apps (Minecraft via Prism, etc.) need the NVIDIA GL
 	// runtime extension matching the host driver. flatpak usually auto-pulls

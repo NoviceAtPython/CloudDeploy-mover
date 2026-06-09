@@ -998,6 +998,36 @@ func TestOptionalAppsIncludesChromeDiscordAndGamingLaunchers(t *testing.T) {
 	}
 }
 
+func TestBottlesProvisionScriptShape(t *testing.T) {
+	// OptionalApps pre-provisions Bottles' essential components by running an
+	// embedded Python script inside the Bottles flatpak. Guard the
+	// load-bearing pieces so an accidental edit can't silently turn "create
+	// new bottle" back into a no-op on fresh deploys. (Verified live: a fresh
+	// Bottles ships with no managed runner and its first-run download
+	// bootstrap does not reliably complete on a headless server; seeding
+	// runner+dxvk+vkd3d locally makes create work instantly and offline.)
+	for _, want := range []string{
+		"proxy.usebottles.com/repo/components/", // catalog index source
+		"index.yml",
+		"component_manager.install", // drive Bottles' own installer (correct on-disk layout)
+		`latest("runners", "soda")`, // prefer the recommended soda wine runner
+		`latest("dxvk")`,
+		`latest("vkd3d")`,
+		"GLib.MainLoop",    // async download callbacks need a running main loop
+		"PROVISION_RESULT", // parsed back into phase Details
+	} {
+		if !strings.Contains(bottlesProvisionScript, want) {
+			t.Fatalf("bottlesProvisionScript missing %q", want)
+		}
+	}
+	// Idempotency: must consult the already-installed sets before installing.
+	for _, want := range []string{"runners_available", "dxvk_available", "vkd3d_available", `"present"`} {
+		if !strings.Contains(bottlesProvisionScript, want) {
+			t.Fatalf("bottlesProvisionScript missing idempotency guard %q", want)
+		}
+	}
+}
+
 func TestSunshineConfigPhaseDryRunMarksDone(t *testing.T) {
 	deps := milestone5Deps(t)
 	if err := (SunshineConfigPhase{}).Run(context.Background(), deps); err != nil {
