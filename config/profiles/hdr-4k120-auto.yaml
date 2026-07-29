@@ -36,6 +36,12 @@ nvidia:
   prefer_server: false
 
 cuda:
+  # PERFORMANCE WARNING: mode=none means Sunshine is built without
+  # its CUDA capture module, so a 4K120 HDR stream copies every
+  # frame through system RAM: one core pinned at 100%, NVENC idle,
+  # whole session capped near 40fps. Use hdr-4k120-cuda-auto for a
+  # fast stream; keep this profile only when CUDA must not be
+  # installed at all.
   mode: none
   method: none
 

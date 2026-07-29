@@ -39,6 +39,13 @@ nvidia:
 
 cuda:
   mode: required
+  # Streaming caveat: this profile targets Ubuntu 25.10, where
+  # Sunshine's CUDA capture module cannot be compiled (CUDA 13 headers
+  # vs glibc). The toolkit installs, but capture still runs on the
+  # GPU -> RAM -> GPU fallback (~40fps at 4K120 HDR, one core pinned).
+  # That is accepted deliberately here; use hdr-4k120-cuda-ubuntu2404
+  # or an -auto profile (which now resolves to 24.04) for a fast stream.
+  allow_unbuildable_sunshine_module: true
   method: apt
   selection_policy: exact-major
   expected_major: "13"

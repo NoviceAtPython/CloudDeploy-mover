@@ -19,8 +19,25 @@
 //	                     The KMS+NVENC+HDR path does not need CUDA.
 //	mode = required  ->  try; if it fails, fail the deploy.
 //
-// The hdr-4k120 profile uses mode=none because Sunshine's CUDA/NvFBC
-// module isn't compiled and the KMS capture path doesn't touch CUDA.
+// NOTE: an earlier revision of this comment claimed the hdr-4k120
+// profile could use mode=none because "Sunshine's CUDA/NvFBC module
+// isn't compiled and the KMS capture path doesn't touch CUDA". Both
+// halves were wrong and the mistake cost a 4K120 HDR deploy most of
+// its throughput:
+//
+//   - The KMS capture path DOES try CUDA first. When the module is
+//     absent Sunshine logs "Attempting to use NVENC without CUDA
+//     support. Reverting back to GPU -> RAM -> GPU" and then copies
+//     every captured frame through system RAM. Measured on a 5090 at
+//     4K120 HDR: one core pinned at 100%, NVENC idle around 5%, whole
+//     session (desktop included) capped near 40fps.
+//   - Whether the module is compiled is a BUILD-time decision that
+//     depends on the toolkit being present, so mode=none is what makes
+//     the claim true rather than a consequence of it.
+//
+// Choose mode=none only to accept that fallback deliberately. See
+// sunshine.CUDAModuleSupported for the Ubuntu releases where the
+// module can be built at all.
 package cuda
 
 import (
