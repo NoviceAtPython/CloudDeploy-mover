@@ -37,6 +37,35 @@ type PrebuiltManifest struct {
 	Ubuntu         string `json:"ubuntu"`
 	Arch           string `json:"arch"`
 	BuiltUTC       string `json:"built_utc"`
+
+	// CUDA reports whether the bundled Sunshine was compiled WITH its
+	// CUDA capture module (SUNSHINE_ENABLE_CUDA=ON).
+	//
+	// Pointer on purpose: "absent" must stay distinguishable from
+	// "false". Bundles published before this field existed say nothing
+	// about CUDA, and at least one of them (prebuilt-ubuntu2510-amd64,
+	// built 2026-06-07) contains a CUDA-less binary. Because
+	// deploy.use_prebuilt defaults to true, that bundle silently won
+	// over every capable host: capture fell back to GPU -> RAM -> GPU,
+	// pinning one core and capping a 4K120 HDR session near 40fps while
+	// the deploy reported success. Treat absent as "unknown" and refuse
+	// it whenever the profile requires CUDA.
+	CUDA *bool `json:"cuda,omitempty"`
+}
+
+// HasCUDA reports whether the bundle positively declares a CUDA-enabled
+// Sunshine. Absent (older bundles) and explicit false both return false.
+func (m PrebuiltManifest) HasCUDA() bool { return m.CUDA != nil && *m.CUDA }
+
+// CUDAClaim renders the manifest's CUDA field for diagnostics.
+func (m PrebuiltManifest) CUDAClaim() string {
+	if m.CUDA == nil {
+		return "unknown (manifest predates the cuda field)"
+	}
+	if *m.CUDA {
+		return "true"
+	}
+	return "false"
 }
 
 // PrebuiltBundle is a downloaded + extracted bundle.

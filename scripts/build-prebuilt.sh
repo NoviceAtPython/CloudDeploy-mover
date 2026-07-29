@@ -14,7 +14,7 @@
 # Layout produced (must match internal/phase/prebuilt.go expectations):
 #
 #   clouddeploy-prebuilt-ubuntu<ver>-<arch>.tar.gz
-#   ├── manifest.json   {sunshine_commit, kwin_version, ubuntu, arch, built_utc}
+#   ├── manifest.json   {sunshine_commit, kwin_version, ubuntu, arch, cuda, built_utc}
 #   ├── sunshine/
 #   │   ├── sunshine          compiled fork binary
 #   │   └── assets/           apps.json, shaders/, images, AND a built web/ UI
@@ -120,12 +120,28 @@ fi
 cp -a "${KWIN_DEBS[@]}" "$STAGE/kwin/"
 
 # --- manifest ---
+# Detect whether the staged Sunshine actually carries its CUDA capture
+# module. Consumers refuse a bundle that cannot prove this when the
+# profile requires CUDA, because a CUDA-less binary silently streams
+# through system RAM (GPU -> RAM -> GPU): one core pinned, NVENC idle,
+# ~40fps at 4K120 HDR. Probe the binary rather than trusting build flags
+# so a bundle can never claim CUDA it does not have.
+SUN_BIN="$STAGE/sunshine/sunshine"
+if [ -f "$SUN_BIN" ] && command -v nm >/dev/null 2>&1 \
+   && nm -C "$SUN_BIN" 2>/dev/null | grep -qE ' (t|T) .*cuda::'; then
+  CUDA_ENABLED=true
+else
+  CUDA_ENABLED=false
+fi
+echo ">> sunshine CUDA capture module present: ${CUDA_ENABLED}"
+
 cat > "$STAGE/manifest.json" <<EOF
 {
   "sunshine_commit": "${SUN_COMMIT}",
   "kwin_version": "${KWIN_VER}",
   "ubuntu": "${UBUNTU_VER}",
   "arch": "${ARCH}",
+  "cuda": ${CUDA_ENABLED},
   "built_utc": "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
 EOF
