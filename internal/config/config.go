@@ -19,7 +19,6 @@ import (
 	"strings"
 
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/edid"
-	"github.com/NoviceAtPython/CloudDeploy-mover/internal/sunshine"
 	"gopkg.in/yaml.v3"
 )
 
@@ -199,17 +198,6 @@ type CUDAConfig struct {
 	// Mode: "none" | "optional" | "required".
 	Mode string `yaml:"mode"`
 
-	// AllowUnbuildableSunshineModule opts a profile out of the gate
-	// that keeps CUDA profiles on an Ubuntu release where Sunshine's
-	// CUDA capture module can actually be built.
-	//
-	// Set this ONLY when the toolkit is wanted for something other
-	// than stream capture (ML workloads on top of the gaming VM, or a
-	// diagnostic profile that exists to probe CUDA repo availability
-	// on a specific release). Streaming on such a host still falls
-	// back to GPU -> RAM -> GPU, which costs most of the frame rate
-	// at 4K120 HDR - see sunshine.CUDAModuleSupported.
-	AllowUnbuildableSunshineModule bool `yaml:"allow_unbuildable_sunshine_module"`
 
 	// PackageName: explicit apt package; empty = auto-discover via
 	// internal/cuda.DiscoverCandidate.
@@ -462,6 +450,21 @@ func (p *Profile) EffectiveSunshine() SunshineConfig {
 	}
 	if strings.TrimSpace(out.EnableCUDA) == "" {
 		out.EnableCUDA = DefaultSunshineEnableCUDA
+	}
+	// cuda.mode=required means the operator is paying for the toolkit
+	// because capture needs it. Under enable_cuda="auto" a failed CUDA
+	// configure silently reconfigures with SUNSHINE_ENABLE_CUDA=OFF and
+	// the deploy reports success while Sunshine copies every frame
+	// through system RAM (GPU -> RAM -> GPU): one core pinned, NVENC
+	// idle, ~40fps at 4K120 HDR. That silent downgrade is the bug this
+	// promotion closes - "required" now means the build fails loudly
+	// instead of shipping a capture-crippled binary.
+	//
+	// An explicit sunshine.enable_cuda is always honored, so a profile
+	// can still say "install the toolkit for other work, but do not
+	// hard-fail the Sunshine build" via enable_cuda: "auto"/"false".
+	if p.WantsCUDARequired() && strings.EqualFold(strings.TrimSpace(p.Sunshine.EnableCUDA), "") {
+		out.EnableCUDA = "true"
 	}
 	if strings.TrimSpace(out.DoxygenVersion) == "" {
 		out.DoxygenVersion = DefaultDoxygenVersion
@@ -857,6 +860,20 @@ func LoadAllProfiles(dir string) ([]*Profile, error) {
 	return out, nil
 }
 
+// WantsCUDARequired reports whether the profile hard-requires the CUDA
+// toolkit (cuda.mode=required and the install is not disabled). Such a
+// profile must not silently end up with a CUDA-less Sunshine build --
+// see EffectiveSunshine.
+func (p *Profile) WantsCUDARequired() bool {
+	if p == nil {
+		return false
+	}
+	if !strings.EqualFold(strings.TrimSpace(p.CUDA.Mode), "required") {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(p.CUDA.Method), "none")
+}
+
 // WantsCUDA reports whether the profile asks for the CUDA toolkit to
 // be installed (mode required or optional). Profiles that want CUDA
 // constrain OS selection, because Sunshine's CUDA capture module only
@@ -872,52 +889,6 @@ func (p *Profile) WantsCUDA() bool {
 	return false
 }
 
-// RequiresSunshineCUDAOS reports whether OS selection must be limited
-// to releases that can build Sunshine's CUDA capture module: the
-// profile wants CUDA and has not deliberately opted out.
-func (p *Profile) RequiresSunshineCUDAOS() bool {
-	if p == nil {
-		return false
-	}
-	return p.WantsCUDA() && !p.CUDA.AllowUnbuildableSunshineModule
-}
-
-// validateCUDAOSTarget rejects profiles whose OS target can only land
-// on releases where Sunshine's CUDA module cannot be compiled.
-//
-// Two shapes are checked:
-//
-//   - a pinned ubuntu_version (no candidate list): it must itself be
-//     a release where the module builds.
-//   - a candidate list: at least ONE entry must be buildable,
-//     otherwise the resolver would reject every candidate at deploy
-//     time - better to say so now.
-func validateCUDAOSTarget(p *Profile) error {
-	if p.CUDA.AllowUnbuildableSunshineModule {
-		return nil
-	}
-	if len(p.Deploy.UbuntuCandidates) == 0 {
-		v := strings.TrimSpace(p.UbuntuVersion)
-		if v == "" || sunshine.CUDAModuleSupported(v) {
-			return nil
-		}
-		return fmt.Errorf("config: profile %q: cuda.mode=%s but ubuntu_version %q cannot build Sunshine's CUDA capture module (unsupported: %v). "+
-			"Deploying this way installs the toolkit and still streams on the GPU -> RAM -> GPU fallback (~40fps at 4K120 HDR). "+
-			"Pin an Ubuntu release that supports the module, or set cuda.mode=none to accept the fallback deliberately",
-			p.Profile, p.CUDA.Mode, v, sunshine.CUDAModuleUnsupportedUbuntuVersions())
-	}
-	for _, c := range p.Deploy.UbuntuCandidates {
-		if sunshine.CUDAModuleSupported(c) {
-			return nil
-		}
-	}
-	return fmt.Errorf("config: profile %q: cuda.mode=%s but every deploy.ubuntu_candidates entry %v is a release where Sunshine's CUDA capture module cannot be built (unsupported: %v). "+
-		"Add a buildable release (e.g. \"24.04\") to the candidate list, or set cuda.mode=none",
-		p.Profile, p.CUDA.Mode, p.Deploy.UbuntuCandidates, sunshine.CUDAModuleUnsupportedUbuntuVersions())
-}
-
-// ValidateProfile sanity-checks a profile's fields and returns the
-// first violation. Used by tests and by the apply command's pre-flight.
 func ValidateProfile(p *Profile) error {
 	if p == nil {
 		return fmt.Errorf("config: profile is nil")
@@ -985,16 +956,6 @@ func ValidateProfile(p *Profile) error {
 	for _, v := range p.Deploy.UbuntuCandidates {
 		if !looksLikeUbuntuVersion(v) {
 			return fmt.Errorf("config: profile %q: deploy.ubuntu_candidates entry %q is not an Ubuntu VERSION_ID (e.g. \"24.04\", \"25.10\")", p.Profile, v)
-		}
-	}
-	// A profile that asks for CUDA must be able to land on an Ubuntu
-	// release where Sunshine's CUDA capture module actually builds.
-	// Without this gate the deploy "succeeds" and the stream silently
-	// runs on the GPU -> RAM -> GPU fallback (one core pinned, ~40fps
-	// at 4K120 HDR). Fail at config-parse time instead.
-	if p.WantsCUDA() {
-		if err := validateCUDAOSTarget(p); err != nil {
-			return err
 		}
 	}
 	if osPolicy == "min-version" && strings.TrimSpace(p.Deploy.UbuntuMinVersion) == "" {

@@ -3,8 +3,6 @@ package ubuntu
 import (
 	"fmt"
 	"strings"
-
-	"github.com/NoviceAtPython/CloudDeploy-mover/internal/sunshine"
 )
 
 // OSSelectionPolicy is the typed value behind
@@ -91,14 +89,6 @@ type OSResolverInputs struct {
 	// nil = no probe.
 	Probe PackageProbeFn
 
-	// RequireSunshineCUDA rejects any candidate whose Ubuntu release
-	// cannot build Sunshine's CUDA capture module. Callers set this
-	// when the profile asks for CUDA (cuda.mode=required/optional),
-	// because installing the toolkit on such a release is worse than
-	// useless: the toolkit lands, the module still does not, and the
-	// stream silently falls back to the GPU -> RAM -> GPU copy path.
-	// See sunshine.CUDAModuleSupported for the rule and its cost.
-	RequireSunshineCUDA bool
 
 	// SkipSupportedCheck disables the "must be in
 	// ubuntu.SupportedVersions()" gate. Used by tests / by
@@ -188,10 +178,6 @@ func evaluateOSCandidate(v string, policy OSSelectionPolicy, in OSResolverInputs
 	}
 	if !in.SkipSupportedCheck && policy != OSPolicyAny && !c.Supported {
 		c.Reason = fmt.Sprintf("not in v3 supported list %v (no validated streaming-stack run yet)", SupportedVersions())
-		return c
-	}
-	if in.RequireSunshineCUDA && !sunshine.CUDAModuleSupported(c.Version) {
-		c.Reason = fmt.Sprintf("profile requests CUDA but Sunshine's CUDA capture module does not build on Ubuntu %s (CUDA 13 headers vs glibc); unsupported: %v", c.Version, sunshine.CUDAModuleUnsupportedUbuntuVersions())
 		return c
 	}
 	if in.Probe != nil {

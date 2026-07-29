@@ -2,20 +2,17 @@ package config
 
 import "testing"
 
-// Regression guard for the 4K120-HDR throughput bug: a profile that
-// installs the CUDA toolkit onto an Ubuntu release where Sunshine's
-// CUDA capture module cannot be built deploys "green" and then streams
-// on the GPU -> RAM -> GPU fallback (~40fps, one core pinned). The
-// contradiction must be caught at config-parse time.
-
-func cudaGuardProfile(mode, ubuntuVersion string, candidates []string) *Profile {
-	return &Profile{
-		Profile:       "test-cuda-guard",
-		UbuntuVersion: ubuntuVersion,
-		CUDA:          CUDAConfig{Mode: mode},
-		Deploy:        DeployConfig{UbuntuCandidates: candidates},
-	}
-}
+// Regression guard for the 4K120-HDR throughput bug.
+//
+// History: a profile could set cuda.mode=required, install the toolkit,
+// and still ship a Sunshine binary built with SUNSHINE_ENABLE_CUDA=OFF,
+// because a failed CUDA cmake-configure silently retries without CUDA
+// under enable_cuda="auto". The deploy reported success while capture
+// ran on the GPU -> RAM -> GPU path: one core pinned, NVENC idle, the
+// whole 4K120 HDR session capped near 40fps.
+//
+// The fix is a linkage, not an OS allowlist: cuda.mode=required
+// promotes sunshine.enable_cuda to "true" so the build fails loudly.
 
 func TestWantsCUDA(t *testing.T) {
 	cases := []struct {
@@ -38,50 +35,56 @@ func TestWantsCUDA(t *testing.T) {
 	}
 }
 
-func TestValidateCUDAOSTarget_PinnedVersion(t *testing.T) {
-	// 25.10 cannot build the module -> reject.
-	if err := validateCUDAOSTarget(cudaGuardProfile("required", "25.10", nil)); err == nil {
-		t.Fatal("expected error for cuda.mode=required pinned to 25.10")
+func TestWantsCUDARequired(t *testing.T) {
+	cases := []struct {
+		mode, method string
+		want         bool
+	}{
+		{"required", "", true},
+		{"Required", "apt", true},
+		{"optional", "apt", false}, // optional must NOT hard-fail the build
+		{"none", "", false},
+		{"required", "none", false},
 	}
-	// 24.04 can -> accept.
-	if err := validateCUDAOSTarget(cudaGuardProfile("required", "24.04", nil)); err != nil {
-		t.Fatalf("24.04 must be accepted, got %v", err)
-	}
-	// Unpinned -> nothing to check yet.
-	if err := validateCUDAOSTarget(cudaGuardProfile("required", "", nil)); err != nil {
-		t.Fatalf("empty ubuntu_version must not error, got %v", err)
-	}
-}
-
-func TestValidateCUDAOSTarget_Candidates(t *testing.T) {
-	// At least one buildable candidate -> accept (the resolver will
-	// pick it; 26.04/25.10 get rejected at resolve time).
-	if err := validateCUDAOSTarget(cudaGuardProfile("optional", "", []string{"26.04", "25.10", "24.04"})); err != nil {
-		t.Fatalf("candidate list containing 24.04 must be accepted, got %v", err)
-	}
-	// No buildable candidate -> reject now rather than at deploy time.
-	if err := validateCUDAOSTarget(cudaGuardProfile("optional", "", []string{"26.04", "25.10"})); err == nil {
-		t.Fatal("expected error when no candidate can build the CUDA module")
+	for _, c := range cases {
+		p := &Profile{CUDA: CUDAConfig{Mode: c.mode, Method: c.method}}
+		if got := p.WantsCUDARequired(); got != c.want {
+			t.Errorf("WantsCUDARequired(mode=%q, method=%q) = %v, want %v", c.mode, c.method, got, c.want)
+		}
 	}
 }
 
-func TestValidateCUDAOSTarget_OptOut(t *testing.T) {
-	// Toolkit wanted for non-streaming reasons (ML / diagnostics).
-	p := cudaGuardProfile("required", "25.10", nil)
-	p.CUDA.AllowUnbuildableSunshineModule = true
-	if err := validateCUDAOSTarget(p); err != nil {
-		t.Fatalf("explicit opt-out must be honored, got %v", err)
+// The core regression test: required CUDA must not be able to degrade
+// into a silent no-CUDA Sunshine build.
+func TestEffectiveSunshine_RequiredCUDAForbidsSilentFallback(t *testing.T) {
+	p := &Profile{
+		Profile: "t",
+		CUDA:    CUDAConfig{Mode: "required", Method: "apt"},
 	}
-	if p.RequiresSunshineCUDAOS() {
-		t.Error("RequiresSunshineCUDAOS must be false once opted out, or the OS resolver would still reject candidates")
+	if got := p.EffectiveSunshine().EnableCUDA; got != "true" {
+		t.Fatalf("EnableCUDA = %q, want \"true\" so a failed CUDA configure fails the deploy instead of silently shipping GPU->RAM->GPU capture", got)
 	}
 }
 
-func TestRequiresSunshineCUDAOS(t *testing.T) {
-	if p := cudaGuardProfile("required", "24.04", nil); !p.RequiresSunshineCUDAOS() {
-		t.Error("cuda.mode=required without opt-out must constrain OS selection")
+func TestEffectiveSunshine_ExplicitOperatorChoiceWins(t *testing.T) {
+	// An operator who wants the toolkit for other work but does not
+	// want the Sunshine build to hard-fail must keep that ability.
+	p := &Profile{
+		Profile:  "t",
+		CUDA:     CUDAConfig{Mode: "required", Method: "apt"},
+		Sunshine: SunshineConfig{EnableCUDA: "auto"},
 	}
-	if p := cudaGuardProfile("none", "24.04", nil); p.RequiresSunshineCUDAOS() {
-		t.Error("cuda.mode=none must not constrain OS selection")
+	if got := p.EffectiveSunshine().EnableCUDA; got != "auto" {
+		t.Fatalf("EnableCUDA = %q, want \"auto\" (explicit profile value must be honored)", got)
+	}
+}
+
+func TestEffectiveSunshine_OptionalCUDAKeepsAutoDefault(t *testing.T) {
+	p := &Profile{
+		Profile: "t",
+		CUDA:    CUDAConfig{Mode: "optional", Method: "apt"},
+	}
+	if got := p.EffectiveSunshine().EnableCUDA; got != DefaultSunshineEnableCUDA {
+		t.Fatalf("EnableCUDA = %q, want %q (optional means best-effort)", got, DefaultSunshineEnableCUDA)
 	}
 }

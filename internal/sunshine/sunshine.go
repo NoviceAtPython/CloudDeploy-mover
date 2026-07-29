@@ -21,7 +21,6 @@ package sunshine
 
 import (
 	"fmt"
-	"sort"
 	"strconv"
 	"strings"
 )
@@ -30,60 +29,22 @@ import (
 // write. NOT YET IMPLEMENTED.
 func Install() error { return nil }
 
-// cudaModuleUnsupportedUbuntu lists the Ubuntu VERSION_IDs where
-// Sunshine's optional CUDA capture module cannot be compiled.
+// NOTE (2026-07-29): CloudDeploy used to refuse to build Sunshine's CUDA
+// capture module on Ubuntu 25.10+ because CUDA 13.0/13.1 headers
+// redeclared rsqrt/rsqrtf incompatibly with glibc 2.41+, breaking nvcc
+// detection during CMake configure. That rule is OBSOLETE: measured on
+// Ubuntu 25.10 (glibc 2.42, gcc 15.2) with CUDA 13.3, compile+link of
+// device code using rsqrtf and CMake's CUDA compiler detection both
+// succeed. Blanket-disabling by OS version silently produced a
+// capture-fallback binary (GPU -> RAM -> GPU, ~40fps at 4K120 HDR) on
+// hosts that were perfectly capable.
 //
-// Why: CUDA 13's headers redeclare rsqrt/rsqrtf in a way that
-// conflicts with the glibc shipped in Ubuntu 25.10 and newer, which
-// breaks nvcc compiler detection during Sunshine's CMake configure.
-// The v2 installer encodes the same rule in
-// resolve_sunshine_cuda_module() (CloudDeploy-wayland.sh) - the two
-// MUST stay in sync.
-//
-// Operational consequence of ignoring this: the deploy happily
-// installs the CUDA toolkit (cuda.mode=required/optional succeeds),
-// then Sunshine is built WITHOUT the module anyway and logs
-//
-//	Attempting to use NVENC without CUDA support.
-//	Reverting back to GPU -> RAM -> GPU
-//
-// at every stream start, copying each captured frame through system
-// RAM. On a 4K120 HDR stream that pins ONE core at 100% while NVENC
-// idles near 5%, capping the whole session (desktop included) around
-// 40fps. Installing the toolkit afterwards does not fix it: the
-// module is a build-time decision, so the only remedies are a
-// rebuild or an OS target where the module compiles.
-var cudaModuleUnsupportedUbuntu = map[string]struct{}{
-	"25.10": {},
-	"26.04": {},
-	"26.10": {},
-}
-
-// CUDAModuleSupported reports whether Sunshine's CUDA capture module
-// can be built on the given Ubuntu VERSION_ID (e.g. "24.04").
-//
-// An empty version is treated as supported: callers that do not know
-// the target OS yet must not have candidates silently rejected.
-func CUDAModuleSupported(ubuntuVersion string) bool {
-	v := strings.TrimSpace(ubuntuVersion)
-	if v == "" {
-		return true
-	}
-	_, unsupported := cudaModuleUnsupportedUbuntu[v]
-	return !unsupported
-}
-
-// CUDAModuleUnsupportedUbuntuVersions returns the sorted VERSION_IDs
-// where CUDAModuleSupported is false. Intended for error messages so
-// an operator sees the whole rejected set at once.
-func CUDAModuleUnsupportedUbuntuVersions() []string {
-	out := make([]string, 0, len(cudaModuleUnsupportedUbuntu))
-	for v := range cudaModuleUnsupportedUbuntu {
-		out = append(out, v)
-	}
-	sort.Strings(out)
-	return out
-}
+// The durable protection is NOT an OS allowlist - it is refusing to
+// silently ship a CUDA-less binary when the profile asked for CUDA.
+// See shouldRetrySunshineWithoutCUDA in internal/phase/milestone5.go
+// and Profile.EffectiveSunshine, which promotes cuda.mode=required into
+// sunshine.enable_cuda=true so a failed CUDA configure fails the deploy
+// instead of degrading it.
 
 // ServerCodecModeSupport bits are the GameStream codec-advertisement
 // flags Sunshine writes into /serverinfo. Keep these in one package so

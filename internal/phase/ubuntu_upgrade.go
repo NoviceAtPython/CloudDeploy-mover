@@ -229,11 +229,6 @@ func (p UbuntuUpgrade) Run(ctx context.Context, deps *Deps) error {
 				AcceptNonLTS:   acceptNonLTS,
 				PreferLTS:      deps.Profile.Deploy.PreferLTS,
 				Probe:          p.OSPackageProbeFn,
-				// Keep the OS target on a release where Sunshine's
-				// CUDA capture module builds; otherwise a CUDA
-				// profile deploys "green" and still streams on the
-				// GPU -> RAM -> GPU fallback.
-				RequireSunshineCUDA: deps.Profile.RequiresSunshineCUDAOS(),
 			}
 			resolved = ubuntu.ResolveOSTarget(in)
 			log.Info("phase ubuntu-upgrade: OS resolver",
