@@ -1,6 +1,10 @@
 package phase
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
+)
 
 // A prebuilt bundle may only satisfy a CUDA-requiring profile when it
 // positively declares a CUDA-enabled Sunshine. Older bundles omit the
@@ -35,5 +39,59 @@ func TestPrebuiltManifestCUDAClaimIsDiagnostic(t *testing.T) {
 	}
 	if got := (PrebuiltManifest{CUDA: &fa}).CUDAClaim(); got != "false" {
 		t.Errorf("CUDAClaim() = %q, want false", got)
+	}
+}
+
+func TestPrebuiltMustDeclareCUDA(t *testing.T) {
+	cases := []struct {
+		name     string
+		profile  *config.Profile
+		sunshine config.SunshineConfig
+		want     bool
+	}{
+		{
+			name: "nil profile",
+		},
+		{
+			name:     "CUDA disabled by mode",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "none", Method: "none"}},
+			sunshine: config.SunshineConfig{EnableCUDA: "auto"},
+		},
+		{
+			name:     "optional CUDA with auto Sunshine",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "optional", Method: "apt"}},
+			sunshine: config.SunshineConfig{EnableCUDA: "auto"},
+			want:     true,
+		},
+		{
+			name:     "optional CUDA with implicit auto Sunshine",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "optional", Method: "apt"}},
+			sunshine: config.SunshineConfig{},
+			want:     true,
+		},
+		{
+			name:     "required CUDA",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "required", Method: "runfile"}},
+			sunshine: config.SunshineConfig{EnableCUDA: "true"},
+			want:     true,
+		},
+		{
+			name:     "explicit Sunshine CUDA opt-out",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "optional", Method: "apt"}},
+			sunshine: config.SunshineConfig{EnableCUDA: "false"},
+		},
+		{
+			name:     "CUDA install method disabled",
+			profile:  &config.Profile{CUDA: config.CUDAConfig{Mode: "optional", Method: "none"}},
+			sunshine: config.SunshineConfig{EnableCUDA: "auto"},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := prebuiltMustDeclareCUDA(c.profile, c.sunshine); got != c.want {
+				t.Fatalf("prebuiltMustDeclareCUDA() = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

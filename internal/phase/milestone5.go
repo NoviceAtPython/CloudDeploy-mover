@@ -113,7 +113,7 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 	usedPrebuilt := false
 	if deps.Profile.Deploy.UsePrebuiltValue() {
 		ver, arch := hostUbuntuArch(ctx, deps)
-		requireCUDA := strings.EqualFold(strings.TrimSpace(cfg.EnableCUDA), "true")
+		requireCUDA := prebuiltMustDeclareCUDA(deps.Profile, cfg)
 		if b, perr := ensurePrebuiltBundle(ctx, deps, deps.Profile.Deploy.PrebuiltRepoValue(), ver, arch); perr != nil {
 			details["prebuilt_unavailable"] = perr.Error()
 		} else if requireCUDA && !b.Manifest.HasCUDA() {
@@ -121,7 +121,7 @@ func (p SunshineBuild) Run(ctx context.Context, deps *Deps) error {
 			// has it. Compiling from source on a CUDA-capable host is far
 			// cheaper than shipping a binary that silently streams through
 			// system RAM.
-			details["prebuilt_rejected_no_cuda"] = fmt.Sprintf("bundle %s declares cuda=%s but the profile requires a CUDA-enabled Sunshine; compiling from source", b.Tag, b.Manifest.CUDAClaim())
+			details["prebuilt_rejected_no_cuda"] = fmt.Sprintf("bundle %s declares cuda=%s but the profile requests a CUDA-enabled Sunshine; compiling from source", b.Tag, b.Manifest.CUDAClaim())
 		} else if mc := strings.TrimSpace(b.Manifest.SunshineCommit); mc != "" && mc == strings.TrimSpace(cfg.ForkCommit) {
 			if serr := stagePrebuiltSunshine(ctx, deps, cfg.BuildDir, b); serr == nil {
 				usedPrebuilt = true

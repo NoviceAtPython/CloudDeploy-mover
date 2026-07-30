@@ -89,7 +89,6 @@ type OSResolverInputs struct {
 	// nil = no probe.
 	Probe PackageProbeFn
 
-
 	// SkipSupportedCheck disables the "must be in
 	// ubuntu.SupportedVersions()" gate. Used by tests / by
 	// OSPolicyAny which intentionally accepts experimental versions.

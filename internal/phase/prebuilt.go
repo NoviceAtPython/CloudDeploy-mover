@@ -23,6 +23,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/NoviceAtPython/CloudDeploy-mover/internal/config"
 	"github.com/NoviceAtPython/CloudDeploy-mover/internal/runner"
 )
 
@@ -49,7 +50,7 @@ type PrebuiltManifest struct {
 	// over every capable host: capture fell back to GPU -> RAM -> GPU,
 	// pinning one core and capping a 4K120 HDR session near 40fps while
 	// the deploy reported success. Treat absent as "unknown" and refuse
-	// it whenever the profile requires CUDA.
+	// it whenever the profile requests CUDA capture.
 	CUDA *bool `json:"cuda,omitempty"`
 }
 
@@ -66,6 +67,17 @@ func (m PrebuiltManifest) CUDAClaim() string {
 		return "true"
 	}
 	return "false"
+}
+
+// prebuiltMustDeclareCUDA reports whether a prebuilt Sunshine must positively
+// declare CUDA support. Optional CUDA still expresses a preference to use the
+// host's available toolkit; only an explicit Sunshine opt-out permits a
+// CUDA-less bundle.
+func prebuiltMustDeclareCUDA(profile *config.Profile, sunshine config.SunshineConfig) bool {
+	if profile == nil || !profile.WantsCUDA() {
+		return false
+	}
+	return !strings.EqualFold(strings.TrimSpace(sunshine.EnableCUDA), "false")
 }
 
 // PrebuiltBundle is a downloaded + extracted bundle.

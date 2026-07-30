@@ -198,7 +198,6 @@ type CUDAConfig struct {
 	// Mode: "none" | "optional" | "required".
 	Mode string `yaml:"mode"`
 
-
 	// PackageName: explicit apt package; empty = auto-discover via
 	// internal/cuda.DiscoverCandidate.
 	PackageName string `yaml:"package_name"`
