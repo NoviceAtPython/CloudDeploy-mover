@@ -166,4 +166,4 @@ echo ">> sha256  $(sha256sum "$OUT" | awk '{print $1}')"
 echo ">> manifest:"
 sed 's/^/     /' "$STAGE/manifest.json"
 echo ">> contents (top):"
-tar tzf "$OUT" | sed 's/^/     /' | head -30
+tar tzf "$OUT" | awk 'NR <= 30 { print "     " $0 }'
