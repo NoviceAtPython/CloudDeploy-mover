@@ -27,6 +27,7 @@
 #   SUNSHINE_SRC    /opt/sunshine-src              git checkout w/ build/{sunshine,assets}
 #   KWIN_BUILD_DIR  /opt/clouddeploy-kwin-src/build dir holding the patched *.deb
 #   SUNSHINE_WEB    /usr/share/sunshine/web         built web UI folded into assets/web
+#   REQUIRE_CUDA    true                            refuse a CUDA-less Sunshine binary
 #
 # Publish (separate step, no auth needed by downloaders since the repo is public):
 #   gh release create prebuilt-ubuntu2510-amd64 clouddeploy-prebuilt-ubuntu2510-amd64.tar.gz \
@@ -40,9 +41,15 @@ set -euo pipefail
 SUNSHINE_SRC="${SUNSHINE_SRC:-/opt/sunshine-src}"
 KWIN_BUILD_DIR="${KWIN_BUILD_DIR:-/opt/clouddeploy-kwin-src/build}"
 SUNSHINE_WEB="${SUNSHINE_WEB:-/usr/share/sunshine/web}"
+REQUIRE_CUDA="${REQUIRE_CUDA:-true}"
 OUT_DIR="${1:-$PWD}"
 
 die() { echo "ERROR: $*" >&2; exit 1; }
+
+case "$REQUIRE_CUDA" in
+  true|false) ;;
+  *) die "REQUIRE_CUDA must be true or false (got: $REQUIRE_CUDA)" ;;
+esac
 
 # --- host identity (becomes the bundle tag) ---
 [ -r /etc/os-release ] || die "/etc/os-release unreadable; run this on the build host"
@@ -128,12 +135,14 @@ cp -a "${KWIN_DEBS[@]}" "$STAGE/kwin/"
 # so a bundle can never claim CUDA it does not have.
 SUN_BIN="$STAGE/sunshine/sunshine"
 if [ -f "$SUN_BIN" ] && command -v nm >/dev/null 2>&1 \
-   && nm -C "$SUN_BIN" 2>/dev/null | grep -qE ' (t|T) .*cuda::'; then
+   && nm -C "$SUN_BIN" 2>/dev/null | grep -E ' (t|T) .*cuda::' >/dev/null; then
   CUDA_ENABLED=true
 else
   CUDA_ENABLED=false
 fi
 echo ">> sunshine CUDA capture module present: ${CUDA_ENABLED}"
+[ "$REQUIRE_CUDA" = false ] || [ "$CUDA_ENABLED" = true ] \
+  || die "Sunshine CUDA capture module is absent; refusing to ship the official prebuilt (set REQUIRE_CUDA=false only for an intentional non-CUDA bundle)"
 
 cat > "$STAGE/manifest.json" <<EOF
 {
